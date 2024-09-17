@@ -1,0 +1,13 @@
+[
+    {
+      "topic": "peer-topic",
+      "numPartitions": 1,
+      "replicationFactor": 1
+    },
+    {
+      "topic": "torrent-topic",
+      "numPartitions": 1,
+      "replicationFactor": 1
+    }
+  ]
+  

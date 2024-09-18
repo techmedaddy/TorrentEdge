@@ -1,0 +1,3 @@
+[submodule "web/web-react-new"]
+    path = web/web-react-new
+    url = https://github.com/umarei/web-react-new.git

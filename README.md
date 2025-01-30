@@ -1,6 +1,6 @@
 # TorrentEdge
 
-**TorrentEdge** is a highly scalable, distributed BitTorrent client built using **Node.js**, **Nginx**, and **Apache Kafka**. The project integrates real-time event streaming, load balancing, and distributed systems architecture, showcasing advanced backend and cloud infrastructure concepts.
+**TorrentEdge** is a highly scalable, distributed BitTorrent client built using **Node.js**, **Nginx**, and **Apache Kafka**. The project integrates real-time event streaming, load balancing, and distributed systems architecture, showcasing advanced backend and cloud infrastructure concept.
 
 
 ![WhatsApp Image 2024-10-17 at 22 13 59_a93cdfdb](https://github.com/user-attachments/assets/5c940e02-31b8-489c-b3ba-b11c222a8914)

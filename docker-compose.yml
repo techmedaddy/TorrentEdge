@@ -1,8 +1,6 @@
-version: '3'
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.2.0
-    container_name: zookeeper
     ports:
       - "2181:2181"
     networks:
@@ -10,20 +8,81 @@ services:
 
   kafka:
     image: confluentinc/cp-kafka:7.2.0
-    container_name: kafka
     depends_on:
       - zookeeper
     ports:
       - "9092:9092"
     environment:
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENERS: INSIDE://kafka:9093,OUTSIDE://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INSIDE:PLAINTEXT,OUTSIDE:PLAINTEXT
-      KAFKA_LISTENER_NAME_INTERNAL: INSIDE
-      KAFKA_ADVERTISED_LISTENERS: OUTSIDE://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
     networks:
       - kafka-network
+
+  backend:
+    build:
+      context: ./src/server
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    depends_on:
+      - kafka
+      - mongodb
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./web/web-react-new
+      dockerfile: Dockerfile
+    environment:
+      - REACT_APP_API_BASE_URL=/api
+    ports:
+      - "3001:80"
+    networks:
+      - app-network
+
+  nginx:
+    image: nginx:stable-alpine
+    ports:
+      - "80:80"
+    depends_on:
+      - frontend
+      - backend
+    volumes:
+      - ./web/web-react-new/build:/usr/share/nginx/html
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf
+    networks:
+      - app-network
+
+  mongodb:
+    image: mongo:6.0
+    container_name: torrentedge-mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: example
+      MONGO_INITDB_DATABASE: torrentedge
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - app-network
 
 networks:
   kafka-network:
     driver: bridge
+  app-network:
+    driver: bridge
+
+volumes:
+  mongo-data:
+    driver: local

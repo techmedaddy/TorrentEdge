@@ -11,14 +11,12 @@ const morgan = require('morgan');
 // Load environment variables from .env file
 dotenv.config();
 
-// Import Routes
-const authRoutes = require('./routes/authRoutes');
-const userRoutes = require('./routes/userRoutes');
-const torrentRoutes = require('./routes/torrentRoutes');
-const statisticsRoutes = require('./routes/statisticsRoutes');
-const healthRoutes = require('./routes/healthRoutes'); // Newly Added Route
+// Initialize Express
+const app = express();
+const server = http.createServer(app);
+const io = socketIO(server);
 
-// Initialize Logger using Winston
+// Logger using Winston
 const logger = winston.createLogger({
   level: 'info',
   format: winston.format.combine(
@@ -26,14 +24,11 @@ const logger = winston.createLogger({
     winston.format.json()
   ),
   transports: [
-    // Log errors to error.log
     new winston.transports.File({ filename: 'error.log', level: 'error' }),
-    // Log all info and above to combined.log
     new winston.transports.File({ filename: 'combined.log' }),
   ],
 });
 
-// If not in production, also log to the console with colorization
 if (process.env.NODE_ENV !== 'production') {
   logger.add(new winston.transports.Console({
     format: winston.format.combine(
@@ -43,40 +38,45 @@ if (process.env.NODE_ENV !== 'production') {
   }));
 }
 
-const app = express();
-const server = http.createServer(app);
-const io = socketIO(server);
-
 // Middleware
 app.use(cors({
-  origin: 'http://localhost', // Adjust based on your frontend's URL
+  origin: 'http://localhost', // Adjust based on your frontend URL
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   credentials: true
 }));
-app.use(express.json()); // Parses incoming JSON requests
+app.use(express.json());
 
-// Setup morgan to use Winston for logging HTTP requests
+// Logging HTTP requests using Morgan & Winston
 app.use(morgan('combined', { stream: { write: msg => logger.info(msg.trim()) } }));
 
-// API Routes
+// Import & Use Routes
+const authRoutes = require('./routes/authRoutes');
+const userRoutes = require('./routes/userRoutes');
+const torrentRoutes = require('./routes/torrentRoutes');  // ✅ Fix: Correctly imported
+const statisticsRoutes = require('./routes/statisticsRoutes');
+const healthRoutes = require('./routes/healthRoutes');
+
 app.use('/api/auth', authRoutes);
 app.use('/api/user', userRoutes);
-app.use('/api/torrent', torrentRoutes);
+app.use('/api/torrent', torrentRoutes);  // ✅ Ensure this works
 app.use('/api/statistics', statisticsRoutes);
-app.use('/api', healthRoutes); // Health check route
+app.use('/api', healthRoutes);  // ✅ Health check route
+
+// Default Route
+app.get('/', (req, res) => {
+  res.send("TorrentEdge Backend Running!");
+});
 
 // WebSocket Setup
 io.on('connection', (socket) => {
   logger.info('New client connected');
-
-  // Handle custom events here
 
   socket.on('disconnect', () => {
     logger.info('Client disconnected');
   });
 });
 
-// Start the server
+// Start Server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   logger.info(`Server running on port ${PORT}`);

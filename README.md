@@ -100,7 +100,7 @@ app.use('/api/torrent', torrentRoutes);
 io.on('connection', (socket) => {
   logger.info('New client connected');
   socket.on('disconnect', () => {
-        logger.info('Client disconnected');
+		logger.info('Client disconnected');
   });
 });
 ```

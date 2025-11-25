@@ -1,0 +1,31 @@
+/* src/styles/global.css */
+body {
+    background-color: #121212;
+    color: #e0e0e0;
+    font-family: Arial, sans-serif;
+  }
+  
+  .container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 20px;
+  }
+  
+  .header, .footer {
+    background-color: #1e1e1e;
+    padding: 10px;
+    text-align: center;
+  }
+  
+  .button {
+    background-color: #333;
+    color: #fff;
+    border: none;
+    padding: 10px 20px;
+    cursor: pointer;
+  }
+  
+  .button:hover {
+    background-color: #555;
+  }
+  

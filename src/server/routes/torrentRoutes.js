@@ -1,8 +1,8 @@
 const express = require('express');
 const router = express.Router();
-const Torrent = require('../models/torrent'); 
+const Torrent = require('../models/torrent');
 
-// ✅ Route to fetch torrents
+// GET: fetch all torrents
 router.get('/', async (req, res) => {
   try {
     const torrents = await Torrent.find();
@@ -12,26 +12,37 @@ router.get('/', async (req, res) => {
   }
 });
 
-// ✅ Route to create a torrent
+// POST: create a new torrent
 router.post('/create', async (req, res) => {
   try {
     const { file } = req.body;
-    const newTorrent = new Torrent({ name: file, size: 100, seeds: 5, leeches: 2 });
+
+    const newTorrent = new Torrent({
+      name: file,
+      size: 100,
+      seeds: 5,
+      leeches: 2,
+    });
+
     await newTorrent.save();
-    res.status(201).json({ message: 'Torrent created successfully', torrent: newTorrent });
+
+    res.status(201).json({
+      message: 'Torrent created successfully',
+      torrent: newTorrent,
+    });
   } catch (error) {
     res.status(500).json({ error: 'Failed to create torrent' });
   }
 });
 
-// ✅ Route to fetch peers
+// GET: peers (placeholder)
 router.get('/peers', async (req, res) => {
-  res.json({ message: 'Peers data here' }); // Implement real logic
+  res.json({ message: 'Peers data here' });
 });
 
-// ✅ Route to fetch status updates
+// GET: status updates (placeholder)
 router.get('/status-updates', async (req, res) => {
-  res.json({ message: 'Status updates data here' }); // Implement real logic
+  res.json({ message: 'Status updates data here' });
 });
 
 module.exports = router;

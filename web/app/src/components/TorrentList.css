@@ -1,0 +1,28 @@
+/* src/components/TorrentList.css */
+
+.torrent-list {
+  margin: 20px;
+  padding: 10px;
+  border: 1px solid #ddd;
+  border-radius: 5px;
+  background-color: #f9f9f9;
+}
+
+.torrent-list h2 {
+  margin-bottom: 10px;
+  font-size: 1.5em;
+  color: #333;
+}
+
+.torrent-list ul {
+  list-style-type: none;
+  padding: 0;
+}
+
+.torrent-list li {
+  margin-bottom: 10px;
+  padding: 5px;
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  background-color: #fff;
+}

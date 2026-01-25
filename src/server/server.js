@@ -75,6 +75,12 @@ app.use((req, res) => {
   res.status(404).json({ error: 'API route not found' });
 });
 
+// Global error handler (must be defined before server.listen)
+app.use((err, req, res, next) => {
+  logger.error(err.stack);
+  res.status(500).json({ error: 'Internal Server Error' });
+});
+
 // Socket Layer
 require('./socket')(server);
 
@@ -83,10 +89,4 @@ const PORT = process.env.PORT || 3029;
 
 server.listen(PORT, () => {
   logger.info(`Server running on port ${PORT}`);
-});
-
-// Global error handler
-app.use((err, req, res, next) => {
-  logger.error(err.stack);
-  res.status(500).json({ error: 'Internal Server Error' });
 });

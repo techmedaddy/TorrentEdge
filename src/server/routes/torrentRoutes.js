@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const Torrent = require('../models/torrent');
+const torrentController = require('../controllers/torrentController');
+const authMiddleware = require('../middleware/authMiddleware');
 
 // GET: fetch all torrents
 router.get('/', async (req, res) => {
@@ -12,8 +14,11 @@ router.get('/', async (req, res) => {
   }
 });
 
-// POST: create a new torrent
-router.post('/create', async (req, res) => {
+// GET: fetch torrent by ID
+router.get('/:id', torrentController.getTorrentById);
+
+// POST: create a new torrent (protected)
+router.post('/create', authMiddleware, async (req, res) => {
   try {
     const { file } = req.body;
 

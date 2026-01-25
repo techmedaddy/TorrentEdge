@@ -1,13 +1,12 @@
 const express = require('express');
 const router = express.Router();
+const userController = require('../controllers/userController');
+const authMiddleware = require('../middleware/authMiddleware');
 
-// GET /api/user/profile
-router.get('/profile', (req, res) => {
-  res.json({
-    id: 1,
-    username: 'test',
-    email: 'test@example.com',
-  });
-});
+// GET /api/user/profile - Get current user's profile (protected)
+router.get('/profile', authMiddleware, userController.getUserProfile);
+
+// PUT /api/user/profile - Update current user's profile (protected)
+router.put('/profile', authMiddleware, userController.updateUserProfile);
 
 module.exports = router;

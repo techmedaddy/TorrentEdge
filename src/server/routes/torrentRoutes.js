@@ -1,44 +1,12 @@
 const express = require('express');
 const router = express.Router();
-const Torrent = require('../models/torrent');
 const torrentController = require('../controllers/torrentController');
 const authMiddleware = require('../middleware/authMiddleware');
 
-// GET: fetch all torrents
-router.get('/', async (req, res) => {
-  try {
-    const torrents = await Torrent.find();
-    res.json(torrents);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch torrents' });
-  }
-});
+// Static routes MUST come before parameterized routes (:id)
 
-// GET: fetch torrent by ID
-router.get('/:id', torrentController.getTorrentById);
-
-// POST: create a new torrent (protected)
-router.post('/create', authMiddleware, async (req, res) => {
-  try {
-    const { file } = req.body;
-
-    const newTorrent = new Torrent({
-      name: file,
-      size: 100,
-      seeds: 5,
-      leeches: 2,
-    });
-
-    await newTorrent.save();
-
-    res.status(201).json({
-      message: 'Torrent created successfully',
-      torrent: newTorrent,
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to create torrent' });
-  }
-});
+// GET: search torrents
+router.get('/search', torrentController.searchTorrents);
 
 // GET: peers (placeholder)
 router.get('/peers', async (req, res) => {
@@ -49,5 +17,21 @@ router.get('/peers', async (req, res) => {
 router.get('/status-updates', async (req, res) => {
   res.json({ message: 'Status updates data here' });
 });
+
+// GET: fetch all torrents for authenticated user
+router.get('/', authMiddleware, torrentController.getAllTorrents);
+
+// POST: create a new torrent (protected)
+router.post('/create', authMiddleware, torrentController.createTorrent);
+
+// Parameterized routes MUST come AFTER static routes
+// GET: fetch torrent by ID
+router.get('/:id', torrentController.getTorrentById);
+
+// PUT: update torrent (protected)
+router.put('/:id', authMiddleware, torrentController.updateTorrent);
+
+// DELETE: remove torrent (protected)
+router.delete('/:id', authMiddleware, torrentController.deleteTorrent);
 
 module.exports = router;

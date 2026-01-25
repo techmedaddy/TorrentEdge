@@ -1,11 +1,17 @@
 {
   "name": "torrentedge",
   "version": "1.0.0",
+  "description": "TorrentEdge - Distributed BitTorrent client backend with Kafka event streaming",
   "private": true,
   "scripts": {
     "start": "node src/server/server.js",
     "dev": "nodemon src/server/server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "jest --passWithNoTests",
+    "test:watch": "jest --watch",
+    "seed": "node src/server/seed.js",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down",
+    "docker:logs": "docker-compose logs -f"
   },
   "dependencies": {
     

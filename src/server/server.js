@@ -4,6 +4,7 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const winston = require('winston');
 const morgan = require('morgan');
+const mongoose = require('mongoose');
 
 dotenv.config();
 
@@ -33,6 +34,11 @@ if (process.env.NODE_ENV !== 'production') {
     })
   );
 }
+
+// MongoDB Connection
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/torrentedge')
+  .then(() => logger.info('MongoDB connected successfully'))
+  .catch((err) => logger.error('MongoDB connection error:', err));
 
 // Middleware
 app.use(

@@ -1,4 +1,4 @@
-const torrentManager = require('../src/client/torrentManager');
+const torrentManager = require('../src/server/torrentEngine/torrentManager');
 
 // A simple test framework setup, using Node's built-in assert
 const assert = require('assert');

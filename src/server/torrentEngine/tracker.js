@@ -4,6 +4,14 @@ const dgram = require('dgram');
 const { URL } = require('url');
 const crypto = require('crypto');
 const { decode } = require('./bencode');
+const { RetryManager } = require('./retryManager');
+
+// Tracker health states
+const TRACKER_STATE = {
+  WORKING: 'WORKING',
+  WARNING: 'WARNING',
+  ERROR: 'ERROR'
+};
 
 /**
  * Generates a 20-byte peer ID for this client
@@ -421,5 +429,253 @@ function announce(options) {
   }
 }
 
-module.exports = { announce, announceToTracker, announceToUdpTracker, generatePeerId, urlEncodeBytes };
+/**
+ * Manages multiple trackers with health tracking and failover
+ */
+class TrackerManager {
+  constructor(trackers = []) {
+    this.trackers = trackers.map(url => ({
+      url,
+      state: TRACKER_STATE.WORKING,
+      consecutiveFailures: 0,
+      lastSuccess: null,
+      lastFailure: null,
+      lastError: null,
+      totalAnnounces: 0,
+      successfulAnnounces: 0
+    }));
+    
+    this.retryManager = new RetryManager({
+      maxRetries: 2,
+      baseDelay: 2000,
+      maxDelay: 30000
+    });
+    
+    this.currentTrackerIndex = 0;
+  }
+  
+  /**
+   * Announces to trackers with automatic failover
+   * @param {Object} options - Announce options (without announceUrl)
+   * @returns {Promise<Object>}
+   */
+  async announce(options) {
+    if (this.trackers.length === 0) {
+      throw new Error('No trackers available');
+    }
+    
+    // Sort trackers: WORKING > WARNING > ERROR
+    const sortedTrackers = this._getSortedTrackers();
+    
+    // Try each tracker until one succeeds
+    for (const tracker of sortedTrackers) {
+      try {
+        const result = await this._announceToTracker(tracker, options);
+        return result;
+      } catch (error) {
+        console.warn(`[TrackerManager] Failed to announce to ${tracker.url}: ${error.message}`);
+        // Continue to next tracker
+      }
+    }
+    
+    // All trackers failed
+    throw new Error('All trackers failed');
+  }
+  
+  /**
+   * Announces to a specific tracker with retry logic
+   * @private
+   */
+  async _announceToTracker(tracker, options) {
+    const announceOptions = {
+      ...options,
+      announceUrl: tracker.url
+    };
+    
+    tracker.totalAnnounces++;
+    
+    try {
+      // Use retry manager with custom retry logic
+      const result = await this.retryManager.retry(
+        () => announce(announceOptions),
+        {
+          retryOn: (error) => this._shouldRetry(error),
+          onRetry: (attempt, error) => {
+            console.log(`[TrackerManager] Retrying ${tracker.url} (attempt ${attempt}): ${error.message}`);
+          }
+        }
+      );
+      
+      // Success
+      this._handleSuccess(tracker);
+      return result;
+      
+    } catch (error) {
+      // Failed after retries
+      this._handleFailure(tracker, error);
+      throw error;
+    }
+  }
+  
+  /**
+   * Determines if error should trigger retry
+   * @private
+   */
+  _shouldRetry(error) {
+    const msg = error.message.toLowerCase();
+    
+    // Retry on network errors and 5xx
+    if (msg.includes('econnrefused') || 
+        msg.includes('enotfound') ||
+        msg.includes('etimedout') ||
+        msg.includes('500') ||
+        msg.includes('502') ||
+        msg.includes('503') ||
+        msg.includes('504')) {
+      return true;
+    }
+    
+    // Don't retry on 4xx (client errors)
+    if (msg.includes('400') || msg.includes('404') || msg.includes('403')) {
+      return false;
+    }
+    
+    // Retry by default
+    return true;
+  }
+  
+  /**
+   * Handles successful tracker announce
+   * @private
+   */
+  _handleSuccess(tracker) {
+    tracker.consecutiveFailures = 0;
+    tracker.lastSuccess = Date.now();
+    tracker.successfulAnnounces++;
+    
+    // Update state
+    if (tracker.state !== TRACKER_STATE.WORKING) {
+      console.log(`[TrackerManager] Tracker ${tracker.url} recovered to WORKING state`);
+      tracker.state = TRACKER_STATE.WORKING;
+    }
+  }
+  
+  /**
+   * Handles failed tracker announce
+   * @private
+   */
+  _handleFailure(tracker, error) {
+    tracker.consecutiveFailures++;
+    tracker.lastFailure = Date.now();
+    tracker.lastError = error.message;
+    
+    // Update state based on failure count
+    if (tracker.consecutiveFailures >= 5) {
+      if (tracker.state !== TRACKER_STATE.ERROR) {
+        console.error(`[TrackerManager] Tracker ${tracker.url} marked as ERROR (${tracker.consecutiveFailures} consecutive failures)`);
+        tracker.state = TRACKER_STATE.ERROR;
+      }
+    } else if (tracker.consecutiveFailures >= 2) {
+      if (tracker.state !== TRACKER_STATE.WARNING) {
+        console.warn(`[TrackerManager] Tracker ${tracker.url} marked as WARNING (${tracker.consecutiveFailures} consecutive failures)`);
+        tracker.state = TRACKER_STATE.WARNING;
+      }
+    }
+  }
+  
+  /**
+   * Gets trackers sorted by health (WORKING > WARNING > ERROR)
+   * @private
+   */
+  _getSortedTrackers() {
+    const stateOrder = {
+      [TRACKER_STATE.WORKING]: 0,
+      [TRACKER_STATE.WARNING]: 1,
+      [TRACKER_STATE.ERROR]: 2
+    };
+    
+    return [...this.trackers].sort((a, b) => {
+      // Sort by state first
+      const stateCompare = stateOrder[a.state] - stateOrder[b.state];
+      if (stateCompare !== 0) return stateCompare;
+      
+      // Then by success rate
+      const aSuccessRate = a.totalAnnounces > 0 ? a.successfulAnnounces / a.totalAnnounces : 0;
+      const bSuccessRate = b.totalAnnounces > 0 ? b.successfulAnnounces / b.totalAnnounces : 0;
+      return bSuccessRate - aSuccessRate;
+    });
+  }
+  
+  /**
+   * Periodically retries failed trackers
+   */
+  async retryFailedTrackers() {
+    const errorTrackers = this.trackers.filter(t => t.state === TRACKER_STATE.ERROR);
+    
+    for (const tracker of errorTrackers) {
+      // Only retry if last attempt was > 5 minutes ago
+      if (!tracker.lastFailure || Date.now() - tracker.lastFailure > 5 * 60 * 1000) {
+        console.log(`[TrackerManager] Retrying failed tracker ${tracker.url}`);
+        
+        try {
+          await this._announceToTracker(tracker, {
+            infoHash: Buffer.alloc(20), // Dummy
+            peerId: generatePeerId(),
+            port: 6881,
+            left: 0
+          });
+        } catch (error) {
+          // Expected, just updating state
+        }
+      }
+    }
+  }
+  
+  /**
+   * Gets tracker statistics
+   * @returns {Array}
+   */
+  getStats() {
+    return this.trackers.map(t => ({
+      url: t.url,
+      state: t.state,
+      consecutiveFailures: t.consecutiveFailures,
+      successRate: t.totalAnnounces > 0 ? (t.successfulAnnounces / t.totalAnnounces) : 0,
+      lastSuccess: t.lastSuccess,
+      lastFailure: t.lastFailure,
+      lastError: t.lastError
+    }));
+  }
+  
+  /**
+   * Adds a new tracker
+   * @param {string} url
+   */
+  addTracker(url) {
+    if (!this.trackers.some(t => t.url === url)) {
+      this.trackers.push({
+        url,
+        state: TRACKER_STATE.WORKING,
+        consecutiveFailures: 0,
+        lastSuccess: null,
+        lastFailure: null,
+        lastError: null,
+        totalAnnounces: 0,
+        successfulAnnounces: 0
+      });
+      
+      console.log(`[TrackerManager] Added tracker: ${url}`);
+    }
+  }
+}
+
+module.exports = { 
+  announce, 
+  announceToTracker, 
+  announceToUdpTracker, 
+  generatePeerId, 
+  urlEncodeBytes,
+  TrackerManager,
+  TRACKER_STATE
+};
 

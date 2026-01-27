@@ -2,6 +2,8 @@ const EventEmitter = require('events');
 const fs = require('fs').promises;
 const path = require('path');
 const { Torrent } = require('./torrent');
+const { QueueManager } = require('./queueManager');
+const { StateManager } = require('./stateManager');
 const { 
   emitTorrentAdded, 
   emitTorrentStarted, 
@@ -16,6 +18,7 @@ const {
   emitPeerDisconnected
 } = require('../socket');
 const { getProducer, closeProducer, EVENT_TYPES } = require('./kafkaProducer');
+const { getIO } = require('../socket');
 
 class TorrentEngine extends EventEmitter {
   constructor(options = {}) {
@@ -27,6 +30,9 @@ class TorrentEngine extends EventEmitter {
 
     this.torrents = new Map();
     this.isRunning = false;
+    
+    // Store options for later use
+    this._options = options;
 
     this._stateFilePath = path.join(this.downloadPath, '.torrentedge', 'state.json');
     
@@ -37,10 +43,35 @@ class TorrentEngine extends EventEmitter {
     // Kafka progress throttling (5 seconds)
     this._kafkaProgressThrottle = new Map(); // infoHash -> { lastSent, timer }
     this._kafkaProgressInterval = 5000;
+    
+    // State manager for persistence
+    this._stateManager = new StateManager({
+      stateDir: options.stateDir || './data/state',
+      saveInterval: options.saveInterval || 30000,
+      maxBackups: options.maxBackups || 3
+    });
+    
+    // Resume options
+    this._autoResume = options.autoResume !== false; // default true
+    this._verifyOnResume = options.verifyOnResume || false;
+    
+    // Initialize Queue Manager
+    this._queueManager = new QueueManager({
+      maxConcurrent: options.maxConcurrent || 3,
+      maxConnectionsTotal: options.maxConnectionsTotal || 200,
+      maxConnectionsPerTorrent: options.maxConnectionsPerTorrent || 50,
+      onQueueChange: () => this._emitQueueUpdate()
+    });
+    
+    // Setup queue manager event listeners
+    this._setupQueueManagerEvents();
 
     console.log('[TorrentEngine] Initialized');
     console.log(`[TorrentEngine] Download path: ${this.downloadPath}`);
     console.log(`[TorrentEngine] Max active torrents: ${this.maxActiveTorrents}`);
+    console.log(`[TorrentEngine] Max concurrent (queue): ${options.maxConcurrent || 3}`);
+    console.log(`[TorrentEngine] Auto-resume: ${this._autoResume}`);
+    console.log(`[TorrentEngine] Verify on resume: ${this._verifyOnResume}`);
     console.log(`[TorrentEngine] Port: ${this.port}`);
     
     // Initialize Kafka if enabled
@@ -48,6 +79,188 @@ class TorrentEngine extends EventEmitter {
       this._initKafka(options.kafka).catch(error => {
         console.error(`[TorrentEngine] Kafka initialization failed: ${error.message}`);
       });
+    }
+  }
+  
+  /**
+   * Initializes engine and resumes torrents from saved state
+   */
+  async initialize() {
+    console.log('[TorrentEngine] Initializing engine...');
+    
+    try {
+      // Initialize state manager
+      await this._stateManager.initialize();
+      
+      // Resume torrents if enabled
+      if (this._autoResume) {
+        await this._resumeTorrents();
+      }
+      
+      // Start auto-save
+      this._stateManager.startAutoSave();
+      
+      console.log('[TorrentEngine] Engine initialized successfully');
+      this.emit('initialized');
+      
+    } catch (error) {
+      console.error(`[TorrentEngine] Initialization failed: ${error.message}`);
+      throw error;
+    }
+  }
+  
+  /**
+   * Resumes torrents from saved state
+   * @private
+   */
+  async _resumeTorrents() {
+    console.log('[TorrentEngine] Resuming torrents from saved state...');
+    
+    const savedStates = this._stateManager.getAllTorrentStates();
+    const torrentCount = Object.keys(savedStates).length;
+    
+    if (torrentCount === 0) {
+      console.log('[TorrentEngine] No torrents to resume');
+      return;
+    }
+    
+    console.log(`[TorrentEngine] Found ${torrentCount} torrents in saved state`);
+    
+    let resumed = 0;
+    let failed = 0;
+    
+    for (const [infoHash, state] of Object.entries(savedStates)) {
+      try {
+        console.log(`[TorrentEngine] Resuming: ${state.magnetURI || state.torrentPath || infoHash}`);
+        
+        // Create torrent options
+        const torrentOptions = {
+          downloadPath: state.downloadPath || this.downloadPath,
+          port: this.port,
+          autoStart: false // Don't auto-start, let queue manager handle it
+        };
+        
+        // Use saved metadata if available (for magnet links)
+        if (state.metadata) {
+          try {
+            torrentOptions.torrentBuffer = Buffer.from(state.metadata, 'base64');
+          } catch (error) {
+            console.warn(`[TorrentEngine] Failed to restore metadata for ${infoHash}: ${error.message}`);
+          }
+        }
+        
+        // Add torrent source
+        if (state.magnetURI) {
+          torrentOptions.magnetURI = state.magnetURI;
+        } else if (state.torrentPath) {
+          torrentOptions.torrentPath = state.torrentPath;
+        } else {
+          console.warn(`[TorrentEngine] No torrent source for ${infoHash}, skipping`);
+          failed++;
+          continue;
+        }
+        
+        // Create torrent instance
+        const torrent = new Torrent(torrentOptions);
+        
+        // Wait for torrent to be ready
+        await new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            reject(new Error('Torrent initialization timeout'));
+          }, 30000); // 30 second timeout
+          
+          torrent.once('ready', () => {
+            clearTimeout(timeout);
+            resolve();
+          });
+          
+          torrent.once('error', (error) => {
+            clearTimeout(timeout);
+            reject(error);
+          });
+        });
+        
+        // Verify infoHash matches
+        if (torrent.infoHash !== infoHash) {
+          console.warn(`[TorrentEngine] InfoHash mismatch for resumed torrent (expected: ${infoHash}, got: ${torrent.infoHash})`);
+          failed++;
+          continue;
+        }
+        
+        // Restore torrent state
+        await this._restoreTorrentState(torrent, state);
+        
+        // Setup event forwarding
+        this._setupTorrentEvents(torrent, infoHash);
+        
+        // Add to torrents map
+        this.torrents.set(infoHash, torrent);
+        
+        // Determine if should start or stay paused
+        const shouldStart = state.state === 'downloading' || state.state === 'seeding' || state.state === 'queued';
+        const startPaused = state.state === 'paused' || !shouldStart;
+        
+        // Add to queue manager
+        this._queueManager.add(torrent, {
+          priority: state.priority || 'normal',
+          startPaused
+        });
+        
+        resumed++;
+        console.log(`[TorrentEngine] Resumed: ${torrent.name} (${state.state})`);
+        
+      } catch (error) {
+        console.error(`[TorrentEngine] Failed to resume ${infoHash}: ${error.message}`);
+        failed++;
+        
+        // Remove from state if resume failed
+        this._stateManager.removeTorrentState(infoHash);
+      }
+    }
+    
+    console.log(`[TorrentEngine] Resume complete: ${resumed} succeeded, ${failed} failed`);
+  }
+  
+  /**
+   * Restores state to a torrent instance
+   * @private
+   */
+  async _restoreTorrentState(torrent, state) {
+    console.log(`[TorrentEngine] Restoring state for ${torrent.name}...`);
+    
+    try {
+      // Restore completed pieces if available
+      if (state.completedPieces && Array.isArray(state.completedPieces) && state.completedPieces.length > 0) {
+        console.log(`[TorrentEngine] Restoring ${state.completedPieces.length} completed pieces`);
+        
+        if (this._verifyOnResume) {
+          // Verify pieces on resume
+          console.log('[TorrentEngine] Verifying pieces on resume...');
+          
+          // This will be handled by the torrent's verify method
+          // For now, just trust the saved state
+        }
+        
+        // Set completed pieces (this should be implemented in Torrent class)
+        if (typeof torrent.setCompletedPieces === 'function') {
+          torrent.setCompletedPieces(state.completedPieces);
+        }
+      }
+      
+      // Restore statistics
+      if (state.totalDownloaded) {
+        torrent._totalDownloaded = state.totalDownloaded;
+      }
+      
+      if (state.totalUploaded) {
+        torrent._totalUploaded = state.totalUploaded;
+      }
+      
+      console.log(`[TorrentEngine] State restored for ${torrent.name}`);
+      
+    } catch (error) {
+      console.error(`[TorrentEngine] Failed to restore state: ${error.message}`);
+      throw error;
     }
   }
 
@@ -92,6 +305,68 @@ class TorrentEngine extends EventEmitter {
       });
     } catch (error) {
       console.error(`[TorrentEngine] Kafka send failed for ${type}: ${error.message}`);
+    }
+  }
+  
+  /**
+   * Setup queue manager event listeners
+   * @private
+   */
+  _setupQueueManagerEvents() {
+    this._queueManager.on('queue:add', (data) => {
+      console.log(`[TorrentEngine] Queue: Added ${data.name} (${data.status})`);
+      this._emitQueueUpdate();
+    });
+    
+    this._queueManager.on('queue:start', (data) => {
+      console.log(`[TorrentEngine] Queue: Started ${data.name}`);
+      this._emitQueueUpdate();
+    });
+    
+    this._queueManager.on('queue:pause', (data) => {
+      console.log(`[TorrentEngine] Queue: Paused ${data.name}`);
+      this._emitQueueUpdate();
+    });
+    
+    this._queueManager.on('queue:complete', (data) => {
+      console.log(`[TorrentEngine] Queue: Completed ${data.name}`);
+      this._emitQueueUpdate();
+    });
+    
+    this._queueManager.on('queue:remove', (data) => {
+      console.log(`[TorrentEngine] Queue: Removed torrent (${data.status})`);
+      this._emitQueueUpdate();
+    });
+    
+    this._queueManager.on('queue:reorder', (data) => {
+      console.log(`[TorrentEngine] Queue: Reordered ${data.infoHash}`);
+      this._emitQueueUpdate();
+    });
+    
+    this._queueManager.on('torrent:error', (data) => {
+      console.error(`[TorrentEngine] Queue: Torrent error - ${data.name}: ${data.error}`);
+    });
+  }
+  
+  /**
+   * Emits queue state update via Socket.IO
+   * @private
+   */
+  _emitQueueUpdate() {
+    try {
+      const io = getIO();
+      if (!io) return;
+      
+      const stats = this._queueManager.getStats();
+      const allTorrents = this._queueManager.getAll();
+      
+      io.to('all').emit('queue:updated', {
+        stats,
+        torrents: allTorrents,
+        timestamp: Date.now()
+      });
+    } catch (error) {
+      console.warn(`[TorrentEngine] Failed to emit queue update: ${error.message}`);
     }
   }
   
@@ -156,10 +431,12 @@ class TorrentEngine extends EventEmitter {
 
       const downloadPath = options.downloadPath || this.downloadPath;
       const autoStart = options.autoStart !== undefined ? options.autoStart : true;
+      const priority = options.priority || 'normal';
+      const startPaused = options.startPaused || false;
 
       console.log('[TorrentEngine] Adding torrent');
 
-      // Create Torrent instance
+      // Create Torrent instance (but don't auto-start)
       const torrent = new Torrent({
         torrentPath: options.torrentPath,
         torrentBuffer: options.torrentBuffer,
@@ -216,10 +493,27 @@ class TorrentEngine extends EventEmitter {
         downloadPath: torrent.downloadPath
       });
 
-      // Auto-start if requested
-      if (autoStart) {
-        await this._startTorrent(torrent);
-      }
+      // Add to queue manager (will auto-start if slots available)
+      this._queueManager.add(torrent, {
+        priority,
+        startPaused: startPaused || !autoStart
+      });
+      
+      // Save initial state
+      this._stateManager.setTorrentState(infoHash, {
+        infoHash,
+        magnetURI: options.magnetURI,
+        torrentPath: options.torrentPath,
+        downloadPath: torrent.downloadPath,
+        priority,
+        state: startPaused || !autoStart ? 'paused' : 'queued',
+        addedAt: Date.now(),
+        completedPieces: [],
+        downloadedBytes: 0,
+        uploadedBytes: 0,
+        totalDownloaded: 0,
+        totalUploaded: 0
+      });
 
       return torrent;
 
@@ -239,10 +533,17 @@ class TorrentEngine extends EventEmitter {
     try {
       console.log(`[TorrentEngine] Removing torrent: ${torrent.name} (${infoHash})`);
 
-      // Stop torrent if active
+      // Remove from queue manager (handles stopping if active)
+      this._queueManager.remove(infoHash);
+
+      // Stop torrent if still active
       if (torrent.state !== 'idle') {
         await torrent.stop();
       }
+      
+      // Remove from state
+      this._stateManager.removeTorrentState(infoHash);
+      await this._stateManager.flush(); // Save immediately
 
       // Delete files if requested
       if (deleteFiles) {
@@ -309,15 +610,23 @@ class TorrentEngine extends EventEmitter {
       throw new Error(`Torrent not found: ${infoHash}`);
     }
     
-    if (torrent.state !== 'downloading') {
-      console.log(`[TorrentEngine] Cannot pause: ${torrent.name} is not downloading`);
-      return;
-    }
-    
     try {
-      torrent.pause();
+      // Delegate to queue manager
+      const paused = this._queueManager.pause(infoHash);
+      
+      if (!paused) {
+        console.log(`[TorrentEngine] Cannot pause: ${torrent.name} is not active`);
+        return;
+      }
+      
       console.log(`[TorrentEngine] Paused torrent: ${torrent.name}`);
       this.emit('torrent:paused', { infoHash });
+      
+      // Update state
+      this._stateManager.setTorrentState(infoHash, {
+        state: 'paused'
+      });
+      await this._stateManager.flush(); // Save immediately on state change
       
       // Emit Socket.IO event
       try {
@@ -351,15 +660,23 @@ class TorrentEngine extends EventEmitter {
       throw new Error(`Torrent not found: ${infoHash}`);
     }
     
-    if (torrent.state !== 'paused') {
-      console.log(`[TorrentEngine] Cannot resume: ${torrent.name} is not paused`);
-      return;
-    }
-    
     try {
-      torrent.resume();
+      // Delegate to queue manager
+      const resumed = this._queueManager.start(infoHash);
+      
+      if (!resumed) {
+        console.log(`[TorrentEngine] Cannot resume: ${torrent.name} is not paused or queued`);
+        return;
+      }
+      
       console.log(`[TorrentEngine] Resumed torrent: ${torrent.name}`);
       this.emit('torrent:resumed', { infoHash });
+      
+      // Update state
+      this._stateManager.setTorrentState(infoHash, {
+        state: 'downloading'
+      });
+      await this._stateManager.flush(); // Save immediately on state change
       
       // Emit Socket.IO event
       try {
@@ -590,6 +907,13 @@ class TorrentEngine extends EventEmitter {
         path: path.join(torrent.downloadPath, torrent.name)
       });
       
+      // Update state
+      this._stateManager.setTorrentState(infoHash, {
+        state: 'completed',
+        completedAt: Date.now()
+      });
+      this._stateManager.flush(); // Save immediately on completion
+      
       // Emit Socket.IO event
       try {
         emitTorrentCompleted(infoHash, {
@@ -642,6 +966,11 @@ class TorrentEngine extends EventEmitter {
       console.log(`[TorrentEngine] Torrent started: ${torrent.name}`);
       torrent._startTime = Date.now(); // Track start time for download duration
       
+      // Update state
+      this._stateManager.setTorrentState(infoHash, {
+        state: 'downloading'
+      });
+      
       // Emit Socket.IO event
       try {
         emitTorrentStarted(infoHash, {
@@ -666,7 +995,10 @@ class TorrentEngine extends EventEmitter {
       console.log(`[TorrentEngine] Torrent stopped: ${torrent.name}`);
     });
     
-    // Progress updates
+    // Progress updates (throttled state saves)
+    let lastStateSave = 0;
+    const stateSaveInterval = 10000; // Save state every 10 seconds during progress
+    
     torrent.on('progress', (data) => {
       // Emit Socket.IO event (throttled by socket layer at 500ms)
       try {
@@ -683,6 +1015,18 @@ class TorrentEngine extends EventEmitter {
         
         emitProgress(infoHash, progressData);
         
+        // Throttled state save for progress
+        const now = Date.now();
+        if (now - lastStateSave >= stateSaveInterval) {
+          this._stateManager.setTorrentState(infoHash, {
+            downloadedBytes: stats.downloaded,
+            uploadedBytes: stats.uploaded || 0,
+            totalDownloaded: torrent._totalDownloaded || 0,
+            totalUploaded: torrent._totalUploaded || 0
+          });
+          lastStateSave = now;
+        }
+        
         // Send to Kafka with more aggressive throttling (5 seconds)
         this._sendKafkaProgress(infoHash, {
           ...progressData,
@@ -696,8 +1040,14 @@ class TorrentEngine extends EventEmitter {
       }
     });
     
-    // Piece completed
+    // Piece completed - update completed pieces in state (batched)
+    let pieceUpdateBatch = [];
+    let pieceUpdateTimer = null;
+    
     torrent.on('piece', ({ index }) => {
+      // Add to batch
+      pieceUpdateBatch.push(index);
+      
       // Emit Socket.IO event
       try {
         const stats = torrent.getStats();
@@ -716,6 +1066,42 @@ class TorrentEngine extends EventEmitter {
         });
       } catch (error) {
         console.warn(`[TorrentEngine] Failed to emit torrent:piece: ${error.message}`);
+      }
+      
+      // Batch update state (save every 10 pieces or every 5 seconds)
+      if (!pieceUpdateTimer) {
+        pieceUpdateTimer = setTimeout(() => {
+          if (pieceUpdateBatch.length > 0) {
+            const currentState = this._stateManager.getTorrentState(infoHash);
+            const completedPieces = currentState?.completedPieces || [];
+            const updatedPieces = [...new Set([...completedPieces, ...pieceUpdateBatch])];
+            
+            this._stateManager.setTorrentState(infoHash, {
+              completedPieces: updatedPieces
+            });
+            
+            pieceUpdateBatch = [];
+          }
+          pieceUpdateTimer = null;
+        }, 5000);
+      }
+      
+      // Force save every 10 pieces
+      if (pieceUpdateBatch.length >= 10) {
+        if (pieceUpdateTimer) {
+          clearTimeout(pieceUpdateTimer);
+          pieceUpdateTimer = null;
+        }
+        
+        const currentState = this._stateManager.getTorrentState(infoHash);
+        const completedPieces = currentState?.completedPieces || [];
+        const updatedPieces = [...new Set([...completedPieces, ...pieceUpdateBatch])];
+        
+        this._stateManager.setTorrentState(infoHash, {
+          completedPieces: updatedPieces
+        });
+        
+        pieceUpdateBatch = [];
       }
     });
     
@@ -769,12 +1155,112 @@ class TorrentEngine extends EventEmitter {
   }
   
   /**
+   * Sets maximum concurrent torrents
+   * @param {number} max
+   */
+  setMaxConcurrent(max) {
+    this._queueManager.setMaxConcurrent(max);
+    console.log(`[TorrentEngine] Max concurrent set to: ${max}`);
+  }
+  
+  /**
+   * Sets priority for a torrent
+   * @param {string} infoHash
+   * @param {'low' | 'normal' | 'high'} priority
+   */
+  setPriority(infoHash, priority) {
+    const success = this._queueManager.setPriority(infoHash, priority);
+    
+    if (success) {
+      console.log(`[TorrentEngine] Set priority for ${infoHash} to ${priority}`);
+    }
+    
+    return success;
+  }
+  
+  /**
+   * Gets queue position for a torrent
+   * @param {string} infoHash
+   * @returns {number} Position in queue (-1 if not queued)
+   */
+  getQueuePosition(infoHash) {
+    const allTorrents = this._queueManager.getAll();
+    const torrentInfo = allTorrents.find(t => t.infoHash === infoHash);
+    
+    return torrentInfo && torrentInfo.position !== undefined ? torrentInfo.position : -1;
+  }
+  
+  /**
+   * Moves torrent to specific position in queue
+   * @param {string} infoHash
+   * @param {number} position
+   */
+  moveInQueue(infoHash, position) {
+    this._queueManager.moveInQueue(infoHash, position);
+    console.log(`[TorrentEngine] Moved ${infoHash} to position ${position}`);
+  }
+  
+  /**
+   * Gets queue statistics
+   * @returns {Object}
+   */
+  getQueueStats() {
+    return this._queueManager.getStats();
+  }
+  
+  /**
+   * Gets comprehensive engine statistics including queue
+   * @returns {Object}
+   */
+  getStats() {
+    const queueStats = this._queueManager.getStats();
+    const allTorrents = this.getAllTorrents();
+    
+    let totalSize = 0;
+    let totalDownloaded = 0;
+    let totalUploaded = 0;
+    
+    for (const torrent of allTorrents) {
+      totalSize += torrent.size || 0;
+      const stats = torrent.getStats ? torrent.getStats() : {};
+      totalDownloaded += stats.downloaded || 0;
+      totalUploaded += stats.uploaded || 0;
+    }
+    
+    return {
+      totalTorrents: this.torrents.size,
+      activeTorrents: this.activeTorrents,
+      totalSize,
+      totalDownloaded,
+      totalUploaded,
+      totalDownloadSpeed: queueStats.totalDownloadSpeed,
+      totalUploadSpeed: queueStats.totalUploadSpeed,
+      totalConnections: queueStats.totalConnections,
+      queue: {
+        active: queueStats.activeCount,
+        queued: queueStats.queuedCount,
+        paused: queueStats.pausedCount,
+        completed: queueStats.completedCount,
+        maxConcurrent: queueStats.maxConcurrent
+      }
+    };
+  }
+  
+  /**
    * Shutdown the engine gracefully
    */
   async shutdown() {
     console.log('[TorrentEngine] Shutting down...');
     
     try {
+      // Stop auto-save and flush state
+      console.log('[TorrentEngine] Saving final state...');
+      await this._stateManager.stopAutoSave();
+      await this._stateManager.flush();
+      
+      // Cleanup queue manager
+      await this._queueManager.cleanup();
+      
       // Stop all torrents
       await this.stopAll();
       
@@ -792,6 +1278,9 @@ class TorrentEngine extends EventEmitter {
         await closeProducer();
         this._kafkaProducer = null;
       }
+      
+      // Final state cleanup
+      await this._stateManager.cleanup();
       
       console.log('[TorrentEngine] Shutdown complete');
       

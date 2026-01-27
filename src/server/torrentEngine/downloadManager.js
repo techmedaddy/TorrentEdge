@@ -12,11 +12,29 @@ class DownloadManager extends EventEmitter {
     this.peerManager = options.peerManager;
     this.downloadPath = options.downloadPath;
     this.maxActiveRequests = options.maxActiveRequests || 5;
+    
+    // Error handling options
+    this.maxPieceRetries = options.maxPieceRetries || 10;
+    this.maxPeerFailuresPerPiece = options.maxPeerFailuresPerPiece || 3;
 
     this.pieces = [];
     this.activePieces = new Map();
     this.completedPieces = new Set();
     this.pendingRequests = new Map();
+    
+    // Piece retry tracking: pieceIndex -> { attempts, failedPeers: Set, lastAttempt }
+    this.pieceRetries = new Map();
+    
+    // Peer piece failure tracking: peerKey -> { pieceIndex, failures }
+    this.peerPieceFailures = new Map();
+    
+    // Problematic pieces (too many failures)
+    this.problematicPieces = new Set();
+    
+    // Endgame mode tracking
+    this.isInEndgame = false;
+    this.endgameThreshold = 0.95; // Enter endgame at 95%
+    this.endgameRequests = new Map(); // pieceIndex -> Set<peerKeys>
     
     this.downloadedBytes = 0;
     this.isComplete = false;
@@ -318,6 +336,7 @@ class DownloadManager extends EventEmitter {
 
   async handlePieceMessage(peer, index, begin, data) {
     const requestKey = `${index}:${begin}`;
+    const peerKey = `${peer.ip}:${peer.port}`;
     
     if (!this.pendingRequests.has(requestKey)) {
       console.warn(`[DownloadManager] Received unrequested piece ${index} block ${begin}`);
@@ -325,7 +344,12 @@ class DownloadManager extends EventEmitter {
     }
 
     this.pendingRequests.delete(requestKey);
-    console.log(`[DownloadManager] Received piece ${index} block ${begin} from ${peer.ip}:${peer.port}`);
+    console.log(`[DownloadManager] Received piece ${index} block ${begin} from ${peerKey}`);
+    
+    // In endgame mode, cancel duplicate requests
+    if (this.isInEndgame) {
+      this._cancelDuplicateEndgameRequests(index, peerKey);
+    }
 
     const piece = this.getPieceByIndex(index);
 
@@ -338,15 +362,23 @@ class DownloadManager extends EventEmitter {
 
         if (isValid) {
           console.log(`[DownloadManager] Piece ${index} verified successfully`);
+          this._recordPieceSuccess(index, peerKey);
           await this._handleVerifiedPiece(piece);
         } else {
-          console.error(`[DownloadManager] Piece ${index} failed verification`);
+          console.error(`[DownloadManager] Piece ${index} failed verification from ${peerKey}`);
+          this._recordPieceFailure(index, peerKey);
           this._handleFailedPiece(piece, peer, 'Hash verification failed');
         }
       }
     } catch (error) {
       console.error(`[DownloadManager] Error handling piece data: ${error.message}`);
-      this.emit('error', { message: `Error handling piece data: ${error.message}` });
+      this._recordPieceFailure(index, peerKey);
+      this.emit('error', { 
+        category: 'PIECE_ERROR',
+        message: `Error handling piece data: ${error.message}`,
+        recoverable: true,
+        action: 'retry'
+      });
     }
 
     // Continue requesting
@@ -393,7 +425,47 @@ class DownloadManager extends EventEmitter {
   }
 
   _handleFailedPiece(piece, peer, reason) {
-    console.error(`[DownloadManager] Piece ${piece.index} failed: ${reason} (from ${peer.ip}:${peer.port})`);
+    const peerKey = `${peer.ip}:${peer.port}`;
+    console.error(`[DownloadManager] Piece ${piece.index} failed: ${reason} (from ${peerKey})`);
+    
+    // Track retry attempts
+    let retryInfo = this.pieceRetries.get(piece.index);
+    if (!retryInfo) {
+      retryInfo = {
+        attempts: 0,
+        failedPeers: new Set(),
+        lastAttempt: Date.now()
+      };
+      this.pieceRetries.set(piece.index, retryInfo);
+    }
+    
+    retryInfo.attempts++;
+    retryInfo.failedPeers.add(peerKey);
+    retryInfo.lastAttempt = Date.now();
+    
+    // Check if this piece has failed too many times
+    if (retryInfo.attempts >= this.maxPieceRetries) {
+      console.error(`[DownloadManager] Piece ${piece.index} marked as problematic after ${retryInfo.attempts} failures`);
+      this.problematicPieces.add(piece.index);
+      
+      this.emit('piece:problematic', {
+        index: piece.index,
+        attempts: retryInfo.attempts,
+        reason: 'Max retries exceeded'
+      });
+    }
+    
+    // Strike peer if hash mismatch (invalid piece data)
+    if (reason.includes('Hash') || reason.includes('verification')) {
+      if (this.peerManager.banManager) {
+        this.peerManager.banManager.strike(peerKey, 'invalid_piece');
+      }
+      
+      // Report hash mismatch to peer connection
+      if (peer.reportHashMismatch) {
+        peer.reportHashMismatch(piece.index);
+      }
+    }
     
     piece.reset();
     this.activePieces.delete(piece.index);
@@ -408,7 +480,13 @@ class DownloadManager extends EventEmitter {
     }
 
     console.log(`[DownloadManager] Canceled ${canceledCount} pending requests for piece ${piece.index}`);
-    this.emit('piece:failed', { index: piece.index, reason, peer: `${peer.ip}:${peer.port}` });
+    this.emit('piece:failed', { 
+      index: piece.index, 
+      reason, 
+      peer: peerKey,
+      attempts: retryInfo.attempts,
+      willRetry: retryInfo.attempts < this.maxPieceRetries
+    });
   }
 
   async _writePieceToDisk(piece) {
@@ -562,6 +640,147 @@ class DownloadManager extends EventEmitter {
     }
 
     return bitfield;
+  }
+  
+  /**
+   * Records successful piece download from peer
+   * @private
+   */
+  _recordPieceSuccess(pieceIndex, peerKey) {
+    // Clear retry info on success
+    if (this.pieceRetries.has(pieceIndex)) {
+      this.pieceRetries.delete(pieceIndex);
+    }
+    
+    // Clear from problematic pieces
+    if (this.problematicPieces.has(pieceIndex)) {
+      this.problematicPieces.delete(pieceIndex);
+      console.log(`[DownloadManager] Piece ${pieceIndex} recovered from problematic state`);
+    }
+  }
+  
+  /**
+   * Records piece failure from peer
+   * @private
+   */
+  _recordPieceFailure(pieceIndex, peerKey) {
+    // Track per-peer piece failures
+    let peerFailures = this.peerPieceFailures.get(peerKey);
+    if (!peerFailures) {
+      peerFailures = new Map(); // pieceIndex -> count
+      this.peerPieceFailures.set(peerKey, peerFailures);
+    }
+    
+    const failCount = (peerFailures.get(pieceIndex) || 0) + 1;
+    peerFailures.set(pieceIndex, failCount);
+    
+    // Ban peer if too many failures for this piece
+    if (failCount >= this.maxPeerFailuresPerPiece) {
+      console.warn(`[DownloadManager] Peer ${peerKey} has ${failCount} failures for piece ${pieceIndex}`);
+      
+      if (this.peerManager.banManager) {
+        this.peerManager.banManager.strike(peerKey, 'invalid_piece');
+      }
+    }
+  }
+  
+  /**
+   * Checks if should enter endgame mode
+   * @private
+   */
+  _checkEndgameMode() {
+    if (this.isInEndgame) return;
+    
+    const progress = this.completedPieces.size / this.pieces.length;
+    
+    if (progress >= this.endgameThreshold) {
+      console.log(`[DownloadManager] Entering endgame mode at ${(progress * 100).toFixed(1)}%`);
+      this.isInEndgame = true;
+      this.emit('endgame:start');
+    }
+  }
+  
+  /**
+   * Requests piece from multiple peers in endgame mode
+   * @private
+   */
+  _requestEndgamePiece(pieceIndex) {
+    const peers = this.peerManager.getConnectedPeers()
+      .filter(p => !p.peerChoking && this._peerHasPiece(p, pieceIndex));
+    
+    if (peers.length === 0) return false;
+    
+    // Request from up to 3 peers simultaneously
+    const peersToRequest = peers.slice(0, Math.min(3, peers.length));
+    let requested = false;
+    
+    for (const peer of peersToRequest) {
+      const peerKey = `${peer.ip}:${peer.port}`;
+      
+      // Track endgame requests
+      if (!this.endgameRequests.has(pieceIndex)) {
+        this.endgameRequests.set(pieceIndex, new Set());
+      }
+      this.endgameRequests.get(pieceIndex).add(peerKey);
+      
+      // Request the piece
+      if (this._requestPieceFromPeer(peer, pieceIndex)) {
+        requested = true;
+      }
+    }
+    
+    return requested;
+  }
+  
+  /**
+   * Cancels duplicate requests in endgame mode
+   * @private
+   */
+  _cancelDuplicateEndgameRequests(pieceIndex, completedPeerKey) {
+    const endgameSet = this.endgameRequests.get(pieceIndex);
+    if (!endgameSet) return;
+    
+    // Cancel requests to other peers for this piece
+    for (const peerKey of endgameSet) {
+      if (peerKey === completedPeerKey) continue;
+      
+      // Find peer and send cancel
+      const [ip, port] = peerKey.split(':');
+      const peer = this.peerManager.getPeer(ip, parseInt(port));
+      
+      if (peer && peer.sendCancel) {
+        const piece = this.getPieceByIndex(pieceIndex);
+        for (let i = 0; i < piece.blocks.length; i++) {
+          const offset = i * piece.blockSize;
+          const length = Math.min(piece.blockSize, piece.length - offset);
+          
+          try {
+            peer.sendCancel(pieceIndex, offset, length);
+          } catch (error) {
+            // Ignore cancel errors
+          }
+        }
+      }
+    }
+    
+    // Clear endgame tracking for this piece
+    this.endgameRequests.delete(pieceIndex);
+  }
+  
+  /**
+   * Gets download statistics including error info
+   * @returns {Object}
+   */
+  getStats() {
+    const progress = this.getProgress();
+    
+    return {
+      ...progress,
+      isInEndgame: this.isInEndgame,
+      problematicPieces: this.problematicPieces.size,
+      pieceRetries: this.pieceRetries.size,
+      peerFailures: this.peerPieceFailures.size
+    };
   }
 }
 

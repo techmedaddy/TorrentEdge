@@ -4,10 +4,23 @@ const crypto = require('crypto');
 const { parseTorrent } = require('./torrentParser');
 const { parseMagnet } = require('./magnet');
 const { announce } = require('./tracker');
+const { TrackerManager } = require('./tracker');
 const { PeerManager } = require('./peerManager');
 const { DownloadManager } = require('./downloadManager');
 const { FileWriter } = require('./fileWriter');
 const { MetadataDownloader } = require('./extensionProtocol');
+const UploadManager = require('./uploadManager');
+const { RetryManager } = require('./retryManager');
+
+// Error categories for structured error handling
+const ERROR_CATEGORY = {
+  TRACKER: 'TRACKER',
+  PEER: 'PEER',
+  FILESYSTEM: 'FILESYSTEM',
+  PROTOCOL: 'PROTOCOL',
+  VERIFICATION: 'VERIFICATION',
+  METADATA: 'METADATA'
+};
 
 /**
  * SpeedTracker - Calculates smoothed speed using exponential moving average
@@ -85,6 +98,13 @@ class Torrent extends EventEmitter {
     this._downloadManager = null;
     this._fileWriter = null;
     this._metadataDownloader = null;
+    this._uploadManager = null;
+    this._pieceManager = null;
+    this._throttler = options.throttler || null;
+    
+    // Error handling
+    this._retryManager = new RetryManager({ maxRetries: 3, baseDelay: 2000 });
+    this._trackerManager = null; // Initialized after parsing metadata
     
     // Magnet link specific properties
     this._needsMetadata = false;
@@ -94,7 +114,17 @@ class Torrent extends EventEmitter {
     this._announceInterval = null;
     this._statsInterval = null;
     this._progressIntervalTimer = null;
+    this._chokingInterval = null;
+    this._seedingLimitCheckInterval = null;
     this._state = 'idle';
+    
+    // Seeding options
+    this._seedRatioLimit = options.seedRatioLimit || 0; // 0 = forever
+    this._seedTimeLimit = options.seedTimeLimit || 0; // minutes, 0 = forever
+    this._seedIdleLimit = options.seedIdleLimit || 0; // minutes, 0 = forever
+    this._seedingStartTime = null;
+    this._lastUploadTime = null;
+    this._completedOnce = false; // Track if we've announced completion
     
     // Speed trackers with exponential moving average
     this._downloadSpeedTracker = new SpeedTracker(5000);
@@ -171,14 +201,148 @@ class Torrent extends EventEmitter {
       console.log(`[Torrent] Size: ${this._formatBytes(this._metadata.length)}`);
       console.log(`[Torrent] Pieces: ${this._metadata.pieces.length}`);
       console.log(`[Torrent] Files: ${this._metadata.files ? this._metadata.files.length : 1}`);
+      
+      // Initialize TrackerManager with all available trackers
+      this._initializeTrackerManager();
 
       // Emit 'ready' asynchronously to allow listeners to be registered
       setImmediate(() => this.emit('ready'));
     } catch (error) {
       console.error(`[Torrent] Initialization error: ${error.message}`);
+      this._handleError(error, ERROR_CATEGORY.METADATA, 'Initialization failed', true);
       this._state = 'error';
-      setImmediate(() => this.emit('error', { message: error.message }));
       throw error;
+    }
+  }
+  
+  /**
+   * Initializes tracker manager with all available trackers
+   * @private
+   */
+  _initializeTrackerManager() {
+    const trackers = [];
+    
+    if (this._metadata.announce) {
+      trackers.push(this._metadata.announce);
+    }
+    
+    if (this._metadata.announceList && Array.isArray(this._metadata.announceList)) {
+      for (const tier of this._metadata.announceList) {
+        if (Array.isArray(tier)) {
+          trackers.push(...tier);
+        }
+      }
+    }
+    
+    // Remove duplicates
+    const uniqueTrackers = [...new Set(trackers)];
+    
+    this._trackerManager = new TrackerManager(uniqueTrackers);
+    console.log(`[Torrent] Initialized TrackerManager with ${uniqueTrackers.length} trackers`);
+  }
+  
+  /**
+   * Centralized error handling with categorization
+   * @private
+   */
+  _handleError(error, category, context, fatal = false) {
+    const errorEvent = {
+      category,
+      code: this._getErrorCode(category, error),
+      message: error.message,
+      context,
+      details: {
+        state: this._state,
+        infoHash: this.infoHash,
+        name: this.name
+      },
+      recoverable: !fatal,
+      action: fatal ? 'pause' : this._getRecoveryAction(category)
+    };
+    
+    console.error(`[Torrent] ${category} error (${context}): ${error.message}`);
+    
+    // Execute recovery action
+    if (!fatal) {
+      this._executeRecoveryAction(errorEvent);
+    }
+    
+    this.emit('error', errorEvent);
+  }
+  
+  /**
+   * Gets error code from category
+   * @private
+   */
+  _getErrorCode(category, error) {
+    const msg = error.message.toLowerCase();
+    
+    if (category === ERROR_CATEGORY.TRACKER) {
+      if (msg.includes('timeout')) return 'TRACKER_TIMEOUT';
+      if (msg.includes('404') || msg.includes('not found')) return 'TRACKER_NOT_FOUND';
+      return 'TRACKER_ERROR';
+    } else if (category === ERROR_CATEGORY.PEER) {
+      return 'PEER_ERROR';
+    } else if (category === ERROR_CATEGORY.FILESYSTEM) {
+      if (msg.includes('enospc')) return 'DISK_FULL';
+      if (msg.includes('eacces')) return 'PERMISSION_DENIED';
+      return 'FILESYSTEM_ERROR';
+    } else if (category === ERROR_CATEGORY.VERIFICATION) {
+      return 'HASH_MISMATCH';
+    }
+    
+    return 'UNKNOWN_ERROR';
+  }
+  
+  /**
+   * Determines recovery action for error category
+   * @private
+   */
+  _getRecoveryAction(category) {
+    switch (category) {
+      case ERROR_CATEGORY.TRACKER:
+        return 'retry'; // Retry with next tracker
+      case ERROR_CATEGORY.PEER:
+        return 'skip'; // Disconnect and try other peers
+      case ERROR_CATEGORY.FILESYSTEM:
+        return 'pause'; // Pause until resolved
+      case ERROR_CATEGORY.VERIFICATION:
+        return 'retry'; // Re-request piece
+      case ERROR_CATEGORY.METADATA:
+        return 'abort'; // Fatal
+      default:
+        return 'retry';
+    }
+  }
+  
+  /**
+   * Executes recovery action
+   * @private
+   */
+  async _executeRecoveryAction(errorEvent) {
+    switch (errorEvent.action) {
+      case 'retry':
+        if (errorEvent.category === ERROR_CATEGORY.TRACKER) {
+          console.log('[Torrent] Retrying tracker announce...');
+          setTimeout(() => this._announceToTracker().catch(() => {}), 5000);
+        } else if (errorEvent.category === ERROR_CATEGORY.VERIFICATION) {
+          console.log('[Torrent] Will re-request failed piece');
+        }
+        break;
+        
+      case 'skip':
+        console.log('[Torrent] Skipping problematic component');
+        break;
+        
+      case 'pause':
+        console.log('[Torrent] Pausing due to error');
+        await this.pause();
+        break;
+        
+      case 'abort':
+        console.log('[Torrent] Aborting due to fatal error');
+        await this.stop();
+        break;
     }
   }
 
@@ -332,15 +496,157 @@ class Torrent extends EventEmitter {
     this._state = 'downloading';
     this.emit('resumed');
   }
+  
+  /**
+   * Resumes a torrent with optional verification
+   * @param {Object} options - { verify: boolean }
+   */
+  async resumeWithVerification(options = {}) {
+    const shouldVerify = options.verify || false;
+    
+    console.log(`[Torrent] Resuming torrent${shouldVerify ? ' with verification' : ''}: ${this.name}`);
+    
+    if (!this._downloadManager) {
+      throw new Error('Download manager not initialized');
+    }
+    
+    if (shouldVerify) {
+      console.log('[Torrent] Verifying completed pieces...');
+      
+      // Get completed pieces from download manager
+      const completedPieces = Array.from(this._downloadManager.completedPieces || []);
+      
+      if (completedPieces.length > 0) {
+        try {
+          // Verify pieces
+          const verifyResult = await this._downloadManager.verifyPieces?.(completedPieces) || 
+                                await this._verifyPiecesManually(completedPieces);
+          
+          console.log(`[Torrent] Verification complete: ${verifyResult.valid.length} valid, ${verifyResult.invalid.length} invalid, ${verifyResult.missing.length} missing`);
+          
+          // Mark invalid pieces as incomplete
+          for (const invalidPiece of verifyResult.invalid) {
+            this._downloadManager.completedPieces.delete(invalidPiece);
+          }
+          
+          for (const missingPiece of verifyResult.missing) {
+            this._downloadManager.completedPieces.delete(missingPiece);
+          }
+          
+          // Update downloaded bytes
+          const pieceLength = this._metadata.pieceLength;
+          const validBytes = verifyResult.valid.length * pieceLength;
+          this._downloadManager.downloadedBytes = validBytes;
+          
+          this.emit('verify:complete', verifyResult);
+          
+        } catch (error) {
+          console.error(`[Torrent] Verification failed: ${error.message}`);
+          this.emit('error', { message: `Verification failed: ${error.message}` });
+        }
+      }
+    }
+    
+    // Resume download
+    if (this._state === 'paused') {
+      this.resume();
+    } else {
+      await this.start();
+    }
+  }
+  
+  /**
+   * Manually verify pieces if download manager doesn't support it
+   * @private
+   */
+  async _verifyPiecesManually(completedPieces) {
+    const { PieceManager } = require('./pieceManager');
+    
+    const pieceManager = new PieceManager({
+      torrentInfo: this._metadata,
+      fileWriter: this._fileWriter
+    });
+    
+    // Forward verification events
+    pieceManager.on('verify:start', (data) => this.emit('verify:start', data));
+    pieceManager.on('verify:progress', (data) => this.emit('verify:progress', data));
+    pieceManager.on('verify:complete', (data) => this.emit('verify:complete', data));
+    
+    return await pieceManager.verifyPieces(completedPieces);
+  }
+  
+  /**
+   * Sets completed pieces (for resume without verification)
+   * @param {number[]} pieces - Array of piece indices
+   */
+  setCompletedPieces(pieces) {
+    if (!this._downloadManager) {
+      console.warn('[Torrent] Cannot set completed pieces: download manager not initialized');
+      return;
+    }
+    
+    console.log(`[Torrent] Setting ${pieces.length} completed pieces`);
+    
+    // Clear existing completed pieces
+    this._downloadManager.completedPieces.clear();
+    
+    // Add new completed pieces
+    for (const pieceIndex of pieces) {
+      this._downloadManager.completedPieces.add(pieceIndex);
+    }
+    
+    // Update downloaded bytes
+    if (this._metadata) {
+      const pieceLength = this._metadata.pieceLength;
+      const numPieces = this._metadata.pieces.length;
+      
+      let totalBytes = 0;
+      for (const pieceIndex of pieces) {
+        if (pieceIndex === numPieces - 1) {
+          // Last piece might be smaller
+          const lastPieceLength = this._metadata.length - (pieceIndex * pieceLength);
+          totalBytes += lastPieceLength;
+        } else {
+          totalBytes += pieceLength;
+        }
+      }
+      
+      this._downloadManager.downloadedBytes = totalBytes;
+      console.log(`[Torrent] Set downloaded bytes: ${totalBytes}`);
+    }
+  }
+  
+  /**
+   * Gets completed pieces
+   * @returns {number[]}
+   */
+  getCompletedPieces() {
+    if (!this._downloadManager || !this._downloadManager.completedPieces) {
+      return [];
+    }
+    
+    return Array.from(this._downloadManager.completedPieces);
+  }
 
   async stop() {
-    if (this._state === 'idle') {
+    if (this._state === 'idle' || this._state === 'stopped') {
       console.log('[Torrent] Already stopped');
       return;
     }
 
     try {
       console.log('[Torrent] Stopping');
+      
+      // Stop seeding-specific timers
+      if (this._chokingInterval) {
+        clearInterval(this._chokingInterval);
+        this._chokingInterval = null;
+      }
+      
+      if (this._seedingLimitCheckInterval) {
+        clearInterval(this._seedingLimitCheckInterval);
+        this._seedingLimitCheckInterval = null;
+      }
 
       // Clear intervals
       if (this._announceInterval) {
@@ -351,6 +657,11 @@ class Torrent extends EventEmitter {
       if (this._statsInterval) {
         clearInterval(this._statsInterval);
         this._statsInterval = null;
+      }
+      
+      if (this._progressIntervalTimer) {
+        clearInterval(this._progressIntervalTimer);
+        this._progressIntervalTimer = null;
       }
       
       // Clear metadata timeout
@@ -369,6 +680,12 @@ class Torrent extends EventEmitter {
       if (this._downloadManager) {
         this._downloadManager.stop();
       }
+      
+      // Stop upload manager
+      if (this._uploadManager) {
+        this._uploadManager.destroy();
+        this._uploadManager = null;
+      }
 
       // Send 'stopped' event to tracker
       try {
@@ -379,7 +696,8 @@ class Torrent extends EventEmitter {
 
       // Disconnect all peers
       if (this._peerManager) {
-        this._peerManager.disconnectAll();
+        this._peerManager.destroy();
+        this._peerManager = null;
       }
 
       // Close file handles
@@ -387,7 +705,7 @@ class Torrent extends EventEmitter {
         await this._fileWriter.close();
       }
 
-      this._state = 'idle';
+      this._state = 'stopped';
       console.log('[Torrent] Stopped');
       this.emit('stopped');
 
@@ -420,8 +738,7 @@ class Torrent extends EventEmitter {
 
     this._downloadManager.on('complete', () => {
       console.log('[Torrent] Download complete!');
-      this._state = 'seeding';
-      this.emit('done');
+      this._transitionToSeeding();
     });
 
     this._downloadManager.on('error', ({ message }) => {
@@ -429,10 +746,335 @@ class Torrent extends EventEmitter {
       this.emit('warning', { message: `Download error: ${message}` });
     });
 
-    this._downloadManager.on('piece:failed', ({ index, reason }) => {
-      console.warn(`[Torrent] Piece ${index} failed: ${reason}`);
-      this.emit('warning', { message: `Piece ${index} failed: ${reason}` });
+    this._downloadManager.on('piece:failed', ({ index, reason, attempts, willRetry }) => {
+      console.warn(`[Torrent] Piece ${index} failed: ${reason} (attempt ${attempts})`);
+      
+      // Handle hash mismatch - will be retried automatically by downloadManager
+      if (reason.includes('Hash') || reason.includes('verification')) {
+        this._handleError(
+          new Error(`Piece ${index} verification failed`),
+          ERROR_CATEGORY.VERIFICATION,
+          `Piece ${index} hash mismatch`,
+          false
+        );
+      }
+      
+      this.emit('warning', { 
+        message: `Piece ${index} failed: ${reason}`,
+        willRetry,
+        attempts
+      });
     });
+    
+    this._downloadManager.on('piece:problematic', ({ index, attempts, reason }) => {
+      console.error(`[Torrent] Piece ${index} marked as problematic after ${attempts} attempts`);
+      
+      this.emit('error', {
+        category: ERROR_CATEGORY.VERIFICATION,
+        code: 'PIECE_PROBLEMATIC',
+        message: `Piece ${index} failed ${attempts} times`,
+        details: { index, attempts, reason },
+        recoverable: false,
+        action: 'skip'
+      });
+    });
+  }
+
+  /**
+   * Transitions from downloading to seeding
+   * @private
+   */
+  async _transitionToSeeding() {
+    try {
+      console.log('[Torrent] Transitioning to seeding mode');
+      this._state = 'seeding';
+      this._seedingStartTime = Date.now();
+      this._lastUploadTime = Date.now();
+      
+      // Initialize UploadManager if not already
+      if (!this._uploadManager) {
+        this._uploadManager = new UploadManager({
+          fileWriter: this._fileWriter,
+          pieceManager: this._pieceManager,
+          throttler: this._throttler,
+          maxUploadsPerTorrent: this._options.maxUploadsPerTorrent || 4
+        });
+        
+        // Setup upload event handlers
+        this._setupUploadManagerEvents();
+      }
+      
+      // Start choking algorithm
+      this._startChokingAlgorithm();
+      
+      // Start seeding limit checker
+      this._startSeedingLimitChecker();
+      
+      // Announce to tracker as seeder (left=0, event=completed)
+      if (!this._completedOnce) {
+        this._completedOnce = true;
+        await this._announceToTracker('completed');
+      } else {
+        await this._announceToTracker();
+      }
+      
+      // Keep accepting connections and serving pieces
+      console.log('[Torrent] Now seeding - serving pieces to peers');
+      this.emit('seeding:start');
+      this.emit('done'); // Backwards compatibility
+      
+    } catch (error) {
+      console.error('[Torrent] Error transitioning to seeding:', error.message);
+      this.emit('error', { message: `Seeding transition error: ${error.message}` });
+    }
+  }
+  
+  /**
+   * Setup upload manager event handlers
+   * @private
+   */
+  _setupUploadManagerEvents() {
+    if (!this._uploadManager) return;
+    
+    this._uploadManager.on('upload:complete', ({ peerId, pieceIndex, length }) => {
+      console.log(`[Torrent] Uploaded piece ${pieceIndex} to ${peerId} (${length} bytes)`);
+      this._totalUploaded += length;
+      this._uploadSpeedTracker.addBytes(length);
+      this._lastUploadTime = Date.now();
+      
+      this.emit('seeding:upload', {
+        peerId,
+        pieceIndex,
+        bytes: length
+      });
+    });
+    
+    this._uploadManager.on('upload:error', ({ upload, error }) => {
+      console.warn(`[Torrent] Upload error for ${upload.peerId}:`, error.message);
+    });
+    
+    this._uploadManager.on('peer:unchoked', ({ peerId }) => {
+      console.log(`[Torrent] Unchoked peer ${peerId}`);
+    });
+    
+    this._uploadManager.on('peer:choked', ({ peerId }) => {
+      console.log(`[Torrent] Choked peer ${peerId}`);
+    });
+  }
+  
+  /**
+   * Starts the choking algorithm timer
+   * @private
+   */
+  _startChokingAlgorithm() {
+    if (this._chokingInterval) {
+      clearInterval(this._chokingInterval);
+    }
+    
+    // Run choking algorithm every 10 seconds
+    this._chokingInterval = setInterval(() => {
+      if (this._uploadManager && this._state === 'seeding') {
+        this._uploadManager.runChokingAlgorithm();
+      }
+    }, 10000);
+    
+    if (this._chokingInterval.unref) {
+      this._chokingInterval.unref();
+    }
+  }
+  
+  /**
+   * Starts seeding limit checker
+   * @private
+   */
+  _startSeedingLimitChecker() {
+    if (this._seedingLimitCheckInterval) {
+      clearInterval(this._seedingLimitCheckInterval);
+    }
+    
+    // Check seeding limits every minute
+    this._seedingLimitCheckInterval = setInterval(() => {
+      if (this._state === 'seeding') {
+        this._checkSeedingLimits();
+      }
+    }, 60000);
+    
+    if (this._seedingLimitCheckInterval.unref) {
+      this._seedingLimitCheckInterval.unref();
+    }
+  }
+  
+  /**
+   * Checks if seeding limits have been reached
+   * @private
+   */
+  _checkSeedingLimits() {
+    if (this._state !== 'seeding') return;
+    
+    const stats = this.getSeedingStats();
+    
+    // Check ratio limit
+    if (this._seedRatioLimit > 0 && stats.ratio >= this._seedRatioLimit) {
+      console.log(`[Torrent] Reached ratio limit ${this._seedRatioLimit} (current: ${stats.ratio.toFixed(2)})`);
+      this._stopSeeding('ratio_limit');
+      return;
+    }
+    
+    // Check time limit
+    if (this._seedTimeLimit > 0 && stats.seedTime >= this._seedTimeLimit) {
+      console.log(`[Torrent] Reached time limit ${this._seedTimeLimit} minutes (current: ${stats.seedTime})`);
+      this._stopSeeding('time_limit');
+      return;
+    }
+    
+    // Check idle limit
+    if (this._seedIdleLimit > 0 && stats.idleTime >= this._seedIdleLimit) {
+      console.log(`[Torrent] Reached idle limit ${this._seedIdleLimit} minutes (idle: ${stats.idleTime})`);
+      this._stopSeeding('idle_limit');
+      return;
+    }
+  }
+  
+  /**
+   * Stops seeding
+   * @private
+   */
+  async _stopSeeding(reason = 'manual') {
+    console.log(`[Torrent] Stopping seeding (reason: ${reason})`);
+    
+    // Stop choking algorithm
+    if (this._chokingInterval) {
+      clearInterval(this._chokingInterval);
+      this._chokingInterval = null;
+    }
+    
+    // Stop limit checker
+    if (this._seedingLimitCheckInterval) {
+      clearInterval(this._seedingLimitCheckInterval);
+      this._seedingLimitCheckInterval = null;
+    }
+    
+    // Announce to tracker that we're stopping
+    await this._announceToTracker('stopped');
+    
+    // Change state
+    this._state = 'stopped';
+    
+    this.emit('seeding:stop', { reason });
+  }
+  
+  /**
+   * Gets seeding statistics
+   * @returns {Object}
+   */
+  getSeedingStats() {
+    const downloaded = this._downloadManager ? this._downloadManager.downloadedBytes : 0;
+    const uploaded = this._totalUploaded;
+    const ratio = downloaded > 0 ? uploaded / downloaded : 0;
+    
+    const seedTime = this._seedingStartTime 
+      ? (Date.now() - this._seedingStartTime) / 60000 // minutes
+      : 0;
+    
+    const idleTime = this._lastUploadTime
+      ? (Date.now() - this._lastUploadTime) / 60000 // minutes
+      : 0;
+    
+    const uploadStats = this._uploadManager ? this._uploadManager.getStats() : {};
+    
+    return {
+      ratio,
+      seedTime,
+      idleTime,
+      uploaded,
+      downloaded,
+      peersServing: uploadStats.unchokedPeers || 0,
+      totalPeers: this._connectedPeers,
+      uploadSpeed: this.uploadSpeed,
+      activePeers: uploadStats.peers ? uploadStats.peers.filter(p => !p.isChoked).length : 0
+    };
+  }
+  
+  /**
+   * Announces to tracker
+   * @private
+   */
+  async _announceToTracker(event = null) {
+    if (!this._metadata || !this._trackerManager) {
+      return;
+    }
+    
+    try {
+      const downloaded = this._downloadManager ? this._downloadManager.downloadedBytes : 0;
+      const remaining = this._metadata.length - downloaded;
+      
+      const params = {
+        infoHash: this._metadata.infoHashBuffer,
+        peerId: this._peerId,
+        port: this._port,
+        uploaded: this._totalUploaded,
+        downloaded: downloaded,
+        left: this._state === 'seeding' ? 0 : remaining,
+        compact: 1
+      };
+      
+      if (event) {
+        params.event = event;
+      }
+      
+      // Use TrackerManager with automatic failover
+      await this._retryManager.retry(
+        () => this._trackerManager.announce(params),
+        {
+          retryOn: (error) => !error.message.includes('404'),
+          onRetry: (attempt, error) => {
+            console.log(`[Torrent] Retrying tracker announce (attempt ${attempt}): ${error.message}`);
+          }
+        }
+      );
+      
+      console.log(`[Torrent] Successfully announced to tracker (event: ${event || 'none'})`);
+      
+    } catch (error) {
+      console.error('[Torrent] Tracker announce error:', error.message);
+      this._handleError(error, ERROR_CATEGORY.TRACKER, 'Tracker announce failed', false);
+    }
+  }
+  
+  /**
+   * Handles incoming piece request from peer
+   * @param {Object} peer
+   * @param {number} pieceIndex
+   * @param {number} offset
+   * @param {number} length
+   */
+  handlePieceRequest(peer, pieceIndex, offset, length) {
+    if (this._uploadManager && this._state === 'seeding') {
+      this._uploadManager.handleRequest(peer, pieceIndex, offset, length);
+    }
+  }
+  
+  /**
+   * Handles incoming cancel request from peer
+   * @param {Object} peer
+   * @param {number} pieceIndex
+   * @param {number} offset
+   * @param {number} length
+   */
+  handleCancelRequest(peer, pieceIndex, offset, length) {
+    if (this._uploadManager) {
+      this._uploadManager.cancelRequest(peer, pieceIndex, offset, length);
+    }
+  }
+  
+  /**
+   * Enables or disables super-seeding mode
+   * @param {boolean} enabled
+   */
+  setSuperSeeding(enabled) {
+    if (this._uploadManager) {
+      this._uploadManager.setSuperSeeding(enabled);
+    }
   }
 
   async _downloadMetadata() {
@@ -605,51 +1247,7 @@ class Torrent extends EventEmitter {
       
     } catch (error) {
       console.error(`[Torrent] Error processing metadata: ${error.message}`);
-      throw error;
-    }
-  }
-
-  async _announceToTracker(event) {
-    if (!this._metadata) {
-      throw new Error('Torrent not initialized');
-    }
-
-    const downloaded = this._downloadManager ? this._downloadManager.downloadedBytes : 0;
-    const uploaded = this._totalUploaded;
-    const left = this._metadata.length - downloaded;
-
-    try {
-      const response = await announce({
-        announceUrl: this._metadata.announce,
-        infoHash: this._metadata.infoHashBuffer,
-        peerId: this._peerId,
-        port: this._port,
-        uploaded,
-        downloaded,
-        left,
-        event,
-        compact: 1
-      });
-
-      console.log(`[Torrent] Tracker response: ${response.peers.length} peers`);
-
-      if (response.seeders !== undefined) {
-        this._seeds = response.seeders;
-      }
-      if (response.leechers !== undefined) {
-        this._leeches = response.leechers;
-      }
-
-      this._totalPeers = response.peers.length;
-
-      // Add peers to peer manager
-      if (this._peerManager && response.peers.length > 0) {
-        this._peerManager.addPeers(response.peers);
-      }
-
-      return response;
-    } catch (error) {
-      console.error(`[Torrent] Tracker announce error: ${error.message}`);
+      this._handleError(error, ERROR_CATEGORY.METADATA, 'Metadata processing failed', false);
       throw error;
     }
   }
@@ -700,6 +1298,7 @@ class Torrent extends EventEmitter {
       name: this.name,
       size: this.size,
       downloaded,
+      uploaded: this._totalUploaded,
       total,
       percentage: Math.min(100, percentage),
       downloadSpeed: this.downloadSpeed,
@@ -717,6 +1316,12 @@ class Torrent extends EventEmitter {
       activePieces: this._downloadManager ? this._downloadManager.activePieces.size : 0,
       pendingRequests: this._downloadManager ? this._downloadManager.pendingRequests.size : 0
     };
+    
+    // Add seeding statistics if seeding
+    if (this._state === 'seeding') {
+      const seedingStats = this.getSeedingStats();
+      stats.seeding = seedingStats;
+    }
     
     // Add metadata progress if fetching
     if (this._state === 'fetching_metadata' && this._metadataDownloader) {

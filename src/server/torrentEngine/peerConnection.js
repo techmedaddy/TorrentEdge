@@ -1,5 +1,15 @@
 const net = require('net');
 const EventEmitter = require('events');
+const { TimeoutManager, PeerBanManager } = require('./retryManager');
+
+// Error categories
+const ERROR_CATEGORIES = {
+  PROTOCOL_ERROR: 'PROTOCOL_ERROR',
+  HASH_MISMATCH: 'HASH_MISMATCH',
+  TIMEOUT: 'TIMEOUT',
+  CONNECTION_RESET: 'CONNECTION_RESET',
+  HANDSHAKE_FAILED: 'HANDSHAKE_FAILED'
+};
 
 const MESSAGE_TYPES = {
   CHOKE: 0,
@@ -54,10 +64,20 @@ class PeerConnection extends EventEmitter {
     this.onError = options.onError || (() => {});
     this.onClose = options.onClose || (() => {});
 
+    // Error handling managers (optional, passed from PeerManager)
+    this.timeoutManager = options.timeoutManager || null;
+    this.banManager = options.banManager || null;
+
     this.socket = null;
     this.isConnected = false;
     this.isHandshakeComplete = false;
     this.remotePeerId = null;
+    
+    // Error tracking
+    this.errorCount = 0;
+    this.protocolErrors = 0;
+    this.timeoutErrors = 0;
+    this.lastError = null;
 
     this.handshakeTimeout = null;
     this.handshakeBuffer = Buffer.alloc(0);
@@ -465,9 +485,186 @@ class PeerConnection extends EventEmitter {
   }
 
   /**
+   * Handles connection errors with categorization
+   */
+  handleError(error, category = null) {
+    if (this.handshakeTimeout) {
+      clearTimeout(this.handshakeTimeout);
+      this.handshakeTimeout = null;
+    }
+    
+    // Categorize error if not provided
+    if (!category) {
+      category = this._categorizeError(error);
+    }
+    
+    // Track error
+    this.errorCount++;
+    this.lastError = { error, category, timestamp: Date.now() };
+    
+    // Update category-specific counters
+    if (category === ERROR_CATEGORIES.PROTOCOL_ERROR) {
+      this.protocolErrors++;
+    } else if (category === ERROR_CATEGORIES.TIMEOUT) {
+      this.timeoutErrors++;
+    }
+    
+    // Create structured error event
+    const errorEvent = {
+      category,
+      code: this._getErrorCode(category, error),
+      message: error.message,
+      details: {
+        ip: this.ip,
+        port: this.port,
+        remotePeerId: this.remotePeerId,
+        handshakeComplete: this.isHandshakeComplete,
+        errorCount: this.errorCount
+      },
+      recoverable: this._isRecoverable(category),
+      action: this._getErrorAction(category)
+    };
+    
+    // Handle based on category
+    this._handleErrorByCategory(category, error, errorEvent);
+    
+    this.onError(errorEvent);
+    this.emit('error', errorEvent);
+  }
+  
+  /**
+   * Categorizes error type
+   * @private
+   */
+  _categorizeError(error) {
+    const msg = error.message.toLowerCase();
+    
+    if (msg.includes('timeout')) {
+      return ERROR_CATEGORIES.TIMEOUT;
+    } else if (msg.includes('protocol') || msg.includes('invalid') || msg.includes('pstrlen')) {
+      return ERROR_CATEGORIES.PROTOCOL_ERROR;
+    } else if (msg.includes('info hash') || msg.includes('hash mismatch')) {
+      return ERROR_CATEGORIES.HANDSHAKE_FAILED;
+    } else if (msg.includes('reset') || msg.includes('econnreset') || msg.includes('epipe')) {
+      return ERROR_CATEGORIES.CONNECTION_RESET;
+    }
+    
+    // Default to connection reset
+    return ERROR_CATEGORIES.CONNECTION_RESET;
+  }
+  
+  /**
+   * Gets error code
+   * @private
+   */
+  _getErrorCode(category, error) {
+    const codes = {
+      [ERROR_CATEGORIES.PROTOCOL_ERROR]: 'PROTOCOL_ERROR',
+      [ERROR_CATEGORIES.HASH_MISMATCH]: 'HASH_MISMATCH',
+      [ERROR_CATEGORIES.TIMEOUT]: 'TIMEOUT',
+      [ERROR_CATEGORIES.CONNECTION_RESET]: 'CONNECTION_RESET',
+      [ERROR_CATEGORIES.HANDSHAKE_FAILED]: 'HANDSHAKE_FAILED'
+    };
+    
+    return codes[category] || 'UNKNOWN_ERROR';
+  }
+  
+  /**
+   * Determines if error is recoverable
+   * @private
+   */
+  _isRecoverable(category) {
+    return category === ERROR_CATEGORIES.CONNECTION_RESET || 
+           category === ERROR_CATEGORIES.TIMEOUT;
+  }
+  
+  /**
+   * Determines action for error
+   * @private
+   */
+  _getErrorAction(category) {
+    switch (category) {
+      case ERROR_CATEGORIES.PROTOCOL_ERROR:
+        return 'skip'; // Strike peer and disconnect
+      case ERROR_CATEGORIES.HASH_MISMATCH:
+        return 'retry'; // Re-request from others
+      case ERROR_CATEGORIES.TIMEOUT:
+        return this.timeoutErrors > 3 ? 'skip' : 'retry';
+      case ERROR_CATEGORIES.CONNECTION_RESET:
+        return 'retry'; // Reconnect with backoff
+      case ERROR_CATEGORIES.HANDSHAKE_FAILED:
+        return 'skip'; // Ban if repeated
+      default:
+        return 'skip';
+    }
+  }
+  
+  /**
+   * Handles error based on category
+   * @private
+   */
+  _handleErrorByCategory(category, error, errorEvent) {
+    const peerId = this.remotePeerId ? this.remotePeerId.toString('hex') : `${this.ip}:${this.port}`;
+    
+    switch (category) {
+      case ERROR_CATEGORIES.PROTOCOL_ERROR:
+        console.warn(`[PeerConnection] Protocol error from ${peerId}: ${error.message}`);
+        // Strike peer if ban manager available
+        if (this.banManager) {
+          this.banManager.strike(peerId, 'protocol_error');
+        }
+        this.disconnect();
+        break;
+        
+      case ERROR_CATEGORIES.HASH_MISMATCH:
+        console.warn(`[PeerConnection] Hash mismatch from ${peerId}`);
+        // Strike peer
+        if (this.banManager) {
+          this.banManager.strike(peerId, 'invalid_piece');
+        }
+        // Don't disconnect immediately - might be one bad piece
+        break;
+        
+      case ERROR_CATEGORIES.TIMEOUT:
+        console.warn(`[PeerConnection] Timeout from ${peerId} (${this.timeoutErrors} total)`);
+        // Track timeout
+        if (this.banManager && this.timeoutErrors > 3) {
+          this.banManager.strike(peerId, 'timeout');
+        }
+        if (this.timeoutErrors > 5) {
+          this.disconnect();
+        }
+        break;
+        
+      case ERROR_CATEGORIES.CONNECTION_RESET:
+        console.log(`[PeerConnection] Connection reset from ${peerId}`);
+        // Will be handled by reconnection logic in PeerManager
+        this.disconnect();
+        break;
+        
+      case ERROR_CATEGORIES.HANDSHAKE_FAILED:
+        console.warn(`[PeerConnection] Handshake failed with ${peerId}: ${error.message}`);
+        // Ban if repeated handshake failures
+        if (this.banManager) {
+          this.banManager.strike(peerId, 'protocol_error');
+        }
+        this.disconnect();
+        break;
+    }
+  }
+  
+  /**
+   * Reports hash mismatch for a piece
+   */
+  reportHashMismatch(pieceIndex) {
+    const error = new Error(`Piece ${pieceIndex} hash mismatch`);
+    this.handleError(error, ERROR_CATEGORIES.HASH_MISMATCH);
+  }
+
+  /**
    * Handles connection errors
    */
-  handleError(error) {
+  handleError_OLD(error) {
     if (this.handshakeTimeout) {
       clearTimeout(this.handshakeTimeout);
       this.handshakeTimeout = null;
@@ -495,4 +692,4 @@ class PeerConnection extends EventEmitter {
   }
 }
 
-module.exports = { PeerConnection, MESSAGE_TYPES };
+module.exports = { PeerConnection, MESSAGE_TYPES, ERROR_CATEGORIES };

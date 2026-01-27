@@ -2,36 +2,59 @@ const express = require('express');
 const router = express.Router();
 const torrentController = require('../controllers/torrentController');
 const authMiddleware = require('../middleware/authMiddleware');
+const multer = require('multer');
 
-// Static routes MUST come before parameterized routes (:id)
+// Configure multer for file uploads (store in memory)
+const upload = multer({ 
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024 // 10MB limit for .torrent files
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === 'application/x-bittorrent' || 
+        file.originalname.endsWith('.torrent')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only .torrent files are allowed'));
+    }
+  }
+});
 
-// GET: search torrents
+// Apply authentication to all torrent routes
+router.use(authMiddleware);
+
+// Static routes MUST come before parameterized routes
+
+// Global engine stats
+router.get('/engine/stats', torrentController.getGlobalStats);
+
+// Search torrents
 router.get('/search', torrentController.searchTorrents);
 
-// GET: peers (placeholder)
-router.get('/peers', async (req, res) => {
-  res.json({ message: 'Peers data here' });
-});
+// Get all torrents for authenticated user
+router.get('/', torrentController.getAllTorrents);
 
-// GET: status updates (placeholder)
-router.get('/status-updates', async (req, res) => {
-  res.json({ message: 'Status updates data here' });
-});
-
-// GET: fetch all torrents for authenticated user
-router.get('/', authMiddleware, torrentController.getAllTorrents);
-
-// POST: create a new torrent (protected)
-router.post('/create', authMiddleware, torrentController.createTorrent);
+// Create/upload torrent
+router.post('/create', upload.single('torrent'), torrentController.createTorrent);
+router.post('/upload', upload.single('torrent'), torrentController.createTorrent);
 
 // Parameterized routes MUST come AFTER static routes
-// GET: fetch torrent by ID
+
+// Torrent control actions
+router.post('/:id/start', torrentController.startTorrent);
+router.post('/:id/pause', torrentController.pauseTorrent);
+router.post('/:id/resume', torrentController.resumeTorrent);
+
+// Get torrent real-time stats
+router.get('/:id/stats', torrentController.getTorrentStats);
+
+// Get torrent by ID or infoHash
 router.get('/:id', torrentController.getTorrentById);
 
-// PUT: update torrent (protected)
-router.put('/:id', authMiddleware, torrentController.updateTorrent);
+// Update torrent metadata
+router.put('/:id', torrentController.updateTorrent);
 
-// DELETE: remove torrent (protected)
-router.delete('/:id', authMiddleware, torrentController.deleteTorrent);
+// Delete torrent (?deleteFiles=true to delete downloaded files)
+router.delete('/:id', torrentController.deleteTorrent);
 
 module.exports = router;

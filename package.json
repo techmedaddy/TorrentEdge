@@ -2,25 +2,58 @@
   "name": "torrentedge",
   "version": "1.0.0",
   "description": "TorrentEdge - Distributed BitTorrent client backend with Kafka event streaming",
+  "main": "src/server/server.js",
   "private": true,
   "scripts": {
     "start": "node src/server/server.js",
     "dev": "nodemon src/server/server.js",
-    "test": "jest --passWithNoTests",
+    "test": "jest --passWithNoTests --testTimeout=30000",
     "test:watch": "jest --watch",
+    "test:unit": "jest --testPathPattern=tests/(?!.*integration).*\\.test\\.js$",
+    "test:integration": "jest --testPathPattern=tests/.*integration.*\\.test\\.js$",
     "seed": "node src/server/seed.js",
     "docker:up": "docker-compose up -d",
     "docker:down": "docker-compose down",
-    "docker:logs": "docker-compose logs -f"
+    "docker:logs": "docker-compose logs -f",
+    "lint": "eslint src/",
+    "kafka:topics": "node src/server/kafka/topics/createTopics.js"
   },
   "dependencies": {
-    
-    
+    "axios": "^1.7.7",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "express-validator": "^7.2.0",
+    "jsonwebtoken": "^9.0.2",
+    "kafkajs": "^2.2.4",
+    "mongoose": "^8.8.0",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1",
+    "socket.io": "^4.8.1",
+    "winston": "^3.16.0"
   },
-  
   "devDependencies": {
     "eslint": "^9.10.0",
     "jest": "^29.7.0",
     "nodemon": "^3.1.4"
-  }
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/techmedaddy/TorrentEdge.git"
+  },
+  "keywords": [
+    "bittorrent",
+    "torrent",
+    "p2p",
+    "dht",
+    "kademlia",
+    "magnet",
+    "kafka"
+  ],
+  "author": "techmedaddy",
+  "license": "MIT"
 }

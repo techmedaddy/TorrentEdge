@@ -1,5 +1,5 @@
 const EventEmitter = require('events');
-const SpeedTracker = require('./speedTracker');
+const { SpeedTracker } = require('./speedTracker');
 
 /**
  * Manages uploading pieces to peers (seeding)

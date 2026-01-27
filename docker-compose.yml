@@ -23,17 +23,18 @@ services:
       - "3031:9092"
     environment:
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_BROKER_ID: 1
     networks:
       - kafka-network
     healthcheck:
-      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list || exit 1"]
       interval: 30s
       timeout: 10s
-      retries: 3
+      retries: 5
+      start_period: 30s
 
   backend:
     build:
@@ -45,6 +46,8 @@ services:
       - .env
     environment:
       - PORT=3029
+      - MONGODB_URI=mongodb://root:example@mongodb:27017/torrentedge?authSource=admin
+      - KAFKA_BROKERS=kafka:9092
     depends_on:
       kafka:
         condition: service_healthy

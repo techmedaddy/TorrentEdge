@@ -9,6 +9,56 @@ const { DownloadManager } = require('./downloadManager');
 const { FileWriter } = require('./fileWriter');
 const { MetadataDownloader } = require('./extensionProtocol');
 
+/**
+ * SpeedTracker - Calculates smoothed speed using exponential moving average
+ */
+class SpeedTracker {
+  constructor(windowMs = 5000) {
+    this.windowMs = windowMs;
+    this.samples = [];
+    this.lastUpdate = Date.now();
+  }
+  
+  addBytes(bytes) {
+    const now = Date.now();
+    this.samples.push({
+      bytes,
+      timestamp: now
+    });
+    
+    // Remove old samples outside the window
+    const cutoff = now - this.windowMs;
+    this.samples = this.samples.filter(s => s.timestamp >= cutoff);
+    
+    this.lastUpdate = now;
+  }
+  
+  getSpeed() {
+    if (this.samples.length === 0) {
+      return 0;
+    }
+    
+    // Calculate speed over the window
+    const now = Date.now();
+    const cutoff = now - this.windowMs;
+    const recentSamples = this.samples.filter(s => s.timestamp >= cutoff);
+    
+    if (recentSamples.length === 0) {
+      return 0;
+    }
+    
+    const totalBytes = recentSamples.reduce((sum, s) => sum + s.bytes, 0);
+    const oldestTimestamp = recentSamples[0].timestamp;
+    const duration = (now - oldestTimestamp) / 1000;
+    
+    return duration > 0 ? totalBytes / duration : 0;
+  }
+  
+  reset() {
+    this.samples = [];
+  }
+}
+
 class Torrent extends EventEmitter {
   constructor(options = {}) {
     super();
@@ -25,6 +75,9 @@ class Torrent extends EventEmitter {
     this._port = options.port || 6881;
     this._peerId = options.peerId || this._generatePeerId();
     this._dht = options.dht || null; // DHT node for peer discovery
+    
+    // Progress tracking configuration
+    this._progressInterval = options.progressInterval || 500;
 
     this._metadata = null;
     this._tracker = null;
@@ -40,11 +93,17 @@ class Torrent extends EventEmitter {
 
     this._announceInterval = null;
     this._statsInterval = null;
+    this._progressIntervalTimer = null;
     this._state = 'idle';
+    
+    // Speed trackers with exponential moving average
+    this._downloadSpeedTracker = new SpeedTracker(5000);
+    this._uploadSpeedTracker = new SpeedTracker(5000);
     
     this._downloadedBytesHistory = [];
     this._uploadedBytesHistory = [];
     this._lastStatsUpdate = Date.now();
+    this._lastProgressEmit = Date.now();
     this._totalDownloaded = 0;
     this._totalUploaded = 0;
 
@@ -604,7 +663,12 @@ class Torrent extends EventEmitter {
       const downloadedDelta = currentDownloaded - this._totalDownloaded;
       this._totalDownloaded = currentDownloaded;
 
-      // Store in history (keep last 5 seconds)
+      // Add to speed tracker instead of history array
+      if (downloadedDelta > 0) {
+        this._downloadSpeedTracker.addBytes(downloadedDelta);
+      }
+
+      // Store in history (keep last 5 seconds) - kept for backwards compatibility
       this._downloadedBytesHistory.push({
         timestamp: now,
         bytes: downloadedDelta
@@ -617,6 +681,13 @@ class Torrent extends EventEmitter {
     }
 
     this._lastStatsUpdate = now;
+    
+    // Emit progress event at configured interval
+    if (now - this._lastProgressEmit >= this._progressInterval) {
+      const progress = this._calculateProgress();
+      this.emit('progress', progress);
+      this._lastProgressEmit = now;
+    }
   }
 
   getStats() {
@@ -653,6 +724,189 @@ class Torrent extends EventEmitter {
     }
     
     return stats;
+  }
+  
+  /**
+   * Calculate comprehensive progress statistics
+   * @returns {Object} Detailed progress information
+   */
+  _calculateProgress() {
+    const downloaded = this._downloadManager ? this._downloadManager.downloadedBytes : 0;
+    const total = this._metadata ? this._metadata.length : 0;
+    const percentage = total > 0 ? (downloaded / total) * 100 : 0;
+    
+    const downloadSpeed = this.downloadSpeed;
+    const uploadSpeed = this.uploadSpeed;
+    
+    // Calculate ETA
+    let eta = null;
+    if (downloadSpeed > 0 && total > downloaded) {
+      eta = Math.ceil((total - downloaded) / downloadSpeed);
+    }
+    
+    // Piece statistics
+    const totalPieces = this.pieceCount;
+    const completedPieces = this._downloadManager ? this._downloadManager.completedPieces.size : 0;
+    const activePieces = this._downloadManager ? this._downloadManager.activePieces.size : 0;
+    const pendingRequests = this._downloadManager ? this._downloadManager.pendingRequests.size : 0;
+    
+    // Calculate share ratio
+    const ratio = downloaded > 0 ? this._totalUploaded / downloaded : 0;
+    
+    return {
+      infoHash: this.infoHash,
+      name: this.name,
+      size: total,
+      downloaded,
+      uploaded: this._totalUploaded,
+      percentage: Math.min(100, percentage),
+      downloadSpeed,
+      uploadSpeed,
+      eta,
+      ratio,
+      state: this._state,
+      peers: {
+        connected: this._connectedPeers,
+        total: this._totalPeers,
+        seeds: this._seeds,
+        leeches: this._leeches
+      },
+      pieces: {
+        total: totalPieces,
+        completed: completedPieces,
+        active: activePieces,
+        pending: pendingRequests
+      },
+      // Add metadata progress if fetching
+      ...(this._state === 'fetching_metadata' && this._metadataDownloader && {
+        metadataProgress: this._metadataDownloader.getProgress()
+      })
+    };
+  }
+  
+  /**
+   * Get piece completion bitmap for visualization
+   * @returns {Uint8Array} Bitmap where 1=completed, 0=not completed
+   */
+  getPieceBitmap() {
+    if (!this._metadata || !this._downloadManager) {
+      return new Uint8Array(0);
+    }
+    
+    const totalPieces = this.pieceCount;
+    const bitmap = new Uint8Array(totalPieces);
+    
+    for (let i = 0; i < totalPieces; i++) {
+      bitmap[i] = this._downloadManager.completedPieces.has(i) ? 1 : 0;
+    }
+    
+    return bitmap;
+  }
+  
+  /**
+   * Get piece availability map (how many peers have each piece)
+   * @returns {Uint8Array} Count of peers per piece
+   */
+  getPieceAvailability() {
+    if (!this._metadata || !this._peerManager) {
+      return new Uint8Array(0);
+    }
+    
+    const totalPieces = this.pieceCount;
+    const availability = new Uint8Array(totalPieces);
+    
+    // Get all connected peers
+    const peers = this._peerManager.peers || [];
+    
+    for (let pieceIndex = 0; pieceIndex < totalPieces; pieceIndex++) {
+      let peerCount = 0;
+      
+      for (const peer of peers) {
+        // Check if peer has this piece
+        if (peer.bitfield && peer.bitfield.has(pieceIndex)) {
+          peerCount++;
+        }
+      }
+      
+      availability[pieceIndex] = Math.min(255, peerCount); // Cap at 255 for Uint8Array
+    }
+    
+    return availability;
+  }
+  
+  /**
+   * Get detailed statistics including piece bitmaps and file progress
+   * @returns {Object} Comprehensive stats with visualization data
+   */
+  getDetailedStats() {
+    const baseStats = this._calculateProgress();
+    
+    // Add piece bitmap as base64 for easy transmission
+    const pieceBitmap = this.getPieceBitmap();
+    const pieceAvailability = this.getPieceAvailability();
+    
+    // Convert to base64 for JSON serialization
+    const pieceBitmapBase64 = Buffer.from(pieceBitmap).toString('base64');
+    const pieceAvailabilityBase64 = Buffer.from(pieceAvailability).toString('base64');
+    
+    // File-level progress if multi-file torrent
+    let fileProgress = [];
+    if (this._metadata && this._metadata.files && this._fileWriter) {
+      fileProgress = this._metadata.files.map((file, index) => {
+        // Calculate which pieces belong to this file
+        const fileStart = file.offset;
+        const fileEnd = file.offset + file.length;
+        const pieceLength = this._metadata.pieceLength;
+        
+        const firstPiece = Math.floor(fileStart / pieceLength);
+        const lastPiece = Math.floor((fileEnd - 1) / pieceLength);
+        
+        let completedBytes = 0;
+        for (let i = firstPiece; i <= lastPiece; i++) {
+          if (this._downloadManager && this._downloadManager.completedPieces.has(i)) {
+            const pieceStart = i * pieceLength;
+            const pieceEnd = Math.min(pieceStart + pieceLength, this._metadata.length);
+            
+            // Calculate overlap with this file
+            const overlapStart = Math.max(pieceStart, fileStart);
+            const overlapEnd = Math.min(pieceEnd, fileEnd);
+            
+            if (overlapEnd > overlapStart) {
+              completedBytes += overlapEnd - overlapStart;
+            }
+          }
+        }
+        
+        return {
+          path: file.path,
+          length: file.length,
+          completed: completedBytes,
+          percentage: (completedBytes / file.length) * 100
+        };
+      });
+    }
+    
+    return {
+      ...baseStats,
+      pieceBitmap: pieceBitmapBase64,
+      pieceAvailability: pieceAvailabilityBase64,
+      files: fileProgress,
+      health: this._calculateHealth()
+    };
+  }
+  
+  /**
+   * Calculate torrent health score (0-1 based on seeds/peers ratio)
+   * @returns {number} Health score
+   */
+  _calculateHealth() {
+    if (this._totalPeers === 0) return 0;
+    
+    const seedRatio = this._seeds / this._totalPeers;
+    const peerAvailability = Math.min(1, this._connectedPeers / 50); // Normalized to 50 peers
+    
+    // Combined health score
+    return (seedRatio * 0.7 + peerAvailability * 0.3);
   }
 
   _formatBytes(bytes) {
@@ -711,31 +965,11 @@ class Torrent extends EventEmitter {
   }
 
   get downloadSpeed() {
-    if (this._downloadedBytesHistory.length === 0) {
-      return 0;
-    }
-
-    // Calculate average speed over last 5 seconds
-    const totalBytes = this._downloadedBytesHistory.reduce((sum, entry) => sum + entry.bytes, 0);
-    const oldestTimestamp = this._downloadedBytesHistory[0].timestamp;
-    const newestTimestamp = this._downloadedBytesHistory[this._downloadedBytesHistory.length - 1].timestamp;
-    const duration = (newestTimestamp - oldestTimestamp) / 1000;
-
-    return duration > 0 ? totalBytes / duration : 0;
+    return this._downloadSpeedTracker.getSpeed();
   }
 
   get uploadSpeed() {
-    // Upload speed calculation (similar to download speed)
-    if (this._uploadedBytesHistory.length === 0) {
-      return 0;
-    }
-
-    const totalBytes = this._uploadedBytesHistory.reduce((sum, entry) => sum + entry.bytes, 0);
-    const oldestTimestamp = this._uploadedBytesHistory[0].timestamp;
-    const newestTimestamp = this._uploadedBytesHistory[this._uploadedBytesHistory.length - 1].timestamp;
-    const duration = (newestTimestamp - oldestTimestamp) / 1000;
-
-    return duration > 0 ? totalBytes / duration : 0;
+    return this._uploadSpeedTracker.getSpeed();
   }
 
   get peers() {

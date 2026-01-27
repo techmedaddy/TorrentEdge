@@ -1,6 +1,7 @@
 const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
+const EventEmitter = require('events');
 
 /**
  * Handles writing piece data to correct files on disk
@@ -11,8 +12,10 @@ const crypto = require('crypto');
  * - For piece at offset P with length L, find files overlapping [P, P+L)
  * - For each file, calculate position and length to write
  */
-class FileWriter {
+class FileWriter extends EventEmitter {
   constructor(options) {
+    super();
+    
     this.torrent = options.torrent;
     this.downloadPath = options.downloadPath;
     
@@ -22,7 +25,17 @@ class FileWriter {
     this.fileHandles = new Map();
     this.isInitialized = false;
 
+    // Per-file progress tracking
+    this._fileProgress = new Map(); // fileIndex -> { downloaded, size, percent, complete }
+    
+    // File priority for selective downloading
+    this._filePriority = new Map(); // fileIndex -> 'skip' | 'low' | 'normal' | 'high'
+    
+    // Track which pieces belong to which files
+    this._filePieceMap = new Map(); // fileIndex -> { first, last, pieces: Set }
+
     this._buildFileMap();
+    this._initializeProgressTracking();
   }
 
   /**
@@ -46,6 +59,46 @@ class FileWriter {
         path: this.torrent.name,
         length: this.torrent.length,
         offset: 0
+      });
+    }
+  }
+  
+  /**
+   * Initializes progress tracking for all files
+   */
+  _initializeProgressTracking() {
+    const pieceLength = this.torrent.pieceLength;
+    
+    for (let fileIndex = 0; fileIndex < this.files.length; fileIndex++) {
+      const file = this.files[fileIndex];
+      
+      // Initialize progress
+      this._fileProgress.set(fileIndex, {
+        downloaded: 0,
+        size: file.length,
+        percent: 0,
+        complete: false
+      });
+      
+      // Set default priority
+      this._filePriority.set(fileIndex, 'normal');
+      
+      // Calculate which pieces belong to this file
+      const fileStart = file.offset;
+      const fileEnd = file.offset + file.length;
+      
+      const firstPiece = Math.floor(fileStart / pieceLength);
+      const lastPiece = Math.floor((fileEnd - 1) / pieceLength);
+      
+      const pieces = new Set();
+      for (let i = firstPiece; i <= lastPiece; i++) {
+        pieces.add(i);
+      }
+      
+      this._filePieceMap.set(fileIndex, {
+        first: firstPiece,
+        last: lastPiece,
+        pieces
       });
     }
   }
@@ -127,6 +180,46 @@ class FileWriter {
       await fd.close();
 
       dataOffset += length;
+      
+      // Update file progress
+      this._updateFileProgress(fileIndex, length);
+    }
+  }
+  
+  /**
+   * Updates progress tracking for a specific file
+   * @param {number} fileIndex
+   * @param {number} bytesWritten
+   */
+  _updateFileProgress(fileIndex, bytesWritten) {
+    const progress = this._fileProgress.get(fileIndex);
+    if (!progress) return;
+    
+    progress.downloaded += bytesWritten;
+    progress.percent = (progress.downloaded / progress.size) * 100;
+    
+    const wasComplete = progress.complete;
+    progress.complete = progress.downloaded >= progress.size;
+    
+    // Emit progress event
+    const file = this.files[fileIndex];
+    this.emit('file:progress', {
+      fileIndex,
+      name: path.basename(file.path),
+      path: file.path,
+      percent: progress.percent,
+      downloaded: progress.downloaded,
+      size: progress.size
+    });
+    
+    // Emit complete event if file just completed
+    if (!wasComplete && progress.complete) {
+      this.emit('file:complete', {
+        fileIndex,
+        name: path.basename(file.path),
+        path: file.path,
+        size: progress.size
+      });
     }
   }
 
@@ -226,6 +319,11 @@ class FileWriter {
         invalid.push(i);
       }
     }
+    
+    // Recalculate file progress based on verified pieces
+    if (valid.length > 0) {
+      this.recalculateFileProgress(new Set(valid));
+    }
 
     return { valid, invalid };
   }
@@ -303,6 +401,172 @@ class FileWriter {
         percentage
       };
     });
+  }
+  
+  /**
+   * Gets progress for a specific file
+   * @param {number} fileIndex
+   * @returns {{ downloaded: number, size: number, percent: number, complete: boolean }}
+   */
+  getFileProgressByIndex(fileIndex) {
+    const progress = this._fileProgress.get(fileIndex);
+    if (!progress) {
+      throw new Error(`Invalid file index: ${fileIndex}`);
+    }
+    
+    return {
+      downloaded: progress.downloaded,
+      size: progress.size,
+      percent: progress.percent,
+      complete: progress.complete
+    };
+  }
+  
+  /**
+   * Gets progress for all files
+   * @returns {Array<{ index: number, name: string, path: string, size: number, downloaded: number, percent: number, complete: boolean }>}
+   */
+  getAllFileProgress() {
+    const result = [];
+    
+    for (let fileIndex = 0; fileIndex < this.files.length; fileIndex++) {
+      const file = this.files[fileIndex];
+      const progress = this._fileProgress.get(fileIndex);
+      
+      result.push({
+        index: fileIndex,
+        name: path.basename(file.path),
+        path: file.path,
+        size: progress.size,
+        downloaded: progress.downloaded,
+        percent: progress.percent,
+        complete: progress.complete
+      });
+    }
+    
+    return result;
+  }
+  
+  /**
+   * Sets priority for a specific file
+   * @param {number} fileIndex
+   * @param {'skip' | 'low' | 'normal' | 'high'} priority
+   */
+  setFilePriority(fileIndex, priority) {
+    if (fileIndex < 0 || fileIndex >= this.files.length) {
+      throw new Error(`Invalid file index: ${fileIndex}`);
+    }
+    
+    const validPriorities = ['skip', 'low', 'normal', 'high'];
+    if (!validPriorities.includes(priority)) {
+      throw new Error(`Invalid priority: ${priority}. Must be one of: ${validPriorities.join(', ')}`);
+    }
+    
+    this._filePriority.set(fileIndex, priority);
+    
+    // Emit priority change event
+    const file = this.files[fileIndex];
+    this.emit('file:priority', {
+      fileIndex,
+      name: path.basename(file.path),
+      path: file.path,
+      priority
+    });
+  }
+  
+  /**
+   * Gets priority for a specific file
+   * @param {number} fileIndex
+   * @returns {string}
+   */
+  getFilePriority(fileIndex) {
+    if (fileIndex < 0 || fileIndex >= this.files.length) {
+      throw new Error(`Invalid file index: ${fileIndex}`);
+    }
+    
+    return this._filePriority.get(fileIndex) || 'normal';
+  }
+  
+  /**
+   * Gets detailed status for all files including piece information
+   * @param {Set<number>} completedPieces - Set of completed piece indices
+   * @returns {Array<{ index: number, name: string, path: string, size: number, downloaded: number, percent: number, complete: boolean, priority: string, pieces: { first: number, last: number, total: number, completed: number[] } }>}
+   */
+  getFileStatus(completedPieces = new Set()) {
+    const result = [];
+    
+    for (let fileIndex = 0; fileIndex < this.files.length; fileIndex++) {
+      const file = this.files[fileIndex];
+      const progress = this._fileProgress.get(fileIndex);
+      const priority = this._filePriority.get(fileIndex);
+      const pieceInfo = this._filePieceMap.get(fileIndex);
+      
+      // Find which pieces for this file are completed
+      const completedFilePieces = [];
+      if (pieceInfo) {
+        for (const pieceIndex of pieceInfo.pieces) {
+          if (completedPieces.has(pieceIndex)) {
+            completedFilePieces.push(pieceIndex);
+          }
+        }
+      }
+      
+      result.push({
+        index: fileIndex,
+        name: path.basename(file.path),
+        path: file.path,
+        size: progress.size,
+        downloaded: progress.downloaded,
+        percent: progress.percent,
+        complete: progress.complete,
+        priority,
+        pieces: {
+          first: pieceInfo.first,
+          last: pieceInfo.last,
+          total: pieceInfo.pieces.size,
+          completed: completedFilePieces
+        }
+      });
+    }
+    
+    return result;
+  }
+  
+  /**
+   * Recalculates file progress based on completed pieces
+   * Useful for resuming torrents or syncing progress
+   * @param {Set<number>} completedPieces
+   */
+  recalculateFileProgress(completedPieces) {
+    const pieceLength = this.torrent.pieceLength;
+    
+    for (let fileIndex = 0; fileIndex < this.files.length; fileIndex++) {
+      const file = this.files[fileIndex];
+      const fileStart = file.offset;
+      const fileEnd = file.offset + file.length;
+      
+      let downloadedBytes = 0;
+      
+      // Check each completed piece to see if it overlaps with this file
+      for (const pieceIndex of completedPieces) {
+        const pieceStart = pieceIndex * pieceLength;
+        const pieceEnd = Math.min(pieceStart + pieceLength, this.totalLength);
+        
+        // Calculate overlap
+        const overlapStart = Math.max(pieceStart, fileStart);
+        const overlapEnd = Math.min(pieceEnd, fileEnd);
+        
+        if (overlapEnd > overlapStart) {
+          downloadedBytes += overlapEnd - overlapStart;
+        }
+      }
+      
+      // Update progress
+      const progress = this._fileProgress.get(fileIndex);
+      progress.downloaded = downloadedBytes;
+      progress.percent = (downloadedBytes / progress.size) * 100;
+      progress.complete = downloadedBytes >= progress.size;
+    }
   }
 
   /**

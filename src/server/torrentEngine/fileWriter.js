@@ -58,8 +58,12 @@ class FileWriter {
       return;
     }
 
-    // Create base directory
-    await fs.mkdir(this.basePath, { recursive: true });
+    // Create base directory (for multi-file) or download path (for single-file)
+    if (this.torrent.isMultiFile) {
+      await fs.mkdir(this.basePath, { recursive: true });
+    } else {
+      await fs.mkdir(this.downloadPath, { recursive: true });
+    }
 
     // Create and pre-allocate files
     for (let i = 0; i < this.files.length; i++) {

@@ -77,11 +77,12 @@ class Torrent extends EventEmitter {
       console.log(`[Torrent] Pieces: ${this._metadata.pieces.length}`);
       console.log(`[Torrent] Files: ${this._metadata.files ? this._metadata.files.length : 1}`);
 
-      this.emit('ready');
+      // Emit 'ready' asynchronously to allow listeners to be registered
+      setImmediate(() => this.emit('ready'));
     } catch (error) {
       console.error(`[Torrent] Initialization error: ${error.message}`);
       this._state = 'error';
-      this.emit('error', { message: error.message });
+      setImmediate(() => this.emit('error', { message: error.message }));
       throw error;
     }
   }
@@ -121,7 +122,7 @@ class Torrent extends EventEmitter {
       // Initialize PeerManager
       console.log('[Torrent] Initializing peer manager');
       this._peerManager = new PeerManager({
-        infoHash: this._metadata.infoHash,
+        infoHash: this._metadata.infoHashBuffer,
         peerId: this._peerId,
         numPieces: this._metadata.pieces.length,
         port: this._port
@@ -322,7 +323,7 @@ class Torrent extends EventEmitter {
     try {
       const response = await announce({
         announceUrl: this._metadata.announce,
-        infoHash: this._metadata.infoHash,
+        infoHash: this._metadata.infoHashBuffer,
         peerId: this._peerId,
         port: this._port,
         uploaded,
@@ -344,10 +345,8 @@ class Torrent extends EventEmitter {
       this._totalPeers = response.peers.length;
 
       // Add peers to peer manager
-      if (this._peerManager) {
-        for (const peer of response.peers) {
-          this._peerManager.addPeer(peer.ip, peer.port);
-        }
+      if (this._peerManager && response.peers.length > 0) {
+        this._peerManager.addPeers(response.peers);
       }
 
       return response;

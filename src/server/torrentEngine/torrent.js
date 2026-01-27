@@ -2,10 +2,12 @@ const EventEmitter = require('events');
 const fs = require('fs').promises;
 const crypto = require('crypto');
 const { parseTorrent } = require('./torrentParser');
+const { parseMagnet } = require('./magnet');
 const { announce } = require('./tracker');
 const { PeerManager } = require('./peerManager');
 const { DownloadManager } = require('./downloadManager');
 const { FileWriter } = require('./fileWriter');
+const { MetadataDownloader } = require('./extensionProtocol');
 
 class Torrent extends EventEmitter {
   constructor(options = {}) {
@@ -22,12 +24,19 @@ class Torrent extends EventEmitter {
     this._downloadPath = options.downloadPath || './downloads';
     this._port = options.port || 6881;
     this._peerId = options.peerId || this._generatePeerId();
+    this._dht = options.dht || null; // DHT node for peer discovery
 
     this._metadata = null;
     this._tracker = null;
     this._peerManager = null;
     this._downloadManager = null;
     this._fileWriter = null;
+    this._metadataDownloader = null;
+    
+    // Magnet link specific properties
+    this._needsMetadata = false;
+    this._magnetPeers = [];
+    this._metadataTimeout = null;
 
     this._announceInterval = null;
     this._statsInterval = null;
@@ -57,7 +66,34 @@ class Torrent extends EventEmitter {
   async _initialize() {
     try {
       if (this._magnetURI) {
-        throw new Error('Magnet links not yet supported');
+        console.log('[Torrent] Parsing magnet link');
+        const magnet = parseMagnet(this._magnetURI);
+        
+        // Create partial metadata from magnet link
+        this._metadata = {
+          infoHash: magnet.infoHash,
+          infoHashBuffer: magnet.infoHashBuffer,
+          name: magnet.displayName || 'Unknown',
+          announce: magnet.trackers[0] || null,
+          announceList: magnet.trackers.length > 1 ? [magnet.trackers] : [],
+          // These will be filled in after metadata download
+          pieceLength: null,
+          pieces: null,
+          length: null,
+          files: null
+        };
+        
+        this._needsMetadata = true;
+        this._magnetPeers = magnet.peers || [];
+        
+        console.log(`[Torrent] Magnet link info hash: ${this._metadata.infoHash}`);
+        console.log(`[Torrent] Magnet name: ${this._metadata.name}`);
+        console.log(`[Torrent] Trackers: ${magnet.trackers.length}`);
+        console.log(`[Torrent] Direct peers: ${this._magnetPeers.length}`);
+        
+        // Emit 'ready' asynchronously - ready to fetch metadata
+        setImmediate(() => this.emit('ready'));
+        return;
       }
 
       let torrentBuffer;
@@ -90,12 +126,29 @@ class Torrent extends EventEmitter {
   async start() {
     await this._initPromise;
 
-    if (this._state === 'downloading' || this._state === 'seeding') {
+    if (this._state === 'downloading' || this._state === 'seeding' || this._state === 'fetching_metadata') {
       console.log('[Torrent] Already running');
       return;
     }
 
     try {
+      // If this is a magnet link, fetch metadata first
+      if (this._needsMetadata) {
+        console.log('[Torrent] Fetching metadata from peers...');
+        this._state = 'fetching_metadata';
+        this.emit('fetching_metadata');
+        
+        await this._downloadMetadata();
+        
+        // Now we have full metadata, continue normal start
+        this._needsMetadata = false;
+        console.log('[Torrent] Metadata fetched successfully');
+        console.log(`[Torrent] Torrent: ${this._metadata.name}`);
+        console.log(`[Torrent] Size: ${this._formatBytes(this._metadata.length)}`);
+        console.log(`[Torrent] Pieces: ${this._metadata.pieces.length}`);
+        console.log(`[Torrent] Files: ${this._metadata.files ? this._metadata.files.length : 1}`);
+      }
+      
       console.log('[Torrent] Starting download');
       this._state = 'checking';
 
@@ -240,6 +293,18 @@ class Torrent extends EventEmitter {
         clearInterval(this._statsInterval);
         this._statsInterval = null;
       }
+      
+      // Clear metadata timeout
+      if (this._metadataTimeout) {
+        clearTimeout(this._metadataTimeout);
+        this._metadataTimeout = null;
+      }
+      
+      // Stop metadata downloader
+      if (this._metadataDownloader) {
+        this._metadataDownloader.stop();
+        this._metadataDownloader = null;
+      }
 
       // Stop download manager
       if (this._downloadManager) {
@@ -309,6 +374,180 @@ class Torrent extends EventEmitter {
       console.warn(`[Torrent] Piece ${index} failed: ${reason}`);
       this.emit('warning', { message: `Piece ${index} failed: ${reason}` });
     });
+  }
+
+  async _downloadMetadata() {
+    return new Promise(async (resolve, reject) => {
+      try {
+        console.log('[Torrent] Starting metadata download...');
+        
+        // Set timeout for metadata download (5 minutes)
+        this._metadataTimeout = setTimeout(() => {
+          console.error('[Torrent] Metadata download timeout');
+          if (this._metadataDownloader) {
+            this._metadataDownloader.stop();
+          }
+          reject(new Error('Metadata download timeout after 5 minutes'));
+        }, 5 * 60 * 1000);
+        
+        // Initialize PeerManager for metadata fetching
+        this._peerManager = new PeerManager({
+          infoHash: this._metadata.infoHashBuffer,
+          peerId: this._peerId,
+          numPieces: 0, // Don't know yet
+          port: this._port
+        });
+        
+        // Track peer connections for metadata
+        this._peerManager.on('peer:connected', (peer) => {
+          this._connectedPeers++;
+          console.log(`[Torrent] Metadata peer connected: ${peer.ip}:${peer.port}`);
+        });
+        
+        this._peerManager.on('peer:disconnected', (peer) => {
+          this._connectedPeers--;
+          console.log(`[Torrent] Metadata peer disconnected: ${peer.ip}:${peer.port}`);
+        });
+        
+        // Create MetadataDownloader
+        this._metadataDownloader = new MetadataDownloader({
+          infoHash: this._metadata.infoHashBuffer,
+          peerManager: this._peerManager,
+          onMetadata: (metadata, infoDict) => {
+            this._handleMetadataComplete(metadata, infoDict, resolve);
+          }
+        });
+        
+        // Handle metadata events
+        this._metadataDownloader.on('size', (size) => {
+          console.log(`[Torrent] Metadata size: ${this._formatBytes(size)}`);
+          this.emit('metadata:size', { size });
+        });
+        
+        this._metadataDownloader.on('piece', ({ index, data }) => {
+          console.log(`[Torrent] Metadata piece ${index} received (${data.length} bytes)`);
+          this.emit('metadata:piece', { index, size: data.length });
+        });
+        
+        this._metadataDownloader.on('error', (error) => {
+          console.error(`[Torrent] Metadata download error: ${error.message}`);
+          clearTimeout(this._metadataTimeout);
+          reject(error);
+        });
+        
+        // Add direct peers from magnet link
+        if (this._magnetPeers && this._magnetPeers.length > 0) {
+          console.log(`[Torrent] Adding ${this._magnetPeers.length} direct peers from magnet`);
+          this._peerManager.addPeers(this._magnetPeers);
+        }
+        
+        // Announce to trackers to get more peers
+        if (this._metadata.announce) {
+          try {
+            console.log('[Torrent] Announcing to tracker for peers...');
+            await this._announceToTracker('started');
+          } catch (error) {
+            console.warn(`[Torrent] Tracker announce failed: ${error.message}`);
+            // Continue anyway, we might have DHT or direct peers
+          }
+        }
+        
+        // Use DHT to find peers
+        if (this._dht) {
+          console.log('[Torrent] Using DHT to find peers...');
+          try {
+            const infoHashHex = this._metadata.infoHashBuffer.toString('hex');
+            
+            // Listen for peers from DHT
+            this._dht.on('peer', (data) => {
+              if (data.infoHash === infoHashHex) {
+                console.log(`[Torrent] DHT found peer: ${data.peer.host}:${data.peer.port}`);
+                this._peerManager.addPeers([data.peer]);
+              }
+            });
+            
+            // Start DHT lookup
+            await this._dht.getPeers(this._metadata.infoHashBuffer, (peers) => {
+              if (peers && peers.length > 0) {
+                console.log(`[Torrent] DHT returned ${peers.length} peers`);
+                this._peerManager.addPeers(peers);
+              }
+            });
+          } catch (error) {
+            console.warn(`[Torrent] DHT peer discovery failed: ${error.message}`);
+            // Continue anyway
+          }
+        }
+        
+        // Start metadata downloader
+        this._metadataDownloader.start();
+        
+        // If no peers after 30 seconds, error out
+        setTimeout(() => {
+          if (this._connectedPeers === 0) {
+            console.error('[Torrent] No peers connected after 30 seconds');
+            clearTimeout(this._metadataTimeout);
+            if (this._metadataDownloader) {
+              this._metadataDownloader.stop();
+            }
+            reject(new Error('No peers available for metadata download'));
+          }
+        }, 30000);
+        
+      } catch (error) {
+        console.error(`[Torrent] Metadata download setup error: ${error.message}`);
+        clearTimeout(this._metadataTimeout);
+        reject(error);
+      }
+    });
+  }
+  
+  _handleMetadataComplete(metadata, infoDict, resolve) {
+    try {
+      console.log('[Torrent] Metadata download complete!');
+      
+      // Clear timeout
+      if (this._metadataTimeout) {
+        clearTimeout(this._metadataTimeout);
+        this._metadataTimeout = null;
+      }
+      
+      // Parse the info dictionary to update metadata
+      const { parseTorrent } = require('./torrentParser');
+      
+      // Create a minimal torrent structure with the info dict
+      const bencode = require('./bencode');
+      const fullTorrent = bencode.encode({
+        info: infoDict
+      });
+      
+      // Parse it to get proper metadata structure
+      const fullMetadata = parseTorrent(fullTorrent);
+      
+      // Update our metadata with the full info
+      this._metadata.name = fullMetadata.name;
+      this._metadata.pieceLength = fullMetadata.pieceLength;
+      this._metadata.pieces = fullMetadata.pieces;
+      this._metadata.length = fullMetadata.length;
+      this._metadata.files = fullMetadata.files;
+      
+      console.log(`[Torrent] Metadata verified and parsed successfully`);
+      console.log(`[Torrent] Name: ${this._metadata.name}`);
+      console.log(`[Torrent] Size: ${this._formatBytes(this._metadata.length)}`);
+      console.log(`[Torrent] Pieces: ${this._metadata.pieces.length}`);
+      
+      this.emit('metadata:complete', {
+        name: this._metadata.name,
+        size: this._metadata.length,
+        pieceCount: this._metadata.pieces.length
+      });
+      
+      resolve();
+      
+    } catch (error) {
+      console.error(`[Torrent] Error processing metadata: ${error.message}`);
+      throw error;
+    }
   }
 
   async _announceToTracker(event) {
@@ -385,7 +624,7 @@ class Torrent extends EventEmitter {
     const total = this._metadata ? this._metadata.length : 0;
     const percentage = total > 0 ? (downloaded / total) * 100 : 0;
 
-    return {
+    const stats = {
       infoHash: this.infoHash,
       name: this.name,
       size: this.size,
@@ -407,6 +646,13 @@ class Torrent extends EventEmitter {
       activePieces: this._downloadManager ? this._downloadManager.activePieces.size : 0,
       pendingRequests: this._downloadManager ? this._downloadManager.pendingRequests.size : 0
     };
+    
+    // Add metadata progress if fetching
+    if (this._state === 'fetching_metadata' && this._metadataDownloader) {
+      stats.metadataProgress = this._metadataDownloader.getProgress();
+    }
+    
+    return stats;
   }
 
   _formatBytes(bytes) {

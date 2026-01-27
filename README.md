@@ -406,36 +406,12 @@ Contributions are welcome! Please follow these steps:
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
-## 📝 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 🙏 Acknowledgments
 
-- Built for learning and portfolio purposes
-- Implements official BitTorrent specifications (BEPs)
-- Inspired by projects like WebTorrent and qBittorrent
-
-## 📚 Resources
-
-- [BitTorrent Protocol Specification (BEP 3)](http://www.bittorrent.org/beps/bep_0003.html)
-- [Magnet URI Scheme (BEP 9)](http://www.bittorrent.org/beps/bep_0009.html)
-- [Extension Protocol (BEP 10)](http://www.bittorrent.org/beps/bep_0010.html)
-- [DHT Protocol (BEP 5)](http://www.bittorrent.org/beps/bep_0005.html)
-
-## 🚧 Roadmap
-
-- [ ] DHT (Distributed Hash Table) implementation
-- [ ] WebRTC support for browser peers
-- [ ] Selective file download
-- [ ] Streaming support
-- [ ] IPv6 support
-- [ ] Web UI dashboard
-- [ ] Mobile app (React Native)
-- [ ] Encryption (BEP 52)
 
 ---
 
-**Made with ❤️ by [Your Name]**
+
 
 For detailed architecture documentation, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).

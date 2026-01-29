@@ -41,7 +41,7 @@ router.post(
 router.post(
   '/login',
   [
-    body('username').notEmpty().withMessage('Username is required.'),
+    body('email').isEmail().withMessage('Valid email is required.'),
     body('password').notEmpty().withMessage('Password is required.'),
   ],
   async (req, res) => {
@@ -51,32 +51,32 @@ router.post(
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { username, password } = req.body;
+    const { email, password } = req.body;
 
     try {
-      logger.info(`Login attempt for username: ${username}`);
+      logger.info(`Login attempt for email: ${email}`);
 
-      const user = await User.findOne({ username });
+      const user = await User.findOne({ email });
 
       if (!user) {
-        logger.warn(`User not found: ${username}`);
+        logger.warn(`User not found: ${email}`);
         return res.status(401).json({ message: 'Invalid credentials.' });
       }
 
       const isMatch = await bcrypt.compare(password, user.password);
 
       if (!isMatch) {
-        logger.warn(`Invalid password for user: ${username}`);
+        logger.warn(`Invalid password for user: ${email}`);
         return res.status(401).json({ message: 'Invalid credentials.' });
       }
 
       const token = jwt.sign(
-        { userId: user._id, username: user.username },
+        { userId: user._id, username: user.username, email: user.email },
         process.env.JWT_SECRET,
         { expiresIn: '1h' }
       );
 
-      logger.info(`User authenticated successfully: ${username}`);
+      logger.info(`User authenticated successfully: ${email}`);
 
       res.json({ token });
 

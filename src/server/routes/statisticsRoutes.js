@@ -77,6 +77,23 @@ router.get('/engine', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/statistics/speed-history - Speed history for graphs (auth required)
+router.get('/speed-history', authMiddleware, async (req, res) => {
+  try {
+    const history = defaultEngine.getSpeedHistory();
+    
+    res.json({
+      history,
+      maxSamples: 60,
+      intervalMs: 1000,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('[Statistics] Error fetching speed history:', error);
+    res.status(500).json({ error: 'Failed to fetch speed history' });
+  }
+});
+
 // GET /api/statistics/user - Current user's stats (auth required)
 router.get('/user', authMiddleware, async (req, res) => {
   try {

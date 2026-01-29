@@ -80,6 +80,58 @@ class TorrentEngine extends EventEmitter {
         console.error(`[TorrentEngine] Kafka initialization failed: ${error.message}`);
       });
     }
+    
+    // Speed history tracking (circular buffer for last 60 samples)
+    this._speedHistory = [];
+    this._speedHistoryMaxSize = 60;
+    this._speedHistoryInterval = null;
+    this._startSpeedHistoryTracking();
+  }
+  
+  /**
+   * Start tracking speed history (samples every 1 second)
+   */
+  _startSpeedHistoryTracking() {
+    if (this._speedHistoryInterval) {
+      clearInterval(this._speedHistoryInterval);
+    }
+    
+    this._speedHistoryInterval = setInterval(() => {
+      const stats = this.getGlobalStats();
+      const sample = {
+        timestamp: Date.now(),
+        downloadSpeed: stats.totalDownloadSpeed || 0,
+        uploadSpeed: stats.totalUploadSpeed || 0
+      };
+      
+      this._speedHistory.push(sample);
+      
+      // Keep only last 60 samples (circular buffer)
+      if (this._speedHistory.length > this._speedHistoryMaxSize) {
+        this._speedHistory.shift();
+      }
+    }, 1000);
+    
+    console.log('[TorrentEngine] Speed history tracking started (1s interval, 60 samples)');
+  }
+  
+  /**
+   * Stop speed history tracking
+   */
+  _stopSpeedHistoryTracking() {
+    if (this._speedHistoryInterval) {
+      clearInterval(this._speedHistoryInterval);
+      this._speedHistoryInterval = null;
+      console.log('[TorrentEngine] Speed history tracking stopped');
+    }
+  }
+  
+  /**
+   * Get speed history for graphs
+   * @returns {Array} Array of { timestamp, downloadSpeed, uploadSpeed }
+   */
+  getSpeedHistory() {
+    return [...this._speedHistory];
   }
   
   /**
@@ -1253,6 +1305,9 @@ class TorrentEngine extends EventEmitter {
     console.log('[TorrentEngine] Shutting down...');
     
     try {
+      // Stop speed history tracking
+      this._stopSpeedHistoryTracking();
+      
       // Stop auto-save and flush state
       console.log('[TorrentEngine] Saving final state...');
       await this._stateManager.stopAutoSave();

@@ -903,6 +903,90 @@ class TorrentEngine extends EventEmitter {
     };
   }
 
+  // ==================== SETTINGS ====================
+  
+  /**
+   * Get current engine settings
+   */
+  getSettings() {
+    return {
+      downloadPath: this.downloadPath,
+      maxActiveTorrents: this.maxActiveTorrents,
+      maxConcurrent: this._queueManager?.maxConcurrent || 3,
+      port: this.port,
+      dht: {
+        enabled: this._dhtEnabled,
+        port: this._dhtPort,
+        running: this._dht?.isReady || false,
+        nodes: this._dht?.nodesCount || 0
+      },
+      speedLimits: {
+        download: this._globalThrottler?.downloadLimit || 0,
+        upload: this._globalThrottler?.uploadLimit || 0
+      }
+    };
+  }
+  
+  /**
+   * Update engine settings
+   * @param {Object} settings - New settings
+   */
+  updateSettings(settings) {
+    const changes = [];
+    
+    // Download path
+    if (settings.downloadPath && settings.downloadPath !== this.downloadPath) {
+      this.downloadPath = settings.downloadPath;
+      changes.push(`downloadPath: ${settings.downloadPath}`);
+    }
+    
+    // Max active torrents
+    if (settings.maxActiveTorrents && settings.maxActiveTorrents !== this.maxActiveTorrents) {
+      this.maxActiveTorrents = settings.maxActiveTorrents;
+      changes.push(`maxActiveTorrents: ${settings.maxActiveTorrents}`);
+    }
+    
+    // Max concurrent
+    if (settings.maxConcurrent && this._queueManager) {
+      this._queueManager.maxConcurrent = settings.maxConcurrent;
+      changes.push(`maxConcurrent: ${settings.maxConcurrent}`);
+    }
+    
+    // Speed limits
+    if (settings.speedLimits) {
+      this.setSpeedLimits(settings.speedLimits.download, settings.speedLimits.upload);
+      changes.push(`speedLimits: DL=${settings.speedLimits.download}, UL=${settings.speedLimits.upload}`);
+    }
+    
+    if (changes.length > 0) {
+      console.log(`[TorrentEngine] Settings updated: ${changes.join(', ')}`);
+      this.emit('settings:changed', this.getSettings());
+    }
+    
+    return this.getSettings();
+  }
+  
+  /**
+   * Set global speed limits
+   * @param {number} downloadLimit - Download limit in bytes/sec (0 = unlimited)
+   * @param {number} uploadLimit - Upload limit in bytes/sec (0 = unlimited)
+   */
+  setSpeedLimits(downloadLimit = 0, uploadLimit = 0) {
+    if (!this._globalThrottler) {
+      // Create global throttler if not exists
+      const { GlobalThrottler } = require('./throttler');
+      this._globalThrottler = new GlobalThrottler({
+        downloadLimit,
+        uploadLimit
+      });
+      console.log('[TorrentEngine] Created global throttler');
+    } else {
+      this._globalThrottler.setLimits(downloadLimit, uploadLimit);
+    }
+    
+    console.log(`[TorrentEngine] Speed limits set: DL=${downloadLimit} B/s, UL=${uploadLimit} B/s`);
+  }
+
   async saveState() {
     try {
       console.log('[TorrentEngine] Saving state');

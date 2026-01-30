@@ -66,6 +66,7 @@ app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/user', require('./routes/userRoutes'));
 app.use('/api/torrent', require('./routes/torrentRoutes'));
 app.use('/api/statistics', require('./routes/statisticsRoutes'));
+app.use('/api/settings', require('./routes/settingsRoutes'));
 app.use('/api', require('./routes/healthRoutes'));
 
 app.get('/', (req, res) => {

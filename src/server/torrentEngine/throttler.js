@@ -148,6 +148,16 @@ class Throttler extends EventEmitter {
   }
   
   /**
+   * Sets both download and upload limits
+   * @param {number} downloadLimit - Download limit in bytes/second (0 = unlimited)
+   * @param {number} uploadLimit - Upload limit in bytes/second (0 = unlimited)
+   */
+  setLimits(downloadLimit, uploadLimit) {
+    this.setDownloadLimit(downloadLimit);
+    this.setUploadLimit(uploadLimit);
+  }
+  
+  /**
    * Gets throttler statistics
    * @returns {Object}
    */

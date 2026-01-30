@@ -25,8 +25,10 @@ router.get('/', async (req, res) => {
 
     // Get engine stats if available
     let engineStats = null;
+    let dhtStats = null;
     try {
       engineStats = defaultEngine.getGlobalStats();
+      dhtStats = defaultEngine.getDHTStats();
     } catch (e) {
       // Engine may not be fully initialized
     }
@@ -42,6 +44,11 @@ router.get('/', async (req, res) => {
         totalUploadSpeed: 0,
         activeTorrents: 0,
         totalTorrents: 0
+      },
+      dht: dhtStats || {
+        enabled: false,
+        running: false,
+        nodes: 0
       },
       timestamp: new Date().toISOString()
     });
@@ -91,6 +98,21 @@ router.get('/speed-history', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('[Statistics] Error fetching speed history:', error);
     res.status(500).json({ error: 'Failed to fetch speed history' });
+  }
+});
+
+// GET /api/statistics/dht - DHT network stats (auth required)
+router.get('/dht', authMiddleware, async (req, res) => {
+  try {
+    const dhtStats = defaultEngine.getDHTStats();
+    
+    res.json({
+      ...dhtStats,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('[Statistics] Error fetching DHT stats:', error);
+    res.status(500).json({ error: 'Failed to fetch DHT statistics' });
   }
 });
 

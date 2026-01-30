@@ -352,7 +352,26 @@ function broadcast(event, data) {
     timestamp: Date.now()
   });
 
-  console.log(`[Socket] Broadcasted '${event}' to all clients`);
+  // Don't log speed updates (too verbose)
+  if (event !== 'stats:speed') {
+    console.log(`[Socket] Broadcasted '${event}' to all clients`);
+  }
+}
+
+/**
+ * Emit global speed update (for live speed graph)
+ * @param {object} data - { downloadSpeed, uploadSpeed, timestamp }
+ */
+function emitSpeedUpdate(data) {
+  if (!io) {
+    return;
+  }
+
+  io.to('all').emit('stats:speed', {
+    downloadSpeed: data.downloadSpeed || 0,
+    uploadSpeed: data.uploadSpeed || 0,
+    timestamp: data.timestamp || Date.now()
+  });
 }
 
 /**
@@ -399,6 +418,7 @@ module.exports = {
   emitTorrentRemoved,
   emitPeerConnected,
   emitPeerDisconnected,
+  emitSpeedUpdate,
   getConnectedClientCount,
   broadcast,
   cleanup

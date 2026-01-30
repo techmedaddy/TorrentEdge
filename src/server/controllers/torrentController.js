@@ -55,7 +55,7 @@ const mergeTorrentData = (dbTorrent, engineTorrent) => {
 // Get all torrents for the authenticated user
 exports.getAllTorrents = async (req, res) => {
   try {
-    const torrents = await Torrent.find({ uploadedBy: req.user.id })
+    const torrents = await Torrent.find({ uploadedBy: req.user.userId || req.user.id })
       .sort({ addedAt: -1 })
       .populate('uploadedBy', 'username');
 
@@ -120,8 +120,26 @@ exports.createTorrent = async (req, res) => {
       torrentPath = path.join(torrentsDir, `${Date.now()}-${req.file.originalname}`);
       await fs.writeFile(torrentPath, torrentBuffer);
     } else if (magnetURI) {
-      // Magnet URI support (Phase 2)
-      return res.status(400).json({ message: 'Magnet links not yet supported' });
+      // Magnet URI support - validate the magnet link first
+      const { parseMagnet } = require('../torrentEngine/magnet');
+      
+      let magnetInfo;
+      try {
+        magnetInfo = parseMagnet(magnetURI);
+      } catch (error) {
+        return res.status(400).json({ message: `Invalid magnet link: ${error.message}` });
+      }
+      
+      // Check if torrent already exists
+      const existingTorrent = await Torrent.findOne({ infoHash: magnetInfo.infoHash });
+      if (existingTorrent) {
+        return res.status(400).json({ 
+          message: 'Torrent already exists',
+          torrent: existingTorrent
+        });
+      }
+      
+      console.log(`[TorrentController] Adding magnet: ${magnetInfo.displayName || magnetInfo.infoHash}`);
     } else {
       return res.status(400).json({ message: 'Must provide torrent file or magnet URI' });
     }
@@ -132,6 +150,7 @@ exports.createTorrent = async (req, res) => {
       engineTorrent = await defaultEngine.addTorrent({
         torrentPath: torrentPath,
         torrentBuffer: torrentBuffer,
+        magnetURI: magnetURI || null,
         autoStart: autoStart
       });
     } catch (error) {
@@ -158,23 +177,37 @@ exports.createTorrent = async (req, res) => {
       });
     }
 
-    // Get initial stats
-    const stats = engineTorrent.getStats();
+    // Get initial stats (may fail for magnet links without metadata yet)
+    let stats = null;
+    try {
+      stats = engineTorrent.getStats();
+    } catch (err) {
+      console.log('[TorrentController] Stats not available yet (magnet link fetching metadata)');
+    }
+
+    // For magnet links, we might not have full metadata yet
+    let displayName = null;
+    if (magnetURI) {
+      try {
+        displayName = require('../torrentEngine/magnet').parseMagnet(magnetURI).displayName;
+      } catch (e) {}
+    }
+    const name = engineTorrent.name || displayName || `Magnet-${engineTorrent.infoHash.substring(0, 8)}`;
 
     // Save to MongoDB
     const torrent = new Torrent({
-      name: engineTorrent.name,
+      name: name,
       infoHash: engineTorrent.infoHash,
       magnetURI: magnetURI || null,
-      size: engineTorrent.size,
-      trackers: engineTorrent._metadata.announce ? [engineTorrent._metadata.announce] : [],
-      uploadedBy: req.user.id,
-      status: engineTorrent.state,
-      progress: stats.percentage,
-      files: engineTorrent.files.map(f => ({
-        name: path.basename(f.path),
-        size: f.length,
-        path: f.path
+      size: engineTorrent.size || 0,
+      trackers: engineTorrent._metadata?.announce ? [engineTorrent._metadata.announce] : [],
+      uploadedBy: req.user.userId || req.user.userId || req.user.id,
+      status: engineTorrent.state || (magnetURI ? 'fetching_metadata' : 'pending'),
+      progress: stats?.percentage || 0,
+      files: (engineTorrent.files || []).map(f => ({
+        name: path.basename(f.path || f.name),
+        size: f.length || f.size,
+        path: f.path || f.name
       }))
     });
 
@@ -235,7 +268,7 @@ exports.deleteTorrent = async (req, res) => {
     }
 
     // Only owner or admin can delete
-    if (torrent.uploadedBy.toString() !== req.user.id && req.user.role !== 'admin') {
+    if (torrent.uploadedBy.toString() !== req.user.userId || req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ message: 'Not authorized to delete this torrent' });
     }
 
@@ -440,6 +473,102 @@ exports.getTorrentStats = async (req, res) => {
     res.json(stats);
   } catch (error) {
     console.error('[TorrentController] getTorrentStats error:', error);
+    res.status(500).json({ message: 'Server error: ' + error.message });
+  }
+};
+
+// Get files with selection status
+exports.getFiles = async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    let dbTorrent;
+    if (isValidObjectId(id)) {
+      dbTorrent = await Torrent.findById(id);
+    } else {
+      dbTorrent = await Torrent.findOne({ infoHash: id.toLowerCase() });
+    }
+
+    if (!dbTorrent) {
+      return res.status(404).json({ message: 'Torrent not found' });
+    }
+
+    const engineTorrent = defaultEngine.getTorrent(dbTorrent.infoHash);
+    
+    if (!engineTorrent) {
+      // Return files from DB if engine not running
+      return res.json({
+        files: dbTorrent.files.map((f, index) => ({
+          index,
+          name: f.name,
+          path: f.path,
+          length: f.size,
+          selected: true
+        })),
+        selectedCount: dbTorrent.files.length,
+        totalCount: dbTorrent.files.length
+      });
+    }
+
+    const files = engineTorrent.getFilesWithSelection();
+    const selectedCount = files.filter(f => f.selected).length;
+    
+    res.json({
+      files,
+      selectedCount,
+      totalCount: files.length
+    });
+  } catch (error) {
+    console.error('[TorrentController] getFiles error:', error);
+    res.status(500).json({ message: 'Server error: ' + error.message });
+  }
+};
+
+// Select/deselect files
+exports.selectFiles = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { fileIndices, selectAll } = req.body;
+    
+    let dbTorrent;
+    if (isValidObjectId(id)) {
+      dbTorrent = await Torrent.findById(id);
+    } else {
+      dbTorrent = await Torrent.findOne({ infoHash: id.toLowerCase() });
+    }
+
+    if (!dbTorrent) {
+      return res.status(404).json({ message: 'Torrent not found' });
+    }
+
+    const engineTorrent = defaultEngine.getTorrent(dbTorrent.infoHash);
+    
+    if (!engineTorrent) {
+      return res.status(400).json({ message: 'Torrent not running in engine' });
+    }
+
+    if (selectAll) {
+      engineTorrent.selectAllFiles();
+    } else if (Array.isArray(fileIndices)) {
+      if (fileIndices.length === 0) {
+        return res.status(400).json({ message: 'Must select at least one file' });
+      }
+      engineTorrent.selectFiles(fileIndices);
+    } else {
+      return res.status(400).json({ message: 'Must provide fileIndices array or selectAll: true' });
+    }
+
+    const files = engineTorrent.getFilesWithSelection();
+    const selectedCount = files.filter(f => f.selected).length;
+    
+    res.json({
+      message: 'File selection updated',
+      files,
+      selectedCount,
+      totalCount: files.length
+    });
+  } catch (error) {
+    console.error('[TorrentController] selectFiles error:', error);
     res.status(500).json({ message: 'Server error: ' + error.message });
   }
 };

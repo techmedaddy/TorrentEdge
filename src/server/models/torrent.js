@@ -34,7 +34,7 @@ const torrentSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ['pending', 'downloading', 'seeding', 'paused', 'error', 'completed'],
+    enum: ['pending', 'downloading', 'seeding', 'paused', 'error', 'completed', 'fetching_metadata', 'idle', 'checking', 'queued'],
     default: 'pending'
   },
   progress: {

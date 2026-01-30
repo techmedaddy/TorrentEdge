@@ -36,6 +36,9 @@ class DownloadManager extends EventEmitter {
     this.endgameThreshold = 0.95; // Enter endgame at 95%
     this.endgameRequests = new Map(); // pieceIndex -> Set<peerKeys>
     
+    // File selection: pieces to skip
+    this.skippedPieces = new Set();
+    
     this.downloadedBytes = 0;
     this.isComplete = false;
     this.isPaused = false;
@@ -172,6 +175,11 @@ class DownloadManager extends EventEmitter {
     const needed = [];
 
     for (let i = 0; i < this.pieces.length; i++) {
+      // Skip pieces from deselected files
+      if (this.skippedPieces.has(i)) {
+        continue;
+      }
+      
       if (this.completedPieces.has(i) || this.activePieces.has(i)) {
         continue;
       }
@@ -189,6 +197,51 @@ class DownloadManager extends EventEmitter {
     // Rarest first: sort by availability (ascending)
     needed.sort((a, b) => a.availability - b.availability);
     return needed[0].index;
+  }
+  
+  /**
+   * Set pieces to skip (for file selection)
+   * @param {number[]} pieceIndices - Piece indices to skip
+   */
+  setSkippedPieces(pieceIndices) {
+    this.skippedPieces = new Set(pieceIndices);
+    console.log(`[DownloadManager] Skipping ${this.skippedPieces.size} pieces`);
+    
+    // Check if we're now complete (all non-skipped pieces done)
+    this._checkCompletion();
+  }
+  
+  /**
+   * Clear skipped pieces (download all files)
+   */
+  clearSkippedPieces() {
+    this.skippedPieces = new Set();
+    console.log('[DownloadManager] Cleared skipped pieces - downloading all files');
+  }
+  
+  /**
+   * Check if download is complete (considering skipped pieces)
+   * @private
+   */
+  _checkCompletion() {
+    const totalPieces = this.pieces.length;
+    let neededPieces = 0;
+    let completedNeeded = 0;
+    
+    for (let i = 0; i < totalPieces; i++) {
+      if (!this.skippedPieces.has(i)) {
+        neededPieces++;
+        if (this.completedPieces.has(i)) {
+          completedNeeded++;
+        }
+      }
+    }
+    
+    if (neededPieces > 0 && completedNeeded === neededPieces && !this.isComplete) {
+      console.log('[DownloadManager] All selected files downloaded!');
+      this.isComplete = true;
+      this.emit('complete');
+    }
   }
 
   start() {

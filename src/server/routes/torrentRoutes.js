@@ -45,6 +45,10 @@ router.post('/:id/start', torrentController.startTorrent);
 router.post('/:id/pause', torrentController.pauseTorrent);
 router.post('/:id/resume', torrentController.resumeTorrent);
 
+// File selection
+router.get('/:id/files', torrentController.getFiles);
+router.post('/:id/files/select', torrentController.selectFiles);
+
 // Get torrent real-time stats
 router.get('/:id/stats', torrentController.getTorrentStats);
 

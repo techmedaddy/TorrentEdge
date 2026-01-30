@@ -4,6 +4,7 @@ const path = require('path');
 const { Torrent } = require('./torrent');
 const { QueueManager } = require('./queueManager');
 const { StateManager } = require('./stateManager');
+const DHTNode = require('./dht/node');
 const { 
   emitTorrentAdded, 
   emitTorrentStarted, 
@@ -15,7 +16,8 @@ const {
   emitTorrentResumed,
   emitTorrentRemoved,
   emitPeerConnected,
-  emitPeerDisconnected
+  emitPeerDisconnected,
+  emitSpeedUpdate
 } = require('../socket');
 const { getProducer, closeProducer, EVENT_TYPES } = require('./kafkaProducer');
 const { getIO } = require('../socket');
@@ -86,6 +88,73 @@ class TorrentEngine extends EventEmitter {
     this._speedHistoryMaxSize = 60;
     this._speedHistoryInterval = null;
     this._startSpeedHistoryTracking();
+    
+    // DHT node for decentralized peer discovery
+    this._dht = null;
+    this._dhtEnabled = options.dht?.enabled !== false; // enabled by default
+    this._dhtPort = options.dht?.port || this.port;
+    
+    if (this._dhtEnabled) {
+      this._initDHT().catch(error => {
+        console.error(`[TorrentEngine] DHT initialization failed: ${error.message}`);
+      });
+    }
+  }
+  
+  /**
+   * Initialize DHT node
+   */
+  async _initDHT() {
+    try {
+      console.log('[TorrentEngine] Initializing DHT node...');
+      
+      this._dht = new DHTNode({
+        port: this._dhtPort,
+        onPeers: (infoHash, peers) => {
+          // Forward peers to the appropriate torrent
+          const torrent = this.torrents.get(infoHash);
+          if (torrent) {
+            console.log(`[TorrentEngine] DHT found ${peers.length} peers for ${infoHash.substring(0, 8)}...`);
+            peers.forEach(peer => {
+              torrent.addPeer(peer.host, peer.port);
+            });
+          }
+        },
+        onReady: () => {
+          console.log('[TorrentEngine] DHT node ready');
+          this.emit('dht:ready');
+        }
+      });
+      
+      await this._dht.start();
+      console.log(`[TorrentEngine] DHT node started on port ${this._dhtPort}`);
+      
+    } catch (error) {
+      console.error(`[TorrentEngine] Failed to start DHT: ${error.message}`);
+      this._dht = null;
+    }
+  }
+  
+  /**
+   * Get DHT stats
+   */
+  getDHTStats() {
+    if (!this._dht) {
+      return {
+        enabled: false,
+        running: false,
+        nodes: 0,
+        port: null
+      };
+    }
+    
+    return {
+      enabled: true,
+      running: this._dht.isReady,
+      nodes: this._dht.nodesCount,
+      port: this._dhtPort,
+      nodeId: this._dht.nodeId?.toString('hex')
+    };
   }
   
   /**
@@ -110,6 +179,9 @@ class TorrentEngine extends EventEmitter {
       if (this._speedHistory.length > this._speedHistoryMaxSize) {
         this._speedHistory.shift();
       }
+      
+      // Emit live speed update via Socket.IO
+      emitSpeedUpdate(sample);
     }, 1000);
     
     console.log('[TorrentEngine] Speed history tracking started (1s interval, 60 samples)');
@@ -495,7 +567,8 @@ class TorrentEngine extends EventEmitter {
         magnetURI: options.magnetURI,
         downloadPath,
         port: this.port,
-        peerId: options.peerId
+        peerId: options.peerId,
+        dht: this._dht // Pass DHT node for peer discovery
       });
 
       // Wait for torrent to be ready (metadata parsed)
@@ -1307,6 +1380,13 @@ class TorrentEngine extends EventEmitter {
     try {
       // Stop speed history tracking
       this._stopSpeedHistoryTracking();
+      
+      // Stop DHT node
+      if (this._dht) {
+        console.log('[TorrentEngine] Stopping DHT node...');
+        await this._dht.stop();
+        this._dht = null;
+      }
       
       // Stop auto-save and flush state
       console.log('[TorrentEngine] Saving final state...');

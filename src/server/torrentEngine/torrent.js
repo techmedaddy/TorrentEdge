@@ -126,6 +126,10 @@ class Torrent extends EventEmitter {
     this._lastUploadTime = null;
     this._completedOnce = false; // Track if we've announced completion
     
+    // File selection: Set of file indices that are selected for download
+    // null means all files selected (default)
+    this._selectedFiles = null;
+    
     // Speed trackers with exponential moving average
     this._downloadSpeedTracker = new SpeedTracker(5000);
     this._uploadSpeedTracker = new SpeedTracker(5000);
@@ -1314,7 +1318,9 @@ class Torrent extends EventEmitter {
       pieceCount: this.pieceCount,
       completedPieces: this._downloadManager ? this._downloadManager.completedPieces.size : 0,
       activePieces: this._downloadManager ? this._downloadManager.activePieces.size : 0,
-      pendingRequests: this._downloadManager ? this._downloadManager.pendingRequests.size : 0
+      pendingRequests: this._downloadManager ? this._downloadManager.pendingRequests.size : 0,
+      // Bitfield as array of piece states: 0=missing, 1=downloading, 2=complete
+      bitfield: this._getBitfieldArray()
     };
     
     // Add seeding statistics if seeding
@@ -1329,6 +1335,32 @@ class Torrent extends EventEmitter {
     }
     
     return stats;
+  }
+  
+  /**
+   * Get bitfield as array of piece states
+   * @returns {number[]} Array where 0=missing, 1=downloading, 2=complete
+   */
+  _getBitfieldArray() {
+    if (!this._downloadManager || !this.pieceCount) {
+      return [];
+    }
+    
+    const bitfield = [];
+    const completed = this._downloadManager.completedPieces;
+    const active = this._downloadManager.activePieces;
+    
+    for (let i = 0; i < this.pieceCount; i++) {
+      if (completed.has(i)) {
+        bitfield.push(2); // complete
+      } else if (active.has(i)) {
+        bitfield.push(1); // downloading
+      } else {
+        bitfield.push(0); // missing
+      }
+    }
+    
+    return bitfield;
   }
   
   /**
@@ -1536,7 +1568,7 @@ class Torrent extends EventEmitter {
   }
 
   get pieceCount() {
-    return this._metadata ? this._metadata.pieces.length : 0;
+    return this._metadata?.pieces?.length || 0;
   }
 
   get files() {
@@ -1611,6 +1643,179 @@ class Torrent extends EventEmitter {
     }
 
     return Math.ceil(remaining / speed);
+  }
+
+  // ==================== FILE SELECTION ====================
+  
+  /**
+   * Get files with selection status
+   * @returns {Array<{index: number, path: string, length: number, selected: boolean}>}
+   */
+  getFilesWithSelection() {
+    if (!this._metadata) return [];
+    
+    const files = this._metadata.files || [{
+      path: this._metadata.name,
+      length: this._metadata.length
+    }];
+    
+    return files.map((f, index) => ({
+      index,
+      path: f.path,
+      name: Array.isArray(f.path) ? f.path[f.path.length - 1] : f.path,
+      length: f.length,
+      selected: this._selectedFiles === null || this._selectedFiles.has(index)
+    }));
+  }
+  
+  /**
+   * Get selected file indices
+   * @returns {number[]|null} Array of selected indices, or null if all selected
+   */
+  get selectedFiles() {
+    return this._selectedFiles ? Array.from(this._selectedFiles) : null;
+  }
+  
+  /**
+   * Select specific files for download
+   * @param {number[]} fileIndices - Array of file indices to select
+   */
+  selectFiles(fileIndices) {
+    if (!this._metadata) {
+      throw new Error('Cannot select files: metadata not available');
+    }
+    
+    const fileCount = this._metadata.files ? this._metadata.files.length : 1;
+    
+    // Validate indices
+    for (const idx of fileIndices) {
+      if (idx < 0 || idx >= fileCount) {
+        throw new Error(`Invalid file index: ${idx}`);
+      }
+    }
+    
+    this._selectedFiles = new Set(fileIndices);
+    console.log(`[Torrent] Selected ${fileIndices.length}/${fileCount} files for download`);
+    
+    // Update download manager to skip unselected files' pieces
+    this._updatePieceSelection();
+    
+    this.emit('files:selected', { selected: fileIndices, total: fileCount });
+  }
+  
+  /**
+   * Select all files for download
+   */
+  selectAllFiles() {
+    this._selectedFiles = null;
+    console.log('[Torrent] Selected all files for download');
+    this._updatePieceSelection();
+    this.emit('files:selected', { selected: null, total: this._metadata?.files?.length || 1 });
+  }
+  
+  /**
+   * Deselect specific files (exclude from download)
+   * @param {number[]} fileIndices - Array of file indices to deselect
+   */
+  deselectFiles(fileIndices) {
+    if (!this._metadata) {
+      throw new Error('Cannot deselect files: metadata not available');
+    }
+    
+    const fileCount = this._metadata.files ? this._metadata.files.length : 1;
+    
+    // If all files were selected, create the full set first
+    if (this._selectedFiles === null) {
+      this._selectedFiles = new Set(Array.from({ length: fileCount }, (_, i) => i));
+    }
+    
+    // Remove deselected files
+    for (const idx of fileIndices) {
+      this._selectedFiles.delete(idx);
+    }
+    
+    // Must have at least one file selected
+    if (this._selectedFiles.size === 0) {
+      throw new Error('Cannot deselect all files');
+    }
+    
+    console.log(`[Torrent] Deselected ${fileIndices.length} files, ${this._selectedFiles.size} remaining`);
+    this._updatePieceSelection();
+    
+    this.emit('files:selected', { selected: Array.from(this._selectedFiles), total: fileCount });
+  }
+  
+  /**
+   * Update piece selection based on selected files
+   * Marks pieces that don't belong to any selected file as "skip"
+   * @private
+   */
+  _updatePieceSelection() {
+    if (!this._downloadManager || !this._metadata) return;
+    
+    // If all files selected, no filtering needed
+    if (this._selectedFiles === null) {
+      this._downloadManager.clearSkippedPieces();
+      return;
+    }
+    
+    // Calculate which pieces belong to selected files
+    const selectedPieces = this._getPiecesForFiles(Array.from(this._selectedFiles));
+    
+    // Mark non-selected pieces to skip
+    const totalPieces = this.pieceCount;
+    const skippedPieces = [];
+    
+    for (let i = 0; i < totalPieces; i++) {
+      if (!selectedPieces.has(i)) {
+        skippedPieces.push(i);
+      }
+    }
+    
+    this._downloadManager.setSkippedPieces(skippedPieces);
+    console.log(`[Torrent] Skipping ${skippedPieces.length}/${totalPieces} pieces (not in selected files)`);
+  }
+  
+  /**
+   * Get piece indices that belong to given files
+   * @param {number[]} fileIndices - File indices
+   * @returns {Set<number>} Set of piece indices
+   * @private
+   */
+  _getPiecesForFiles(fileIndices) {
+    const pieces = new Set();
+    
+    if (!this._metadata) return pieces;
+    
+    const pieceLength = this._metadata.pieceLength;
+    const files = this._metadata.files || [{
+      path: this._metadata.name,
+      length: this._metadata.length,
+      offset: 0
+    }];
+    
+    // Calculate file offsets if not present
+    let offset = 0;
+    const filesWithOffset = files.map(f => {
+      const fileWithOffset = { ...f, offset };
+      offset += f.length;
+      return fileWithOffset;
+    });
+    
+    // For each selected file, find which pieces it spans
+    for (const fileIndex of fileIndices) {
+      const file = filesWithOffset[fileIndex];
+      if (!file) continue;
+      
+      const startPiece = Math.floor(file.offset / pieceLength);
+      const endPiece = Math.floor((file.offset + file.length - 1) / pieceLength);
+      
+      for (let p = startPiece; p <= endPiece; p++) {
+        pieces.add(p);
+      }
+    }
+    
+    return pieces;
   }
 }
 

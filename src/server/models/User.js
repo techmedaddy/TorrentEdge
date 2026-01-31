@@ -21,13 +21,30 @@ const userSchema = new mongoose.Schema({
   },
   password: { 
     type: String, 
-    required: true,
+    required: function() {
+      // Password required only if not using OAuth
+      return !this.googleId;
+    },
     minlength: 6
   },
   role: {
     type: String,
     enum: ['user', 'admin'],
     default: 'user'
+  },
+  // Google OAuth fields
+  googleId: {
+    type: String,
+    unique: true,
+    sparse: true  // Allows null values while maintaining uniqueness
+  },
+  avatar: {
+    type: String  // Google profile picture URL
+  },
+  authProvider: {
+    type: String,
+    enum: ['local', 'google'],
+    default: 'local'
   }
 }, {
   timestamps: true
@@ -36,6 +53,7 @@ const userSchema = new mongoose.Schema({
 // Indexes
 userSchema.index({ email: 1 });
 userSchema.index({ username: 1 });
+userSchema.index({ googleId: 1 });
 
 // Pre-save hook to hash passwords
 userSchema.pre('save', async function (next) {

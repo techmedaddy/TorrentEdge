@@ -467,15 +467,31 @@ class TrackerManager {
     // Sort trackers: WORKING > WARNING > ERROR
     const sortedTrackers = this._getSortedTrackers();
     
-    // Try each tracker until one succeeds
+    let lastResult = null;
+    
+    // Try each tracker until one returns peers
     for (const tracker of sortedTrackers) {
       try {
         const result = await this._announceToTracker(tracker, options);
-        return result;
+        lastResult = result;
+        
+        // If we got peers, return immediately
+        if (result.peers && result.peers.length > 0) {
+          console.log(`[TrackerManager] ${tracker.url} returned ${result.peers.length} peers`);
+          return result;
+        }
+        
+        // No peers but succeeded, try next tracker
+        console.log(`[TrackerManager] ${tracker.url} succeeded but returned 0 peers, trying next...`);
       } catch (error) {
         console.warn(`[TrackerManager] Failed to announce to ${tracker.url}: ${error.message}`);
         // Continue to next tracker
       }
+    }
+    
+    // Return last successful result even if no peers, or throw if all failed
+    if (lastResult) {
+      return lastResult;
     }
     
     // All trackers failed

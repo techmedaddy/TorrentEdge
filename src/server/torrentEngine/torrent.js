@@ -184,6 +184,9 @@ class Torrent extends EventEmitter {
         console.log(`[Torrent] Trackers: ${magnet.trackers.length}`);
         console.log(`[Torrent] Direct peers: ${this._magnetPeers.length}`);
         
+        // Initialize TrackerManager for magnet links too
+        this._initializeTrackerManager();
+        
         // Emit 'ready' asynchronously - ready to fetch metadata
         setImmediate(() => this.emit('ready'));
         return;
@@ -1010,7 +1013,8 @@ class Torrent extends EventEmitter {
     
     try {
       const downloaded = this._downloadManager ? this._downloadManager.downloadedBytes : 0;
-      const remaining = this._metadata.length - downloaded;
+      // For magnet links without metadata yet, use 0 as remaining (we don't know the size)
+      const remaining = this._metadata.length ? (this._metadata.length - downloaded) : 0;
       
       const params = {
         infoHash: this._metadata.infoHashBuffer,
@@ -1027,7 +1031,7 @@ class Torrent extends EventEmitter {
       }
       
       // Use TrackerManager with automatic failover
-      await this._retryManager.retry(
+      const result = await this._retryManager.retry(
         () => this._trackerManager.announce(params),
         {
           retryOn: (error) => !error.message.includes('404'),
@@ -1036,6 +1040,16 @@ class Torrent extends EventEmitter {
           }
         }
       );
+      
+      // Add peers from tracker response
+      if (result && result.peers && result.peers.length > 0) {
+        console.log(`[Torrent] Tracker returned ${result.peers.length} peers`);
+        if (this._peerManager) {
+          this._peerManager.addPeers(result.peers);
+        }
+      } else {
+        console.log(`[Torrent] Tracker returned no peers`);
+      }
       
       console.log(`[Torrent] Successfully announced to tracker (event: ${event || 'none'})`);
       

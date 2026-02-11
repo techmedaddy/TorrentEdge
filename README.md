@@ -6,6 +6,11 @@ A modern, production-ready BitTorrent client built from scratch in Node.js with 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Docker](https://img.shields.io/badge/docker-ready-brightgreen.svg)](docker-compose.yml)
 
+
+
+<img width="1600" height="772" alt="image" src="https://github.com/user-attachments/assets/dca162c8-8e19-4ab7-a1ff-673ff049d749" />
+
+
 ## ✨ Features
 
 ### Core BitTorrent Protocol
@@ -26,6 +31,9 @@ A modern, production-ready BitTorrent client built from scratch in Node.js with 
 - 🔥 **Comprehensive Error Handling** with retry logic and peer banning
 - 🔥 **Per-File Progress Tracking** for multi-file torrents
 
+  <img width="1600" height="772" alt="image" src="https://github.com/user-attachments/assets/ca19036e-ac5d-4c23-bcc6-44bca2604780" />
+
+
 ### Real-time & Scalable Architecture
 - 📡 **Socket.IO** for live progress updates to web clients
 - 📊 **Kafka Event Streaming** for analytics and monitoring
@@ -33,6 +41,7 @@ A modern, production-ready BitTorrent client built from scratch in Node.js with 
 - 🚀 **Redis Caching** for improved performance (optional)
 - 🐳 **Docker & Docker Compose** for easy deployment
 - 📈 **Health Monitoring** with tracker and peer health tracking
+<img width="1600" height="772" alt="image" src="https://github.com/user-attachments/assets/d35a62ce-426c-4eed-b52c-bc72857bc3a8" />
 
 ### Production Ready
 - ⚡ **Concurrent Download Management** (default: 3 active, unlimited queued)
@@ -77,6 +86,9 @@ A modern, production-ready BitTorrent client built from scratch in Node.js with 
 - **Peer Manager**: Connection pooling, health tracking, reconnection
 - **State Manager**: Persistence with backup rotation
 - **Tracker Manager**: Multi-tracker failover with health states
+
+  <img width="1600" height="772" alt="image" src="https://github.com/user-attachments/assets/cb8418b7-bba8-445f-b273-b2a549b4d3ec" />
+
 
 ## 🚀 Quick Start
 
@@ -247,6 +259,7 @@ socket.on('queue:updated', (data) => {
   console.log(`Queued: ${data.stats.queuedCount}`);
 });
 ```
+<img width="1600" height="772" alt="image" src="https://github.com/user-attachments/assets/27be6a13-04b4-4585-a7c6-738744f04760" />
 
 ## ⚙️ Configuration
 
@@ -415,3 +428,4 @@ Contributions are welcome! Please follow these steps:
 
 
 For detailed architecture documentation, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+

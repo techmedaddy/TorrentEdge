@@ -9,6 +9,9 @@ const winston = require('winston');
 const authController = require('../controllers/authController');
 
 // Google OAuth client
+if (!process.env.GOOGLE_CLIENT_ID) {
+  logger.warn('GOOGLE_CLIENT_ID not found in environment variables. Google login may fail.');
+}
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 // Re-create the same logger used in server.js
@@ -98,7 +101,26 @@ router.post('/google', async (req, res) => {
 
   } catch (error) {
     logger.error('Google auth error:', error);
-    res.status(401).json({ message: 'Invalid Google token' });
+    
+    // Check for specific Google Auth errors
+    if (error.message && error.message.includes('wrong number of segments')) {
+      return res.status(400).json({ 
+        message: 'Malformed Google credential format.',
+        details: error.message 
+      });
+    }
+
+    if (error.message && error.message.includes('Token used too late')) {
+      return res.status(401).json({ 
+        message: 'Google token expired. Please sign in again.',
+        details: error.message 
+      });
+    }
+
+    res.status(401).json({ 
+      message: 'Google authentication failed.',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 });
 

@@ -8,13 +8,7 @@ const { body, validationResult } = require('express-validator');
 const winston = require('winston');
 const authController = require('../controllers/authController');
 
-// Google OAuth client
-if (!process.env.GOOGLE_CLIENT_ID) {
-  logger.warn('GOOGLE_CLIENT_ID not found in environment variables. Google login may fail.');
-}
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
-
-// Re-create the same logger used in server.js
+// Create logger first (before using it)
 const logger = winston.createLogger({
   level: 'info',
   format: winston.format.combine(
@@ -26,6 +20,12 @@ const logger = winston.createLogger({
     new winston.transports.File({ filename: 'combined.log' }),
   ],
 });
+
+// Google OAuth client
+if (!process.env.GOOGLE_CLIENT_ID) {
+  logger.warn('GOOGLE_CLIENT_ID not found in environment variables. Google login may fail.');
+}
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 // Helper function to generate JWT token
 const generateToken = (user) => {

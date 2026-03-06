@@ -1,5 +1,6 @@
 const EventEmitter = require('events');
-const fs = require('fs').promises;
+const net  = require('net');
+const fs   = require('fs').promises;
 const path = require('path');
 const { Torrent } = require('./torrent');
 const { QueueManager } = require('./queueManager');
@@ -646,6 +647,276 @@ class TorrentEngine extends EventEmitter {
       console.error(`[TorrentEngine] Failed to add torrent: ${error.message}`);
       throw error;
     }
+  }
+
+  // ── Phase 3.1 ─────────────────────────────────────────────────────────────
+
+  /**
+   * seedFromFile — add a torrent and immediately seed it from an existing file.
+   *
+   * Flow:
+   *  1. Copy the source file to the engine's download path so FileWriter finds it
+   *  2. Call addTorrent() with the .torrent buffer
+   *  3. When the Torrent's verify() runs it finds ALL pieces valid → skips download
+   *  4. Engine transitions directly to seeding state
+   *  5. Announces to trackers with left=0 (seeder)
+   *
+   * @param {Object} options
+   * @param {Buffer} options.torrentBuffer  - The .torrent file bytes
+   * @param {string} options.sourcePath     - Absolute path to the file to seed
+   * @param {string} [options.downloadPath] - Where engine stores files (default: engine path)
+   * @param {boolean} [options.autoStart=true]
+   *
+   * @returns {Promise<Torrent>} The running torrent instance
+   */
+  async seedFromFile(options = {}) {
+    const { torrentBuffer, sourcePath, autoStart = true } = options;
+
+    if (!torrentBuffer || !Buffer.isBuffer(torrentBuffer)) {
+      throw new Error('seedFromFile: torrentBuffer is required and must be a Buffer');
+    }
+    if (!sourcePath || typeof sourcePath !== 'string') {
+      throw new Error('seedFromFile: sourcePath is required and must be a string');
+    }
+
+    const downloadPath = options.downloadPath || this.downloadPath;
+
+    // ── Step 1: Parse the torrent to get the name ─────────────────────────
+    // We need the torrent name to know where FileWriter expects the file
+    const { parseTorrent } = require('./torrentParser');
+    let metadata;
+    try {
+      metadata = parseTorrent(torrentBuffer);
+    } catch (err) {
+      throw new Error(`seedFromFile: Failed to parse torrent buffer: ${err.message}`);
+    }
+
+    const torrentName = metadata.name;
+    const isMultiFile = metadata.isMultiFile || (metadata.files && metadata.files.length > 1);
+
+    // ── Step 2: Place the source file where FileWriter expects it ─────────
+    // Single-file torrent: engine looks for <downloadPath>/<torrentName>
+    // We symlink (preferred) or copy to avoid duplicating large files on disk
+    let linkedPath;
+
+    if (isMultiFile) {
+      // Multi-file not supported for seed-from-file yet — would need the whole dir
+      throw new Error('seedFromFile: Multi-file torrents are not yet supported for seeding from a single file');
+    }
+
+    linkedPath = path.join(downloadPath, torrentName);
+
+    // Ensure download directory exists
+    await fs.mkdir(downloadPath, { recursive: true });
+
+    // Check if target already exists (previous seed or partial download)
+    let needsLink = true;
+    try {
+      const existing = await fs.stat(linkedPath);
+      if (existing.size === metadata.length) {
+        // File already in place and correct size — skip linking
+        needsLink = false;
+        console.log(`[TorrentEngine] seedFromFile: file already in place: ${linkedPath}`);
+      } else {
+        // Wrong size — remove and re-link
+        await fs.unlink(linkedPath).catch(() => {});
+      }
+    } catch {
+      // File doesn't exist — need to link
+    }
+
+    if (needsLink) {
+      // Try symlink first (zero-copy, space-efficient)
+      try {
+        await fs.symlink(sourcePath, linkedPath);
+        console.log(`[TorrentEngine] seedFromFile: symlinked ${sourcePath} → ${linkedPath}`);
+      } catch (symlinkErr) {
+        // Symlink failed (e.g. cross-device, Windows) — fall back to hard copy
+        console.warn(`[TorrentEngine] seedFromFile: symlink failed (${symlinkErr.code}), copying file`);
+        await fs.copyFile(sourcePath, linkedPath);
+        console.log(`[TorrentEngine] seedFromFile: copied ${sourcePath} → ${linkedPath}`);
+      }
+    }
+
+    // ── Step 3: Add torrent to engine with the .torrent buffer ────────────
+    // The engine calls torrent.start() → FileWriter.verify() → finds all pieces valid
+    // → DownloadManager sees 100% complete → transitions to seeding state
+    console.log(`[TorrentEngine] seedFromFile: adding torrent "${torrentName}" as seeder`);
+
+    const torrent = await this.addTorrent({
+      torrentBuffer,
+      downloadPath,
+      autoStart,
+    });
+
+    console.log(`[TorrentEngine] seedFromFile: "${torrentName}" is now seeding (${torrent.infoHash})`);
+
+    // ── Phase 3.3: Ensure inbound peer TCP server is listening ────────────
+    // Idempotent — only opens once even if seedFromFile is called many times
+    await this.startPeerListener();
+
+    // ── Phase 3.2: Announce to trackers as seeder ──────────────────────────
+    // Fire-and-forget — we don't await so seedFromFile returns fast.
+    // The engine's own start() already calls _announceToTracker('completed'),
+    // but we also do an explicit seeder announce with correct left=0 params
+    // to ensure trackers categorise us as a seeder (not a downloader).
+    const trackerUrls = metadata.announceList && metadata.announceList.length > 0
+      ? metadata.announceList.flat().filter(Boolean).map(u =>
+          Buffer.isBuffer(u) ? u.toString('utf8') : String(u))
+      : metadata.announce
+        ? [ Buffer.isBuffer(metadata.announce) ? metadata.announce.toString('utf8') : String(metadata.announce) ]
+        : [];
+
+    if (trackerUrls.length > 0) {
+      setImmediate(() => {
+        this.announceAsSeeder({
+          infoHash: torrent.infoHash,
+          fileSize: metadata.length,
+          trackers: trackerUrls,
+          port:     this.port,
+        }).catch(err => {
+          // Non-fatal — seeding still works via DHT/PEX even if trackers fail
+          console.warn(`[TorrentEngine] seedFromFile announce failed (non-fatal): ${err.message}`);
+        });
+      });
+    } else {
+      console.warn(`[TorrentEngine] seedFromFile: no trackers found in torrent — skipping announce (DHT only)`);
+    }
+
+    return torrent;
+  }
+
+  // ── Phase 3.2 ─────────────────────────────────────────────────────────────
+
+  /**
+   * announceAsSeeder — announce to all trackers that we are a seeder.
+   *
+   * Sends a BEP-3 compliant tracker announce with:
+   *   uploaded   = 0       (fresh seed, nothing uploaded yet)
+   *   downloaded = fileSize (we have the complete file)
+   *   left       = 0       (nothing left to download — we're 100%)
+   *   event      = 'started' (first announce)
+   *
+   * Called automatically by seedFromFile after the engine torrent is ready,
+   * but can also be called standalone (e.g. on server restart to re-register).
+   *
+   * @param {Object} options
+   * @param {string}   options.infoHash   - Hex info hash (40 chars)
+   * @param {number}   options.fileSize   - Total file size in bytes
+   * @param {string[]} options.trackers   - Tracker announce URLs
+   * @param {number}   [options.port]     - Port we're listening on (default 6881)
+   * @param {Buffer}   [options.peerId]   - Our peer ID (default: generate fresh)
+   *
+   * @returns {Promise<{
+   *   results: Array<{ tracker: string, ok: boolean, peers: number, error?: string }>,
+   *   successCount: number,
+   *   totalPeers: number,
+   * }>}
+   */
+  async announceAsSeeder(options = {}) {
+    const { infoHash, fileSize, trackers = [], port = this.port } = options;
+
+    // ── Validate ────────────────────────────────────────────────────────────
+    if (!infoHash || typeof infoHash !== 'string' || !/^[a-f0-9]{40}$/i.test(infoHash)) {
+      throw new Error('announceAsSeeder: infoHash must be a 40-char hex string');
+    }
+    if (typeof fileSize !== 'number' || fileSize <= 0) {
+      throw new Error('announceAsSeeder: fileSize must be a positive number');
+    }
+    if (!Array.isArray(trackers) || trackers.length === 0) {
+      throw new Error('announceAsSeeder: trackers must be a non-empty array');
+    }
+
+    // ── Build announce params (seeder: left=0, downloaded=fileSize) ─────────
+    const { announce, generatePeerId } = require('./tracker');
+
+    const infoHashBuffer = Buffer.from(infoHash, 'hex'); // 20-byte Buffer
+    const peerId         = options.peerId || generatePeerId();
+
+    const announceParams = {
+      infoHash:   infoHashBuffer,
+      peerId,
+      port,
+      uploaded:   0,          // Fresh seed — nothing uploaded yet
+      downloaded: fileSize,   // We have the whole file
+      left:       0,          // Nothing left to download
+      event:      'started',  // First announce to this tracker
+      compact:    1,
+    };
+
+    console.log(`[TorrentEngine] announceAsSeeder: ${infoHash} (${trackers.length} trackers, left=0, downloaded=${fileSize})`);
+
+    // ── Announce to each tracker, collect results ────────────────────────────
+    // We fire all tracker announces in parallel — don't wait for slow ones.
+    // Each result is independent; one tracker failing doesn't block others.
+    const announcePromises = trackers.map(async (trackerUrl) => {
+      try {
+        const result = await announce({
+          ...announceParams,
+          announceUrl: trackerUrl,
+        });
+
+        const peerCount = result.peers ? result.peers.length : 0;
+        console.log(`[TorrentEngine] announceAsSeeder: ✅ ${trackerUrl} → ${peerCount} peers`);
+
+        return {
+          tracker:  trackerUrl,
+          ok:       true,
+          peers:    peerCount,
+          interval: result.interval,
+          seeders:  result.complete,
+          leechers: result.incomplete,
+        };
+      } catch (err) {
+        console.warn(`[TorrentEngine] announceAsSeeder: ⚠️  ${trackerUrl} failed — ${err.message}`);
+        return {
+          tracker: trackerUrl,
+          ok:      false,
+          peers:   0,
+          error:   err.message,
+        };
+      }
+    });
+
+    const results      = await Promise.all(announcePromises);
+    const successCount = results.filter(r => r.ok).length;
+    const totalPeers   = results.reduce((sum, r) => sum + r.peers, 0);
+
+    console.log(`[TorrentEngine] announceAsSeeder: ${successCount}/${trackers.length} trackers OK, ${totalPeers} total peers seen`);
+
+    // ── Schedule re-announces ────────────────────────────────────────────────
+    // Trackers expect periodic re-announces (typically every 30 min).
+    // We use the shortest interval reported by any successful tracker.
+    const successResults  = results.filter(r => r.ok && r.interval > 0);
+    const reAnnounceAfter = successResults.length > 0
+      ? Math.min(...successResults.map(r => r.interval)) * 1000
+      : 30 * 60 * 1000; // default 30 min
+
+    if (successCount > 0) {
+      const reAnnounceKey = `reannounce:${infoHash}`;
+
+      // Clear any existing re-announce timer for this torrent
+      if (this._reAnnounceTimers) {
+        clearTimeout(this._reAnnounceTimers.get(reAnnounceKey));
+      } else {
+        this._reAnnounceTimers = new Map();
+      }
+
+      const timer = setTimeout(() => {
+        console.log(`[TorrentEngine] Re-announcing seeder: ${infoHash}`);
+        this.announceAsSeeder({ ...options, event: '' }).catch(err => {
+          console.warn(`[TorrentEngine] Re-announce failed for ${infoHash}: ${err.message}`);
+        });
+      }, reAnnounceAfter);
+
+      // Don't prevent process exit
+      if (timer.unref) timer.unref();
+      this._reAnnounceTimers.set(reAnnounceKey, timer);
+
+      console.log(`[TorrentEngine] Re-announce scheduled for ${infoHash} in ${Math.round(reAnnounceAfter / 1000 / 60)} min`);
+    }
+
+    return { results, successCount, totalPeers };
   }
 
   async removeTorrent(infoHash, deleteFiles = false) {
@@ -1458,6 +1729,312 @@ class TorrentEngine extends EventEmitter {
   /**
    * Shutdown the engine gracefully
    */
+  // ── Phase 3.3 ─────────────────────────────────────────────────────────────
+
+  /**
+   * startPeerListener — opens a TCP server on this.port so inbound peers
+   * can connect and download pieces from us.
+   *
+   * BitTorrent peers initiate connections by sending a handshake:
+   *   [pstrlen=19][pstr="BitTorrent protocol"][8 reserved bytes][infoHash][peerId]
+   *
+   * We read the infoHash from the handshake, find the matching torrent in our
+   * map, and delegate piece serving to that torrent's UploadManager.
+   *
+   * Already called by seedFromFile — idempotent (safe to call multiple times).
+   *
+   * @returns {Promise<number>} The port actually bound to
+   */
+  async startPeerListener() {
+    // Idempotent — don't open a second server if already listening
+    if (this._peerServer && this._peerServer.listening) {
+      return this._peerListenPort;
+    }
+
+    const { PeerConnection, MESSAGE_TYPES } = require('./peerConnection');
+    const { generatePeerId }                = require('./tracker');
+
+    // Our engine-level peerId (shared across all torrents we seed)
+    if (!this._enginePeerId) {
+      this._enginePeerId = generatePeerId();
+    }
+
+    return new Promise((resolve, reject) => {
+      const server = net.createServer((socket) => {
+        this._handleInboundPeer(socket, MESSAGE_TYPES);
+      });
+
+      server.on('error', (err) => {
+        if (err.code === 'EADDRINUSE') {
+          // Port taken — try next port
+          const fallback = this.port + 1;
+          console.warn(`[TorrentEngine] Port ${this.port} in use, trying ${fallback}`);
+          server.listen(fallback);
+        } else {
+          console.error(`[TorrentEngine] Peer listener error: ${err.message}`);
+        }
+      });
+
+      server.listen(this.port, () => {
+        this._peerServer     = server;
+        this._peerListenPort = server.address().port;
+        console.log(`[TorrentEngine] Peer listener started on port ${this._peerListenPort}`);
+        this.emit('listener:started', { port: this._peerListenPort });
+        resolve(this._peerListenPort);
+      });
+    });
+  }
+
+  /**
+   * Handles a single inbound TCP connection from a remote peer.
+   * Reads the BitTorrent handshake, routes to the right torrent, delegates.
+   * @private
+   */
+  _handleInboundPeer(socket, MESSAGE_TYPES) {
+    const remoteAddr = `${socket.remoteAddress}:${socket.remotePort}`;
+    console.log(`[TorrentEngine] Inbound peer: ${remoteAddr}`);
+
+    // 68-byte handshake: 1 + 19 + 8 + 20 + 20
+    const HANDSHAKE_LEN = 68;
+    let buffer = Buffer.alloc(0);
+
+    const onData = (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+
+      if (buffer.length < HANDSHAKE_LEN) return; // wait for full handshake
+
+      // Parse handshake
+      const pstrLen = buffer[0];
+      if (pstrLen !== 19) {
+        console.warn(`[TorrentEngine] Invalid pstrlen from ${remoteAddr}: ${pstrLen}`);
+        socket.destroy();
+        return;
+      }
+
+      const pstr     = buffer.slice(1, 20).toString('ascii');
+      if (pstr !== 'BitTorrent protocol') {
+        console.warn(`[TorrentEngine] Unknown protocol from ${remoteAddr}: ${pstr}`);
+        socket.destroy();
+        return;
+      }
+
+      // infoHash is bytes 28-47
+      const infoHashBuf = buffer.slice(28, 48);
+      const infoHashHex = infoHashBuf.toString('hex');
+      const remotePeerId = buffer.slice(48, 68);
+
+      console.log(`[TorrentEngine] Handshake from ${remoteAddr} for ${infoHashHex}`);
+
+      // Remove data listener — torrent takes over from here
+      socket.removeListener('data', onData);
+
+      // Find matching torrent
+      const torrent = this.torrents.get(infoHashHex);
+      if (!torrent) {
+        console.warn(`[TorrentEngine] No torrent for ${infoHashHex} — closing ${remoteAddr}`);
+        socket.destroy();
+        return;
+      }
+
+      // Only accept if we're seeding (have the file)
+      const state = torrent.state || torrent._state;
+      if (state !== 'seeding') {
+        console.warn(`[TorrentEngine] Torrent ${infoHashHex} not seeding (state: ${state}) — closing ${remoteAddr}`);
+        socket.destroy();
+        return;
+      }
+
+      // ── Send our handshake response ────────────────────────────────────
+      const handshake = Buffer.alloc(HANDSHAKE_LEN);
+      let offset = 0;
+      handshake[offset++] = 19;
+      Buffer.from('BitTorrent protocol').copy(handshake, offset); offset += 19;
+      // Reserved bytes (8) — already zero
+      offset += 8;
+      infoHashBuf.copy(handshake, offset); offset += 20;
+      this._enginePeerId.copy(handshake, offset);
+      socket.write(handshake);
+
+      // ── Send bitfield (we have all pieces) ────────────────────────────
+      this._sendBitfield(socket, torrent);
+
+      // ── Send unchoke so they can start requesting ──────────────────────
+      const unchoke = Buffer.alloc(5);
+      unchoke.writeUInt32BE(1, 0); // length = 1
+      unchoke[4] = MESSAGE_TYPES.UNCHOKE;
+      socket.write(unchoke);
+
+      // ── Forward remaining data to torrent's handlePieceRequest ────────
+      const remaining = buffer.slice(HANDSHAKE_LEN);
+
+      // Create a lightweight peer proxy so UploadManager can write back
+      const peer = this._buildPeerProxy(socket, remotePeerId, remoteAddr, MESSAGE_TYPES);
+
+      if (remaining.length > 0) {
+        this._dispatchPeerMessage(peer, remaining, torrent);
+      }
+
+      socket.on('data', (data) => {
+        this._dispatchPeerMessage(peer, data, torrent);
+      });
+
+      socket.on('close', () => {
+        console.log(`[TorrentEngine] Peer disconnected: ${remoteAddr}`);
+        this.emit('peer:disconnected', { addr: remoteAddr, infoHash: infoHashHex });
+      });
+
+      socket.on('error', (err) => {
+        console.warn(`[TorrentEngine] Peer socket error ${remoteAddr}: ${err.message}`);
+      });
+
+      this.emit('peer:connected', { addr: remoteAddr, infoHash: infoHashHex });
+    };
+
+    socket.on('data', onData);
+
+    // 30s timeout for handshake — close dead connections
+    socket.setTimeout(30_000, () => {
+      if (buffer.length < HANDSHAKE_LEN) {
+        console.warn(`[TorrentEngine] Handshake timeout from ${remoteAddr}`);
+        socket.destroy();
+      }
+    });
+
+    socket.on('error', (err) => {
+      console.warn(`[TorrentEngine] Pre-handshake error from ${remoteAddr}: ${err.message}`);
+    });
+  }
+
+  /**
+   * Sends a bitfield message telling the peer we have ALL pieces.
+   * @private
+   */
+  _sendBitfield(socket, torrent) {
+    // Get piece count from torrent metadata
+    const metadata   = torrent._metadata;
+    if (!metadata || !metadata.pieces) return;
+
+    const numPieces   = metadata.pieces.length;
+    const byteCount   = Math.ceil(numPieces / 8);
+    const bitfield    = Buffer.alloc(byteCount, 0xFF); // all 1s = have everything
+
+    // Zero out spare bits at the end (spec requirement)
+    const spareBits = (byteCount * 8) - numPieces;
+    if (spareBits > 0) {
+      bitfield[byteCount - 1] &= (0xFF << spareBits) & 0xFF;
+    }
+
+    // Message: [length 4B][id=5 1B][bitfield nB]
+    const msg = Buffer.alloc(4 + 1 + byteCount);
+    msg.writeUInt32BE(1 + byteCount, 0);
+    msg[4] = 5; // BITFIELD message id
+    bitfield.copy(msg, 5);
+    socket.write(msg);
+  }
+
+  /**
+   * Parses incoming peer messages and dispatches to torrent.
+   * Handles REQUEST (id=6) and CANCEL (id=8) — the only ones we care about as seeder.
+   * @private
+   */
+  _dispatchPeerMessage(peer, data, torrent) {
+    // Messages: [4-byte length][1-byte id][payload...]
+    // May receive multiple messages in one chunk
+    let offset = 0;
+
+    while (offset < data.length) {
+      if (offset + 4 > data.length) break; // incomplete length prefix
+
+      const msgLen = data.readUInt32BE(offset);
+      offset += 4;
+
+      if (msgLen === 0) continue; // keepalive
+
+      if (offset + msgLen > data.length) break; // incomplete message
+
+      const msgId = data[offset];
+      const payload = data.slice(offset + 1, offset + msgLen);
+      offset += msgLen;
+
+      if (msgId === 6) {
+        // REQUEST: [pieceIndex 4B][begin 4B][length 4B]
+        if (payload.length < 12) continue;
+        const pieceIndex = payload.readUInt32BE(0);
+        const begin      = payload.readUInt32BE(4);
+        const length     = payload.readUInt32BE(8);
+        torrent.handlePieceRequest(peer, pieceIndex, begin, length);
+      } else if (msgId === 8) {
+        // CANCEL: same format as REQUEST
+        if (payload.length < 12) continue;
+        const pieceIndex = payload.readUInt32BE(0);
+        const begin      = payload.readUInt32BE(4);
+        const length     = payload.readUInt32BE(8);
+        torrent.handleCancelRequest(peer, pieceIndex, begin, length);
+      }
+      // Ignore CHOKE, UNCHOKE, INTERESTED, etc. — we're seeder-only here
+    }
+  }
+
+  /**
+   * Builds a minimal peer proxy object that UploadManager can use.
+   * UploadManager calls peer.send() / peer.sendPiece() to write data back.
+   * @private
+   */
+  _buildPeerProxy(socket, remotePeerId, remoteAddr, MESSAGE_TYPES) {
+    const peerIdStr = remotePeerId.toString('hex').slice(0, 8);
+
+    return {
+      id:       peerIdStr,
+      ip:       socket.remoteAddress,
+      port:     socket.remotePort,
+      choked:   false, // we unchoked them already
+      _socket:  socket,
+
+      // Send a PIECE message back to the peer
+      // Format: [length 4B][id=7 1B][pieceIndex 4B][begin 4B][data nB]
+      sendPiece(pieceIndex, begin, data) {
+        if (!socket.writable) return;
+        const msgLen = 1 + 4 + 4 + data.length;
+        const msg    = Buffer.alloc(4 + msgLen);
+        msg.writeUInt32BE(msgLen, 0);
+        msg[4] = MESSAGE_TYPES ? MESSAGE_TYPES.PIECE : 7;
+        msg.writeUInt32BE(pieceIndex, 5);
+        msg.writeUInt32BE(begin, 9);
+        data.copy(msg, 13);
+        socket.write(msg);
+      },
+
+      // Generic send for other messages (choke, etc.)
+      send(msgId, payload = Buffer.alloc(0)) {
+        if (!socket.writable) return;
+        const msg = Buffer.alloc(4 + 1 + payload.length);
+        msg.writeUInt32BE(1 + payload.length, 0);
+        msg[4] = msgId;
+        if (payload.length > 0) payload.copy(msg, 5);
+        socket.write(msg);
+      },
+
+      destroy() {
+        socket.destroy();
+      },
+    };
+  }
+
+  /**
+   * stopPeerListener — closes the inbound TCP server cleanly.
+   * Called by shutdown().
+   */
+  async stopPeerListener() {
+    if (!this._peerServer) return;
+    return new Promise((resolve) => {
+      this._peerServer.close(() => {
+        console.log('[TorrentEngine] Peer listener stopped');
+        this._peerServer = null;
+        resolve();
+      });
+    });
+  }
+
   async shutdown() {
     console.log('[TorrentEngine] Shutting down...');
     
@@ -1498,6 +2075,9 @@ class TorrentEngine extends EventEmitter {
         this._kafkaProducer = null;
       }
       
+      // Stop peer listener (Phase 3.3)
+      await this.stopPeerListener();
+
       // Final state cleanup
       await this._stateManager.cleanup();
       

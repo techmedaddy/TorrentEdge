@@ -62,6 +62,27 @@ const torrentSchema = new mongoose.Schema({
     path: String
   }],
   trackers: [String],
+
+  // ── Phase 2.2: Created-from-file fields ────────────────────────────────────
+  // Populated only when torrent was created from a local file (not downloaded)
+  sourcePath: {
+    type: String,
+    default: null,
+    // Absolute path to the source file on disk that this torrent seeds
+    // e.g. /home/user/downloads/.torrentedge/seeds/report.pdf
+  },
+  torrentFilePath: {
+    type: String,
+    default: null,
+    // Absolute path to the saved .torrent file on disk
+    // e.g. /home/user/downloads/.torrentedge/torrents/1234567890-report.pdf.torrent
+  },
+  createdFromUpload: {
+    type: Boolean,
+    default: false,
+    // true = this torrent was created by the user from their own file
+    // false = this torrent was added via magnet/download
+  },
   addedAt: {
     type: Date,
     default: Date.now,

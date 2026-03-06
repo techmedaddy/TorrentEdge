@@ -22,6 +22,7 @@
 const Torrent = require('../models/torrent');
 const mongoose = require('mongoose');
 const { defaultEngine } = require('../torrentEngine');
+const { broadcast } = require('../socket');
 const path = require('path');
 const fs = require('fs').promises;
 
@@ -570,6 +571,290 @@ exports.selectFiles = async (req, res) => {
   } catch (error) {
     console.error('[TorrentController] selectFiles error:', error);
     res.status(500).json({ message: 'Server error: ' + error.message });
+  }
+};
+
+// ─── Create Torrent FROM a user's file (Phase 2.1) ───────────────────────────
+
+/**
+ * POST /api/torrent/create-from-file
+ *
+ * Accepts any file upload (PDF, MP3, MP4, ZIP, etc.) and generates:
+ *  - A .torrent file (returned as base64)
+ *  - An infoHash
+ *  - A magnet URI the user can share
+ *
+ * Body (multipart/form-data):
+ *  - file         : [required] the file to create a torrent from
+ *  - name         : [optional] override torrent name (defaults to original filename)
+ *  - trackers     : [optional] JSON array of tracker URLs e.g. '["udp://..."]'
+ *  - pieceSize    : [optional] piece size in bytes (16384 – 8388608)
+ *  - private      : [optional] "true" to make private torrent (disables DHT)
+ *
+ * Response 201:
+ *  {
+ *    infoHash     : string,   // 40-char hex
+ *    magnetURI    : string,   // ready-to-share magnet link
+ *    name         : string,   // torrent name used
+ *    fileSize     : number,   // original file size in bytes
+ *    pieceLength  : number,   // piece size used
+ *    pieceCount   : number,   // number of pieces
+ *    trackers     : string[], // tracker URLs included
+ *    torrentFile  : string,   // base64-encoded .torrent file
+ *    torrent      : Object,   // saved DB entry (same shape as other torrent endpoints)
+ *  }
+ */
+exports.createTorrentFromFile = async (req, res) => {
+  // Track paths for cleanup on failure
+  let savedSourcePath  = null;
+  let savedTorrentPath = null;
+
+  try {
+    // ── 1. Validate upload present ──────────────────────────────────────────
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded. Send a file in the "file" field.' });
+    }
+
+    const fileBuffer = req.file.buffer;
+    if (!fileBuffer || fileBuffer.length === 0) {
+      return res.status(400).json({ error: 'Uploaded file is empty.' });
+    }
+
+    // ── 2. File too large guard (controller-level, defence-in-depth) ────────
+    // Multer already enforces this at HTTP layer but we double-check here so
+    // the limit is respected even if the route is called programmatically.
+    const MAX_BYTES = parseInt(process.env.MAX_SEED_FILE_SIZE, 10) || (2 * 1024 * 1024 * 1024);
+    if (fileBuffer.length > MAX_BYTES) {
+      const limitMB = (MAX_BYTES / (1024 * 1024)).toFixed(0);
+      return res.status(413).json({
+        error:    `File too large. Maximum allowed size is ${limitMB} MB.`,
+        maxBytes: MAX_BYTES,
+        fileBytes: fileBuffer.length,
+      });
+    }
+
+    // ── 3. File type check — WARN, never block ──────────────────────────────
+    // Any file can be torrented. We just warn the user if the type looks odd
+    // so they know what they're sharing (e.g. accidentally uploading .exe)
+    const warnings = [];
+    const mimeType       = req.file.mimetype || 'application/octet-stream';
+    const originalName   = req.file.originalname || 'untitled';
+    const ext            = path.extname(originalName).toLowerCase();
+
+    const SAFE_TYPES = new Set([
+      // Documents
+      '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+      '.txt', '.md', '.csv', '.json', '.xml',
+      // Media
+      '.mp3', '.mp4', '.mkv', '.avi', '.mov', '.wav', '.flac', '.ogg',
+      '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg',
+      // Archives
+      '.zip', '.tar', '.gz', '.rar', '.7z',
+      // Code / misc
+      '.js', '.ts', '.py', '.html', '.css', '.epub', '.iso',
+    ]);
+
+    const WARN_TYPES = new Set([
+      '.exe', '.dll', '.bat', '.sh', '.cmd', '.msi', '.deb', '.rpm',
+      '.apk', '.dmg', '.pkg',
+    ]);
+
+    if (WARN_TYPES.has(ext)) {
+      warnings.push(`File type "${ext}" is an executable. Make sure you intended to share this.`);
+    } else if (ext && !SAFE_TYPES.has(ext)) {
+      warnings.push(`File type "${ext}" is uncommon — proceeding anyway.`);
+    }
+
+    if (!ext) {
+      warnings.push('File has no extension — torrent will still be created, but recipients may not know the file type.');
+    }
+
+    // ── 4. Parse options from body ──────────────────────────────────────────
+    const rawName    = req.body.name || originalName || 'untitled';
+    const rawPrivate = req.body.private === 'true' || req.body.private === true;
+
+    let trackers;
+    if (req.body.trackers) {
+      try {
+        trackers = typeof req.body.trackers === 'string'
+          ? JSON.parse(req.body.trackers)
+          : req.body.trackers;
+        if (!Array.isArray(trackers)) {
+          return res.status(400).json({ error: 'trackers must be a JSON array of strings.' });
+        }
+      } catch {
+        return res.status(400).json({ error: 'Invalid trackers format. Expected JSON array e.g. ["udp://..."]' });
+      }
+    }
+
+    let pieceSize;
+    if (req.body.pieceSize) {
+      pieceSize = parseInt(req.body.pieceSize, 10);
+      if (isNaN(pieceSize)) {
+        return res.status(400).json({ error: 'pieceSize must be a number.' });
+      }
+    }
+
+    // ── 5. Create .torrent from file ────────────────────────────────────────
+    const { createTorrentWithMagnet } = require('../torrentEngine/torrentCreator');
+
+    // Throttle progress broadcasts — emit at most once every 100ms and
+    // only when progress actually changes by ≥1% to avoid flooding the socket.
+    const pieceCount = Math.ceil(fileBuffer.length / (pieceSize || 262144));
+    let   lastEmittedPct = -1;
+    let   lastEmitTime   = 0;
+    const THROTTLE_MS    = 100;
+
+    const onProgress = (hashed, total) => {
+      const pct = Math.floor((hashed / total) * 100);
+      const now = Date.now();
+      if (pct !== lastEmittedPct && (now - lastEmitTime) >= THROTTLE_MS) {
+        lastEmittedPct = pct;
+        lastEmitTime   = now;
+        try {
+          broadcast('torrent:hash-progress', {
+            userId:   req.user?._id?.toString() || req.user?.id,
+            fileName: originalName,
+            hashed,
+            total,
+            percent: pct,
+          });
+        } catch (_) { /* socket not yet ready — non-fatal */ }
+      }
+    };
+
+    let created;
+    try {
+      created = createTorrentWithMagnet(fileBuffer, {
+        name:       rawName,
+        trackers,
+        pieceSize,
+        private:    rawPrivate,
+        onProgress: pieceCount > 1 ? onProgress : undefined, // skip for tiny files
+      });
+    } catch (err) {
+      return res.status(400).json({ error: `Failed to create torrent: ${err.message}` });
+    }
+
+    // Emit 100% done event
+    try {
+      broadcast('torrent:hash-progress', {
+        userId:   req.user?._id?.toString() || req.user?.id,
+        fileName: originalName,
+        hashed:   pieceCount,
+        total:    pieceCount,
+        percent:  100,
+        done:     true,
+      });
+    } catch (_) {}
+
+    // ── 6. Duplicate detection ──────────────────────────────────────────────
+    // Check by infoHash — if same file + same name was already uploaded,
+    // this catches it. We return the existing record so the client can
+    // reuse the magnet link immediately rather than re-uploading.
+    const existing = await Torrent.findOne({ infoHash: created.infoHash });
+    if (existing) {
+      return res.status(409).json({
+        error:    'This exact file has already been added (same content and name).',
+        hint:     'Use the existing magnet link below to share it.',
+        infoHash: created.infoHash,
+        magnetURI: existing.magnetURI || created.magnetURI,
+        torrent:  existing,
+      });
+    }
+
+    // ── 7. Write files to disk ──────────────────────────────────────────────
+    const baseDir     = process.env.DOWNLOAD_PATH || './downloads';
+    const seedsDir    = path.join(baseDir, '.torrentedge', 'seeds');
+    const torrentsDir = path.join(baseDir, '.torrentedge', 'torrents');
+
+    await fs.mkdir(seedsDir,    { recursive: true });
+    await fs.mkdir(torrentsDir, { recursive: true });
+
+    const safeOrigName   = path.basename(originalName).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const hashPrefix     = created.infoHash.slice(0, 8);
+
+    savedSourcePath  = path.join(seedsDir,    `${hashPrefix}-${safeOrigName}`);
+    savedTorrentPath = path.join(torrentsDir, `${hashPrefix}-${safeOrigName}.torrent`);
+
+    await fs.writeFile(savedSourcePath,  fileBuffer);
+    await fs.writeFile(savedTorrentPath, created.torrentBuffer);
+
+    console.log(`[TorrentController] Saved source file  : ${savedSourcePath}`);
+    console.log(`[TorrentController] Saved .torrent file: ${savedTorrentPath}`);
+
+    // ── 8. Save to MongoDB ──────────────────────────────────────────────────
+    const torrent = new Torrent({
+      name:              created.name,
+      infoHash:          created.infoHash,
+      magnetURI:         created.magnetURI,
+      size:              created.fileSize,
+      trackers:          created.trackers,
+      uploadedBy:        req.user.userId || req.user.id,
+      status:            'seeding',
+      progress:          100,
+      sourcePath:        savedSourcePath,
+      torrentFilePath:   savedTorrentPath,
+      createdFromUpload: true,
+      files: [{
+        name: created.name,
+        size: created.fileSize,
+        path: savedSourcePath,
+      }],
+    });
+
+    await torrent.save();
+
+    console.log(`[TorrentController] Created torrent from file: ${created.name} (${created.infoHash})`);
+
+    // ── 9. Auto-seed: wire into engine (Phase 3.1) ──────────────────────────
+    // Fire-and-forget — seeding starting up shouldn't delay the HTTP response.
+    // Engine errors are logged but don't fail the request (torrent is saved, user
+    // already has the magnet link they need to share).
+    setImmediate(async () => {
+      try {
+        await defaultEngine.seedFromFile({
+          torrentBuffer: created.torrentBuffer,
+          sourcePath:    savedSourcePath,
+          downloadPath:  path.join(process.env.DOWNLOAD_PATH || './downloads', 'seeds'),
+          autoStart:     true,
+        });
+        console.log(`[TorrentController] Engine seeding started: ${created.infoHash}`);
+      } catch (err) {
+        // Don't crash — torrent is already saved, user has the magnet link
+        console.warn(`[TorrentController] Engine seed failed (non-fatal): ${err.message}`);
+      }
+    });
+
+    // ── 10. Respond ─────────────────────────────────────────────────────────
+    const response = {
+      infoHash:        created.infoHash,
+      magnetURI:       created.magnetURI,
+      name:            created.name,
+      fileSize:        created.fileSize,
+      pieceLength:     created.pieceLength,
+      pieceCount:      created.pieceCount,
+      trackers:        created.trackers,
+      torrentFile:     created.torrentBuffer.toString('base64'),
+      sourcePath:      savedSourcePath,
+      torrentFilePath: savedTorrentPath,
+      torrent:         torrent.toObject(),
+    };
+
+    // Attach warnings if any (non-blocking)
+    if (warnings.length > 0) {
+      response.warnings = warnings;
+    }
+
+    return res.status(201).json(response);
+
+  } catch (error) {
+    // ── Cleanup on failure — never leave orphan files on disk ───────────────
+    if (savedSourcePath)  await fs.unlink(savedSourcePath).catch(() => {});
+    if (savedTorrentPath) await fs.unlink(savedTorrentPath).catch(() => {});
+
+    console.error('[TorrentController] createTorrentFromFile error:', error);
+    res.status(500).json({ error: 'Server error: ' + error.message });
   }
 };
 

@@ -463,9 +463,23 @@ exports.getTorrentStats = async (req, res) => {
     const engineTorrent = defaultEngine.getTorrent(dbTorrent.infoHash);
     
     if (!engineTorrent) {
-      return res.status(400).json({ 
-        message: 'Torrent not running in engine',
-        dbStatus: dbTorrent.status
+      // Torrent is saved in DB but not currently loaded in the engine.
+      // Return DB-based stats so the dashboard shows the correct persisted state
+      // instead of an error. This happens when the engine hasn't loaded it yet,
+      // or when seedFromFile/addTorrent fails after the DB record is created.
+      return res.json({
+        state:         dbTorrent.status || 'paused',
+        progress:      dbTorrent.progress ?? 0,
+        downloadSpeed: 0,
+        uploadSpeed:   0,
+        peers:         0,
+        seeds:         0,
+        downloaded:    dbTorrent.downloaded ?? 0,
+        uploaded:      dbTorrent.uploaded ?? 0,
+        size:          dbTorrent.size ?? 0,
+        eta:           null,
+        pieces: { total: 0, done: 0, active: 0 },
+        _engineMissing: true,
       });
     }
 

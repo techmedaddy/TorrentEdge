@@ -753,7 +753,12 @@ class TorrentEngine extends EventEmitter {
 
     // ── Phase 3.3: Ensure inbound peer TCP server is listening ────────────
     // Idempotent — only opens once even if seedFromFile is called many times
-    await this.startPeerListener();
+    // Non-fatal: if all ports are in use, seeding still works via DHT/PEX
+    try {
+      await this.startPeerListener();
+    } catch (listenErr) {
+      console.warn(`[TorrentEngine] seedFromFile: peer listener failed (non-fatal): ${listenErr.message}`);
+    }
 
     // ── Phase 3.2: Announce to trackers as seeder ──────────────────────────
     // Fire-and-forget — we don't await so seedFromFile returns fast.
@@ -1760,28 +1765,32 @@ class TorrentEngine extends EventEmitter {
     }
 
     return new Promise((resolve, reject) => {
-      const server = net.createServer((socket) => {
-        this._handleInboundPeer(socket, MESSAGE_TYPES);
-      });
+      const tryListen = (port) => {
+        const server = net.createServer((socket) => {
+          this._handleInboundPeer(socket, MESSAGE_TYPES);
+        });
 
-      server.on('error', (err) => {
-        if (err.code === 'EADDRINUSE') {
-          // Port taken — try next port
-          const fallback = this.port + 1;
-          console.warn(`[TorrentEngine] Port ${this.port} in use, trying ${fallback}`);
-          server.listen(fallback);
-        } else {
-          console.error(`[TorrentEngine] Peer listener error: ${err.message}`);
-        }
-      });
+        server.once('error', (err) => {
+          if (err.code === 'EADDRINUSE') {
+            const fallback = port + 1;
+            console.warn(`[TorrentEngine] Port ${port} in use, trying ${fallback}`);
+            tryListen(fallback);
+          } else {
+            console.error(`[TorrentEngine] Peer listener error: ${err.message}`);
+            reject(err);
+          }
+        });
 
-      server.listen(this.port, () => {
-        this._peerServer     = server;
-        this._peerListenPort = server.address().port;
-        console.log(`[TorrentEngine] Peer listener started on port ${this._peerListenPort}`);
-        this.emit('listener:started', { port: this._peerListenPort });
-        resolve(this._peerListenPort);
-      });
+        server.listen(port, () => {
+          this._peerServer     = server;
+          this._peerListenPort = server.address().port;
+          console.log(`[TorrentEngine] Peer listener started on port ${this._peerListenPort}`);
+          this.emit('listener:started', { port: this._peerListenPort });
+          resolve(this._peerListenPort);
+        });
+      };
+
+      tryListen(this.port);
     });
   }
 

@@ -56,14 +56,26 @@ const mergeTorrentData = (dbTorrent, engineTorrent) => {
 // Get all torrents for the authenticated user
 exports.getAllTorrents = async (req, res) => {
   try {
-    const torrents = await Torrent.find({ uploadedBy: req.user.userId || req.user.id })
+    const userId = req.user.userId || req.user.id;
+
+    // 2.1 — show torrents where user is uploader OR downloader
+    const torrents = await Torrent.find({
+      $or: [
+        { uploadedBy: userId },
+        { downloadedBy: userId }
+      ]
+    })
       .sort({ addedAt: -1 })
       .populate('uploadedBy', 'username');
 
-    // Merge with live engine stats
+    // Merge with live engine stats + attach isOwner flag
     const mergedTorrents = torrents.map(torrent => {
       const engineTorrent = defaultEngine.getTorrent(torrent.infoHash);
-      return mergeTorrentData(torrent, engineTorrent);
+      const merged = mergeTorrentData(torrent, engineTorrent);
+      merged.isOwner = torrent.uploadedBy._id
+        ? torrent.uploadedBy._id.toString() === userId.toString()
+        : torrent.uploadedBy.toString() === userId.toString();
+      return merged;
     });
 
     res.json(mergedTorrents);
@@ -77,7 +89,7 @@ exports.getAllTorrents = async (req, res) => {
 exports.getTorrentById = async (req, res) => {
   try {
     let torrent;
-    
+
     // Check if it's MongoDB ObjectId or infoHash
     if (isValidObjectId(req.params.id)) {
       torrent = await Torrent.findById(req.params.id)
@@ -92,9 +104,22 @@ exports.getTorrentById = async (req, res) => {
       return res.status(404).json({ message: 'Torrent not found' });
     }
 
-    // Merge with live engine stats
+    // 2.4 — allow access if user is uploader OR in downloadedBy
+    const userId = req.user.userId || req.user.id;
+    const uploaderId = torrent.uploadedBy._id
+      ? torrent.uploadedBy._id.toString()
+      : torrent.uploadedBy.toString();
+    const isOwner = uploaderId === userId.toString();
+    const isLeecher = torrent.downloadedBy.map(id => id.toString()).includes(userId.toString());
+
+    if (!isOwner && !isLeecher) {
+      return res.status(403).json({ message: 'Not authorized to view this torrent' });
+    }
+
+    // Merge with live engine stats + attach isOwner flag
     const engineTorrent = defaultEngine.getTorrent(torrent.infoHash);
     const mergedData = mergeTorrentData(torrent, engineTorrent);
+    mergedData.isOwner = isOwner;
 
     res.json(mergedData);
   } catch (error) {
@@ -131,13 +156,30 @@ exports.createTorrent = async (req, res) => {
         return res.status(400).json({ message: `Invalid magnet link: ${error.message}` });
       }
       
-      // Check if torrent already exists
+      // 2.2 — if torrent already exists, add this user as a downloader instead of erroring
       const existingTorrent = await Torrent.findOne({ infoHash: magnetInfo.infoHash });
       if (existingTorrent) {
-        return res.status(400).json({ 
-          message: 'Torrent already exists',
-          torrent: existingTorrent
-        });
+        const userId = req.user.userId || req.user.id;
+        const alreadyOwner = existingTorrent.uploadedBy.toString() === userId.toString();
+        const alreadyLeeching = existingTorrent.downloadedBy.map(id => id.toString()).includes(userId.toString());
+
+        if (alreadyOwner || alreadyLeeching) {
+          // User already has this torrent — return it with isOwner flag
+          const engineTorrent = defaultEngine.getTorrent(existingTorrent.infoHash);
+          const merged = mergeTorrentData(existingTorrent, engineTorrent);
+          merged.isOwner = alreadyOwner;
+          return res.status(200).json({ message: 'Already in your list', torrent: merged });
+        }
+
+        // New leecher — add them to downloadedBy
+        existingTorrent.downloadedBy.push(userId);
+        await existingTorrent.save();
+        console.log(`[TorrentController] User ${userId} added as leecher for: ${existingTorrent.name}`);
+
+        const engineTorrent = defaultEngine.getTorrent(existingTorrent.infoHash);
+        const merged = mergeTorrentData(existingTorrent, engineTorrent);
+        merged.isOwner = false;
+        return res.status(200).json(merged);
       }
       
       console.log(`[TorrentController] Adding magnet: ${magnetInfo.displayName || magnetInfo.infoHash}`);
@@ -169,13 +211,19 @@ exports.createTorrent = async (req, res) => {
       throw error;
     }
 
-    // Check if torrent already exists in MongoDB
+    // Check if torrent already exists in MongoDB (e.g. added via .torrent file with same hash)
     const existingTorrent = await Torrent.findOne({ infoHash: engineTorrent.infoHash });
     if (existingTorrent) {
-      return res.status(400).json({ 
-        message: 'Torrent already exists in database',
-        torrent: existingTorrent
-      });
+      const userId = req.user.userId || req.user.id;
+      const alreadyOwner = existingTorrent.uploadedBy.toString() === userId.toString();
+      const alreadyLeeching = existingTorrent.downloadedBy.map(id => id.toString()).includes(userId.toString());
+      if (!alreadyOwner && !alreadyLeeching) {
+        existingTorrent.downloadedBy.push(userId);
+        await existingTorrent.save();
+      }
+      const merged = mergeTorrentData(existingTorrent, engineTorrent);
+      merged.isOwner = alreadyOwner;
+      return res.status(200).json(merged);
     }
 
     // Get initial stats (may fail for magnet links without metadata yet)
@@ -216,7 +264,10 @@ exports.createTorrent = async (req, res) => {
 
     console.log(`[TorrentController] Created torrent: ${torrent.name} (${torrent.infoHash})`);
     
-    res.status(201).json(mergeTorrentData(torrent, engineTorrent));
+    // 5.3 — always include isOwner in response
+    const response = mergeTorrentData(torrent, engineTorrent);
+    response.isOwner = true;
+    res.status(201).json(response);
   } catch (error) {
     console.error('[TorrentController] createTorrent error:', error);
     res.status(500).json({ message: 'Server error: ' + error.message });
@@ -256,36 +307,63 @@ exports.updateTorrent = async (req, res) => {
 exports.deleteTorrent = async (req, res) => {
   try {
     const deleteFiles = req.query.deleteFiles === 'true';
-    
+    const userId = req.user.userId || req.user.id;
+
     let torrent;
     if (isValidObjectId(req.params.id)) {
       torrent = await Torrent.findById(req.params.id);
     } else {
       torrent = await Torrent.findOne({ infoHash: req.params.id.toLowerCase() });
     }
-    
+
     if (!torrent) {
       return res.status(404).json({ message: 'Torrent not found' });
     }
 
-    // Only owner or admin can delete
-    if (torrent.uploadedBy.toString() !== req.user.userId || req.user.id && req.user.role !== 'admin') {
-      return res.status(403).json({ message: 'Not authorized to delete this torrent' });
+    const isOwner = torrent.uploadedBy.toString() === userId.toString();
+    const isLeecher = torrent.downloadedBy.map(id => id.toString()).includes(userId.toString());
+
+    if (!isOwner && !isLeecher) {
+      return res.status(403).json({ message: 'Not authorized to remove this torrent' });
     }
 
-    // Remove from engine
+    // 5.2 — leechers just get removed from downloadedBy, torrent stays alive
+    if (!isOwner && isLeecher) {
+      torrent.downloadedBy = torrent.downloadedBy.filter(id => id.toString() !== userId.toString());
+      await torrent.save();
+      console.log(`[TorrentController] Leecher ${userId} removed from: ${torrent.name}`);
+
+      // 5.2 — if no leechers remain AND no owner (shouldn't happen, but guard it),
+      // or if this was the last reference to the torrent, clean up engine
+      // (Normal case: owner still seeds, so engine stays. Nothing to do.)
+      return res.json({ message: 'Removed from your list' });
+    }
+
+    // Owner deleting — remove from engine and DB entirely
+    // 5.2 — if leechers still exist, just remove owner's association
+    // Only fully purge when nobody else has it
+    if (torrent.downloadedBy && torrent.downloadedBy.length > 0) {
+      // Leechers still have it — transfer ownership to first leecher
+      // so the torrent stays alive, or just null out uploadedBy
+      // Simplest safe behavior: delete from engine & DB but leave leechers a tombstone
+      // Actually cleanest: just wipe it — owner made the call
+      console.log(`[TorrentController] Owner deleting torrent with ${torrent.downloadedBy.length} leecher(s) still attached`);
+    }
+
     try {
-      await defaultEngine.removeTorrent(torrent.infoHash, deleteFiles);
+      await Promise.race([
+        defaultEngine.removeTorrent(torrent.infoHash, deleteFiles),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+      ]);
       console.log(`[TorrentController] Removed from engine: ${torrent.infoHash}`);
     } catch (error) {
-      console.warn(`[TorrentController] Failed to remove from engine (may not be running): ${error.message}`);
+      console.warn(`[TorrentController] Failed to remove from engine (non-fatal): ${error.message}`);
     }
 
-    // Remove from MongoDB
     await Torrent.findByIdAndDelete(torrent._id);
-    
+
     console.log(`[TorrentController] Deleted torrent: ${torrent.name}`);
-    res.json({ 
+    res.json({
       message: 'Torrent deleted successfully',
       deletedFiles: deleteFiles
     });
@@ -834,6 +912,22 @@ exports.createTorrentFromFile = async (req, res) => {
           autoStart:     true,
         });
         console.log(`[TorrentController] Engine seeding started: ${created.infoHash}`);
+
+        // Force-transition to seeding state — seedFromFile files are already
+        // 100% complete on disk so downloadManager:complete never fires.
+        const engineTorrent = defaultEngine.getTorrent(created.infoHash);
+        if (engineTorrent && typeof engineTorrent._transitionToSeeding === 'function') {
+          if (engineTorrent._state !== 'seeding') {
+            await engineTorrent._transitionToSeeding();
+            console.log(`[TorrentController] Force-transitioned to seeding: ${created.infoHash}`);
+          }
+        }
+
+        // Also update DB status to seeding
+        await Torrent.findOneAndUpdate(
+          { infoHash: created.infoHash },
+          { status: 'seeding', progress: 100 }
+        );
       } catch (err) {
         // Don't crash — torrent is already saved, user has the magnet link
         console.warn(`[TorrentController] Engine seed failed (non-fatal): ${err.message}`);
@@ -852,7 +946,7 @@ exports.createTorrentFromFile = async (req, res) => {
       torrentFile:     created.torrentBuffer.toString('base64'),
       sourcePath:      savedSourcePath,
       torrentFilePath: savedTorrentPath,
-      torrent:         torrent.toObject(),
+      torrent:         { ...torrent.toObject(), isOwner: true },  // 5.3
     };
 
     // Attach warnings if any (non-blocking)

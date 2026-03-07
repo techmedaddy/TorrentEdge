@@ -56,6 +56,13 @@ const torrentSchema = new mongoose.Schema({
     ref: 'User',
     required: true
   },
+  downloadedBy: {
+    type: [mongoose.Schema.Types.ObjectId],
+    ref: 'User',
+    default: []
+    // Users who added this torrent to their list (leechers/peers)
+    // Does NOT include the uploader — use uploadedBy for that
+  },
   files: [{
     name: String,
     size: Number,
@@ -95,6 +102,8 @@ const torrentSchema = new mongoose.Schema({
 torrentSchema.index({ name: 'text' });  // Text search on name
 torrentSchema.index({ infoHash: 1 }, { unique: true });
 torrentSchema.index({ uploadedBy: 1 });
+torrentSchema.index({ downloadedBy: 1 });
+torrentSchema.index({ uploadedBy: 1, downloadedBy: 1 });  // compound for "my torrents" query
 torrentSchema.index({ status: 1 });
 torrentSchema.index({ addedAt: -1 });  // Recent torrents first
 

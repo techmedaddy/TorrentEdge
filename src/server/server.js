@@ -75,6 +75,22 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/torrented
               try {
                 await defaultEngine.seedFromFile({ torrentBuffer, sourcePath, downloadPath, autoStart: true });
                 logger.info(`[SeedRestore] Resumed seeding: "${doc.name}"`);
+
+                // Force-transition to seeding — file is already 100% on disk
+                // so downloadManager:complete never fires automatically
+                const engineTorrent = defaultEngine.getTorrent(doc.infoHash);
+                if (engineTorrent && typeof engineTorrent._transitionToSeeding === 'function') {
+                  if (engineTorrent._state !== 'seeding') {
+                    await engineTorrent._transitionToSeeding();
+                    logger.info(`[SeedRestore] Force-transitioned to seeding: "${doc.name}"`);
+                  }
+                }
+
+                // Sync DB status
+                await TorrentModel.findOneAndUpdate(
+                  { infoHash: doc.infoHash },
+                  { status: 'seeding', progress: 100 }
+                );
               } catch (err) {
                 logger.warn(`[SeedRestore] Failed to resume "${doc.name}": ${err.message}`);
               }

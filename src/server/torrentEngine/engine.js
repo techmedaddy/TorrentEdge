@@ -704,7 +704,7 @@ class TorrentEngine extends EventEmitter {
       throw new Error('seedFromFile: Multi-file torrents are not yet supported for seeding from a single file');
     }
 
-    linkedPath = path.join(downloadPath, torrentName);
+    linkedPath = path.resolve(downloadPath, torrentName);
 
     // Ensure download directory exists
     await fs.mkdir(downloadPath, { recursive: true });
@@ -727,8 +727,11 @@ class TorrentEngine extends EventEmitter {
 
     if (needsLink) {
       // Try symlink first (zero-copy, space-efficient)
+      // IMPORTANT: use absolute resolved paths so the symlink is valid regardless
+      // of cwd — relative symlinks resolve relative to the symlink's own directory
+      // which would produce a broken path (e.g. downloads/seeds/downloads/...)
       try {
-        await fs.symlink(sourcePath, linkedPath);
+        await fs.symlink(path.resolve(sourcePath), linkedPath);
         console.log(`[TorrentEngine] seedFromFile: symlinked ${sourcePath} → ${linkedPath}`);
       } catch (symlinkErr) {
         // Symlink failed (e.g. cross-device, Windows) — fall back to hard copy

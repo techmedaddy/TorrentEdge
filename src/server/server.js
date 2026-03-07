@@ -37,9 +37,57 @@ if (process.env.NODE_ENV !== 'production') {
   );
 }
 
-// MongoDB Connection
+// MongoDB Connection + post-connect seed restore
 mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/torrentedge')
-  .then(() => logger.info('MongoDB connected successfully'))
+  .then(async () => {
+    logger.info('MongoDB connected successfully');
+
+    // Phase 3.2 — Restore seeding for createdFromUpload torrents on startup
+    try {
+      const TorrentModel  = require('./models/torrent');
+      const { defaultEngine } = require('./torrentEngine');
+      const fsSync        = require('fs');
+      const pathLib       = require('path');
+
+      const seedTorrents = await TorrentModel.find({ createdFromUpload: true });
+      if (seedTorrents.length > 0) {
+        logger.info(`[SeedRestore] Restoring ${seedTorrents.length} seeded torrent(s)...`);
+        for (const doc of seedTorrents) {
+          try {
+            const torrentFilePath = pathLib.resolve(doc.torrentFilePath);
+            const sourcePath      = pathLib.resolve(doc.sourcePath);
+
+            if (!fsSync.existsSync(torrentFilePath)) {
+              logger.warn(`[SeedRestore] .torrent file missing for "${doc.name}", skipping`);
+              continue;
+            }
+            if (!fsSync.existsSync(sourcePath)) {
+              logger.warn(`[SeedRestore] Source file missing for "${doc.name}", skipping`);
+              continue;
+            }
+
+            const torrentBuffer = fsSync.readFileSync(torrentFilePath);
+            const downloadPath  = pathLib.resolve(
+              process.env.DOWNLOAD_PATH || './downloads', 'seeds'
+            );
+
+            setImmediate(async () => {
+              try {
+                await defaultEngine.seedFromFile({ torrentBuffer, sourcePath, downloadPath, autoStart: true });
+                logger.info(`[SeedRestore] Resumed seeding: "${doc.name}"`);
+              } catch (err) {
+                logger.warn(`[SeedRestore] Failed to resume "${doc.name}": ${err.message}`);
+              }
+            });
+          } catch (err) {
+            logger.warn(`[SeedRestore] Error processing "${doc.name}": ${err.message}`);
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn(`[SeedRestore] Restore pass failed (non-fatal): ${err.message}`);
+    }
+  })
   .catch((err) => logger.error('MongoDB connection error:', err));
 
 // Middleware

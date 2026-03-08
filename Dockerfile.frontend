@@ -1,0 +1,20 @@
+# Dockerfile.frontend — builds the Vite/React dashboard for production
+
+FROM node:18-alpine AS builder
+
+WORKDIR /app
+
+# Install deps
+COPY torrentedge-dashboard/package*.json ./
+RUN npm ci
+
+# Copy source and build
+COPY torrentedge-dashboard/ .
+RUN npm run build
+
+# Serve with nginx
+FROM nginx:stable-alpine
+COPY --from=builder /app/dist /usr/share/nginx/html
+# nginx routing handled by the main nginx service; this just serves static files
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]

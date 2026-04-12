@@ -51,44 +51,99 @@ A modern, production-ready BitTorrent client built from scratch in Node.js with 
 - 🎯 **Smart Piece Selection** with availability tracking
 - 📝 **Comprehensive Logging** with categorized errors
 
-## 🏗️ Architecture
+## 🧭 High-Level Design (HLD)
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                       TorrentEdge API                        │
-│                    (Express + Socket.IO)                     │
-└────────────┬───────────────────────────────────┬────────────┘
-             │                                   │
-    ┌────────▼─────────┐              ┌─────────▼──────────┐
-    │  Torrent Engine  │              │   Kafka Producer   │
-    │   (Core Logic)   │──────────────▶│   (Analytics)      │
-    └────────┬─────────┘              └────────────────────┘
-             │
-    ┌────────▼──────────────────────────────────────────────┐
-    │              Component Layer                          │
-    ├───────────────┬───────────────┬──────────────────────┤
-    │ Queue Manager │ State Manager │  Peer Manager        │
-    │ Download Mgr  │ Upload Mgr    │  Throttler           │
-    │ File Writer   │ Piece Manager │  Retry Manager       │
-    └───────────────┴───────────────┴──────────────────────┘
-                     │
-            ┌────────▼─────────┐
-            │  Peer Network    │
-            │  (TCP + Tracker) │
-            └──────────────────┘
+```mermaid
+flowchart LR
+    U[Clients / UI] --> API[Express API + Socket.IO]
+    API --> ENG[Torrent Engine Orchestrator]
+    API --> AUTH[Auth + Validation]
+
+    ENG --> Q[Queue Manager]
+    ENG --> DL[Download Manager]
+    ENG --> UL[Upload Manager]
+    ENG --> PEER[Peer Manager]
+    ENG --> TRACK[Tracker Manager]
+    ENG --> STATE[State Manager]
+    ENG --> FILE[File Writer]
+
+    ENG --> KAFKA[Kafka Producer]
+    API --> DB[(MongoDB)]
+    API --> REDIS[(Redis Cache)]
+
+    PEER --> SWARM[Peer Swarm (TCP)]
+    TRACK --> TRK[Trackers (HTTP/UDP)]
 ```
 
-### Key Components
-- **Torrent Engine**: Core orchestration for all torrent operations
-- **Queue Manager**: Priority-based multi-torrent scheduling
-- **Download Manager**: Piece selection, endgame mode, retry logic
-- **Upload Manager**: Tit-for-tat choking, super-seeding
-- **Peer Manager**: Connection pooling, health tracking, reconnection
-- **State Manager**: Persistence with backup rotation
-- **Tracker Manager**: Multi-tracker failover with health states
+## 🧩 Low-Level Design (LLD)
 
-  <img width="1600" height="772" alt="image" src="https://github.com/user-attachments/assets/cb8418b7-bba8-445f-b273-b2a549b4d3ec" />
+```mermaid
+flowchart TB
+    subgraph Engine[\"src/server/torrentEngine\"]
+      E[engine.js]
+      T[torrent.js]
+      QM[queueManager.js]
+      DM[downloadManager.js]
+      UM[uploadManager.js]
+      PM[peerManager.js]
+      PC[peerConnection.js]
+      TM[tracker.js]
+      PiM[pieceManager.js]
+      FW[fileWriter.js]
+      SM[stateManager.js]
+      TH[throttler.js]
+      RM[retryManager.js]
+    end
 
+    E --> T
+    E --> QM
+    E --> DM
+    E --> UM
+    E --> PM
+    E --> TM
+    E --> SM
+
+    DM --> PiM
+    DM --> FW
+    DM --> TH
+    DM --> RM
+
+    PM --> PC
+    PM --> TH
+    PC --> TM
+```
+
+## 🔄 Dataflow Diagram
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as API (Express)
+    participant E as Torrent Engine
+    participant T as Trackers
+    participant P as Peers
+    participant F as File Writer
+    participant M as MongoDB
+    participant K as Kafka
+    participant S as Socket.IO
+
+    C->>A: POST /api/torrents (file/magnet)
+    A->>E: addTorrent()
+    E->>T: announce / scrape
+    T-->>E: peer list
+    E->>P: handshake + bitfield exchange
+    loop Until complete
+      E->>P: request piece blocks
+      P-->>E: piece blocks
+      E->>F: verify + write piece
+      E->>M: persist progress/state
+      E->>K: publish metrics/events
+      E->>S: emit progress update
+      S-->>C: live status
+    end
+    E-->>A: completed / seeding
+    A-->>C: final status
+```
 
 ## 🚀 Quick Start
 

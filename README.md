@@ -55,31 +55,31 @@ A modern, production-ready BitTorrent client built from scratch in Node.js with 
 
 ```mermaid
 flowchart LR
-    U[Clients / UI] --> API[Express API + Socket.IO]
-    API --> ENG[Torrent Engine Orchestrator]
-    API --> AUTH[Auth + Validation]
+    U[Clients / UI] --> API[Express API + Socket.IO];
+    API --> ENG[Torrent Engine Orchestrator];
+    API --> AUTH[Auth + Validation];
 
-    ENG --> Q[Queue Manager]
-    ENG --> DL[Download Manager]
-    ENG --> UL[Upload Manager]
-    ENG --> PEER[Peer Manager]
-    ENG --> TRACK[Tracker Manager]
-    ENG --> STATE[State Manager]
-    ENG --> FILE[File Writer]
+    ENG --> Q[Queue Manager];
+    ENG --> DL[Download Manager];
+    ENG --> UL[Upload Manager];
+    ENG --> PEER[Peer Manager];
+    ENG --> TRACKER[Tracker Manager];
+    ENG --> STATE[State Manager];
+    ENG --> FILE[File Writer];
 
-    ENG --> KAFKA[Kafka Producer]
-    API --> DB[(MongoDB)]
-    API --> REDIS[(Redis Cache)]
+    ENG --> KAFKA[Kafka Producer];
+    API --> DB[(MongoDB)];
+    API --> REDIS[(Redis Cache)];
 
-    PEER --> SWARM[Peer Swarm (TCP)]
-    TRACK --> TRK[Trackers (HTTP/UDP)]
+    PEER --> SWARM[Peer Swarm TCP];
+    TRACKER --> TRK[Trackers HTTP UDP];
 ```
 
 ## 🧩 Low-Level Design (LLD)
 
 ```mermaid
 flowchart TB
-    subgraph Engine[\"src/server/torrentEngine\"]
+    subgraph Engine[src/server/torrentEngine]
       E[engine.js]
       T[torrent.js]
       QM[queueManager.js]

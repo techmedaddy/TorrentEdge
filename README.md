@@ -1,88 +1,178 @@
-# TorrentEdge 🚀
+# TorrentEdge – Node.js BitTorrent backend with event-streamed telemetry
 
-A modern, production-ready BitTorrent client built from scratch in Node.js with real-time monitoring and event streaming capabilities.
+## 2) One-line summary
 
-[![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Docker](https://img.shields.io/badge/docker-ready-brightgreen.svg)](docker-compose.yml)
+A backend-first BitTorrent system that coordinates peer/tracker protocol work, torrent lifecycle control, and real-time operational visibility.
 
+## 3) Problem statement
 
+Most torrent clients optimize for desktop UX, not backend control surfaces.
 
-<img width="1600" height="772" alt="image" src="https://github.com/user-attachments/assets/dca162c8-8e19-4ab7-a1ff-673ff049d749" />
+This project exists to provide a service-oriented torrent runtime that can be integrated into applications requiring:
+- authenticated multi-user torrent management,
+- deterministic lifecycle control (`start`, `pause`, `resume`, `remove`),
+- resumable state across process restarts,
+- and machine-consumable live telemetry.
 
+## 4) Engineering highlights
 
-## ✨ Features
+- **Distributed peer discovery paths**: tracker announce + DHT integration for decentralized peer intake.
+- **Concurrent workload orchestration**: `QueueManager` enforces bounded active torrents while keeping unbounded queue depth.
+- **Protocol lifecycle handling**: magnet links enter a partial-metadata path before full download orchestration.
+- **I/O-aware scheduling**: piece selection/retry and write verification are separated from API request handling.
+- **Dual event surfaces**:
+  - Socket.IO for low-latency UI/state updates.
+  - Kafka producer path for downstream analytics/event pipelines.
+- **Restart resilience**: engine state persisted on interval and flushed on graceful shutdown.
 
-### Core BitTorrent Protocol
-- ✅ **Full BitTorrent Protocol** implementation (BEP 3)
-- ✅ **Magnet Link Support** with metadata exchange (BEP 9)
-- ✅ **Extension Protocol** for advanced features (BEP 10)
-- ✅ **Multi-file Torrents** with proper piece alignment
-- ✅ **Piece Verification** using SHA1 hashing
-- ✅ **Resume Downloads** with state persistence
-- ✅ **Tracker Protocol** (HTTP/HTTPS/UDP)
+## 5) Architecture overview
 
-### Advanced Features
-- 🔥 **Multi-Torrent Queue Management** with priority-based scheduling
-- 🔥 **Bandwidth Throttling** using token bucket algorithm
-- 🔥 **Upload Management** with tit-for-tat choking algorithm
-- 🔥 **Super-Seeding Mode** for efficient distribution
-- 🔥 **Piece Selection Strategies**: Rarest-first, endgame mode
-- 🔥 **Comprehensive Error Handling** with retry logic and peer banning
-- 🔥 **Per-File Progress Tracking** for multi-file torrents
-
-  <img width="1600" height="772" alt="image" src="https://github.com/user-attachments/assets/ca19036e-ac5d-4c23-bcc6-44bca2604780" />
-
-
-### Real-time & Scalable Architecture
-- 📡 **Socket.IO** for live progress updates to web clients
-- 📊 **Kafka Event Streaming** for analytics and monitoring
-- 💾 **MongoDB** for torrent metadata and user management
-- 🚀 **Redis Caching** for improved performance (optional)
-- 🐳 **Docker & Docker Compose** for easy deployment
-- 📈 **Health Monitoring** with tracker and peer health tracking
-<img width="1600" height="772" alt="image" src="https://github.com/user-attachments/assets/d35a62ce-426c-4eed-b52c-bc72857bc3a8" />
-
-### Production Ready
-- ⚡ **Concurrent Download Management** (default: 3 active, unlimited queued)
-- 🔒 **Peer Ban System** with strike tracking
-- 🔄 **Automatic Reconnection** with exponential backoff
-- 📦 **State Backup & Recovery** with rotation
-- 🎯 **Smart Piece Selection** with availability tracking
-- 📝 **Comprehensive Logging** with categorized errors
-
-## 🧭 High-Level Design (HLD)
-
-```mermaid
-flowchart LR
-    U[Clients / UI] --> API[Express API + Socket.IO];
-    API --> ENG[Torrent Engine Orchestrator];
-    API --> AUTH[Auth + Validation];
-
-    ENG --> Q[Queue Manager];
-    ENG --> DL[Download Manager];
-    ENG --> UL[Upload Manager];
-    ENG --> PEER[Peer Manager];
-    ENG --> TRACKER[Tracker Manager];
-    ENG --> STATE[State Manager];
-    ENG --> FILE[File Writer];
-
-    ENG --> KAFKA[Kafka Producer];
-    API --> DB[(MongoDB)];
-    API --> REDIS[(Redis Cache)];
-
-    PEER --> SWARM[Peer Swarm TCP];
-    TRACKER --> TRK[Trackers HTTP UDP];
+```text
+Clients (REST + Socket.IO)
+        |
+        v
+Express API Layer (auth, validation, controllers)
+        |
+        v
+TorrentEngine (orchestrator)
+  |        |         |         |         |
+  v        v         v         v         v
+Queue   Torrent   State     DHT      Kafka
+Mgmt    runtime   Manager   Node     Producer
+           |
+           v
+  Peer/Tracker/Piece/File subsystems
+           |
+           v
+     Filesystem + Network
 ```
 
-## 🧩 Low-Level Design (LLD)
+Core server entrypoints and modules:
+- [src/server/server.js](src/server/server.js)
+- [src/server/torrentEngine/engine.js](src/server/torrentEngine/engine.js)
+- [src/server/torrentEngine/torrent.js](src/server/torrentEngine/torrent.js)
+- [src/server/socket.js](src/server/socket.js)
 
-```mermaid
-flowchart TB
-    subgraph Engine[src/server/torrentEngine]
-      E[engine.js]
-      T[torrent.js]
-      QM[queueManager.js]
+## 6) Execution / data flow
+
+1. Client calls authenticated API on [src/server/routes/torrentRoutes.js](src/server/routes/torrentRoutes.js) to create from `.torrent`, magnet URI, or uploaded file.
+2. Controller persists metadata in MongoDB and hands torrent source to `defaultEngine`.
+3. `TorrentEngine` creates/queues torrent runtime; admission is controlled by `maxConcurrent`.
+4. Torrent runtime initializes trackers, DHT peer intake (if enabled), peer connections, and file writer.
+5. For magnet input, runtime enters metadata-fetch state before piece scheduling.
+6. Piece blocks are requested asynchronously, verified, and committed to disk.
+7. Runtime emits progress/peer/piece/lifecycle events:
+   - Socket.IO room-scoped updates for UI.
+   - Kafka events when Kafka is enabled.
+8. State snapshots are periodically persisted; shutdown path flushes pending state and closes dependencies.
+
+## 7) Key design decisions
+
+### Engine as single in-process control plane
+- **Why**: keeps lifecycle and scheduling semantics centralized.
+- **Tradeoff**: simpler consistency, but bounded by single-process memory/CPU.
+
+### Queue-constrained activation
+- **Why**: prevent unbounded active torrent fan-out from exhausting connections and disk I/O.
+- **Tradeoff**: queued torrents wait for activation; throughput per torrent is prioritized over immediate parallelism.
+
+### Local state files + MongoDB metadata
+- **Why**: torrent runtime state is latency-sensitive; document metadata is query-oriented.
+- **Tradeoff**: two persistence domains require reconciliation logic.
+
+### Socket.IO + Kafka split
+- **Why**: UI updates and durable event streaming have different latency and retention needs.
+- **Tradeoff**: duplicate event publication paths increase operational surface area.
+
+### Graceful shutdown-first lifecycle
+- **Why**: torrent workloads are long-lived; abrupt exits corrupt runtime continuity.
+- **Tradeoff**: shutdown path is more complex (server close, engine flush, producer close, DB close).
+
+## 8) Reliability and failure handling
+
+- **Retry behavior**
+  - Tracker and transient network operations retry with backoff paths in engine/runtime components.
+  - Kafka producer uses built-in retry configuration and buffered progress batching.
+
+- **Partial state handling**
+  - Magnet torrents can exist in `fetching_metadata` before full torrent metadata is known.
+  - Piece verification differentiates valid vs invalid on-disk data during resume/check stages.
+
+- **Failure scenarios covered**
+  - Missing/invalid metadata.
+  - Peer disconnect/churn.
+  - Tracker failure and fallback behavior.
+  - Filesystem write/verification issues.
+  - Process termination with in-flight torrents.
+
+- **Recovery behavior**
+  - `StateManager` performs periodic saves and atomic write pattern (`temp -> rename`) with backup rotation.
+  - Engine auto-resume reloads persisted torrents and restores queue/paused intent.
+  - Startup flow attempts to restore seeding sessions for created-from-upload torrents when source assets exist.
+
+## 9) Observability / debugging
+
+- **Structured logs** via Winston JSON transports to `logs/error.log` and `logs/combined.log`.
+- **HTTP request logs** via Morgan stream integration.
+- **Live runtime introspection**:
+  - `GET /api/statistics`
+  - `GET /api/statistics/engine`
+  - `GET /api/statistics/speed-history`
+  - `GET /api/statistics/dht`
+- **Socket event surface** for per-torrent and global rooms (`subscribe:torrent`, `subscribe:all`).
+- **Event stream diagnostics** through Kafka topic output when enabled.
+
+## 10) Demo
+
+- API demo (placeholder): add curl walkthrough for create/start/pause/resume/remove.
+- Real-time demo (placeholder): add short screen capture showing Socket.IO progress + speed history.
+- Failure demo (placeholder): add runbook clip showing restart/resume behavior after process kill.
+
+## 11) How to run
+
+### Local
+
+```bash
+npm install
+cp .env.example .env
+npm run dev
+```
+
+Backend default: `http://localhost:3029`
+
+### Docker Compose
+
+```bash
+docker-compose up -d
+```
+
+This brings up backend + MongoDB + Kafka + Zookeeper + Nginx using [docker-compose.yml](docker-compose.yml).
+
+### Tests
+
+```bash
+npm test
+```
+
+## 12) Project structure (brief)
+
+- [src/server](src/server): Express server, auth, REST routes, controllers.
+- [src/server/torrentEngine](src/server/torrentEngine): BitTorrent engine and protocol/runtime components.
+- [src/server/torrentEngine/dht](src/server/torrentEngine/dht): DHT node and routing table logic.
+- [src/server/models](src/server/models): MongoDB persistence schemas.
+- [src/server/routes](src/server/routes): API surfaces for torrents, stats, settings, health.
+- [src/server/socket.js](src/server/socket.js): Socket.IO initialization and event fan-out.
+- [tests](tests): unit/integration coverage across parser, magnet, peer, tracker, DHT, and manager modules.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): expanded architecture reference.
+
+## 13) What this demonstrates
+
+- Designing a stateful network service around eventually consistent external systems (trackers, peers, DHT).
+- Building async orchestration with explicit queueing, bounded concurrency, and lifecycle transitions.
+- Implementing resumable workloads with persistence and recovery semantics.
+- Separating operational telemetry paths (interactive vs stream processing).
+- Operating a Node.js service with graceful shutdown and structured diagnostics.
+- Combining protocol-level logic with API-level product constraints (auth, multi-user ownership, control plane endpoints).
       DM[downloadManager.js]
       UM[uploadManager.js]
       PM[peerManager.js]

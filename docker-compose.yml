@@ -48,10 +48,20 @@ services:
       - PORT=3029
       - MONGODB_URI=mongodb://root:example@mongodb:27017/torrentedge?authSource=admin
       - KAFKA_BROKERS=kafka:9092
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=torrentedge
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASS=postgres
+      - REDIS_URL=redis://redis:6379
     depends_on:
       kafka:
         condition: service_healthy
       mongodb:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     networks:
       - app-network
@@ -97,6 +107,38 @@ services:
       timeout: 10s
       retries: 3
 
+  postgres:
+    image: postgres:15-alpine
+    container_name: torrentedge-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: torrentedge
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: torrentedge-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 networks:
   kafka-network:
     driver: bridge
@@ -105,6 +147,8 @@ networks:
 
 volumes:
   mongo-data:
+    driver: local
+  postgres-data:
     driver: local
   torrent-downloads:
     driver: local

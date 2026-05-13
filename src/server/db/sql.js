@@ -18,7 +18,7 @@ const logger = winston.createLogger({
 const sequelize = new Sequelize(
   process.env.POSTGRES_DB || 'torrentedge',
   process.env.POSTGRES_USER || 'postgres',
-  process.env.POSTGRES_PASSWORD || 'password',
+  process.env.POSTGRES_PASSWORD || process.env.POSTGRES_PASS || 'password',
   {
     host: process.env.POSTGRES_HOST || 'localhost',
     port: process.env.POSTGRES_PORT || 5432,
@@ -49,7 +49,10 @@ const connectSQL = async () => {
     }
   } catch (error) {
     console.error('[SQL] Unable to connect to the database:', error);
-    process.exit(1);
+    if (process.env.NODE_ENV === 'production') {
+      process.exit(1);
+    }
+    console.warn('[SQL] Running without PostgreSQL — transfer metadata features will be unavailable.');
   }
 };
 

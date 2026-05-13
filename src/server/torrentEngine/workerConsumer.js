@@ -19,6 +19,7 @@
 
 const EventEmitter = require('events');
 const { DIRECTIVE_TYPES, TOPICS, buildDirective, validateDirective } = require('./jobDirective');
+const LeaseManager = require('./leaseManager');
 
 class WorkerConsumer extends EventEmitter {
   /**
@@ -139,6 +140,14 @@ class WorkerConsumer extends EventEmitter {
 
     const torrent = await this._engine.addTorrent(opts);
 
+    // Phase 2.2: Acquire lease
+    const acquired = await LeaseManager.acquireLease(torrent.infoHash, this._nodeId);
+    if (!acquired) {
+      console.warn(`[Worker:${this._nodeId}] Failed to acquire lease for new job ${torrent.infoHash}. Removing...`);
+      await this._engine.removeTorrent(torrent.infoHash);
+      throw new Error(`Lease denied for ${torrent.infoHash}`);
+    }
+
     this.emit('lifecycle', buildDirective(
       DIRECTIVE_TYPES.TRANSFER_STARTED,
       {
@@ -158,6 +167,9 @@ class WorkerConsumer extends EventEmitter {
     }
     torrent.pause();
 
+    // Phase 2.2: Release lease
+    await LeaseManager.releaseLease(payload.infoHash, this._nodeId);
+
     this.emit('lifecycle', buildDirective(
       DIRECTIVE_TYPES.TRANSFER_PAUSED,
       { infoHash: payload.infoHash },
@@ -170,6 +182,13 @@ class WorkerConsumer extends EventEmitter {
     if (!torrent) {
       throw new Error(`Torrent not found: ${payload.infoHash}`);
     }
+
+    // Phase 2.2: Acquire lease
+    const acquired = await LeaseManager.acquireLease(payload.infoHash, this._nodeId);
+    if (!acquired) {
+      throw new Error(`Failed to acquire lease for resume ${payload.infoHash}`);
+    }
+
     torrent.resume();
 
     this.emit('lifecycle', buildDirective(
@@ -183,6 +202,9 @@ class WorkerConsumer extends EventEmitter {
     await this._engine.removeTorrent(payload.infoHash, {
       deleteFiles: payload.deleteFiles || false,
     });
+
+    // Phase 2.2: Release lease
+    await LeaseManager.releaseLease(payload.infoHash, this._nodeId);
 
     this.emit('lifecycle', buildDirective(
       DIRECTIVE_TYPES.TRANSFER_COMPLETED,
@@ -241,8 +263,22 @@ class WorkerConsumer extends EventEmitter {
   _startHeartbeat() {
     if (this._heartbeatTimer) return;
 
-    this._heartbeatTimer = setInterval(() => {
+    this._heartbeatTimer = setInterval(async () => {
       const stats = this._engine ? this._engine.getGlobalStats() : {};
+
+      // Phase 2.2: Renew leases for all active torrents
+      if (this._engine) {
+        for (const [infoHash, torrent] of this._engine.torrents.entries()) {
+          // Only renew if not paused/stopped
+          if (torrent.state !== 'paused' && torrent.state !== 'stopped' && torrent.state !== 'error') {
+            const renewed = await LeaseManager.renewLease(infoHash, this._nodeId);
+            if (!renewed) {
+              console.warn(`[Worker:${this._nodeId}] Lost lease for ${infoHash}! Pausing torrent to prevent split-brain.`);
+              torrent.pause();
+            }
+          }
+        }
+      }
 
       this.emit('heartbeat', buildDirective(
         DIRECTIVE_TYPES.WORKER_HEARTBEAT,

@@ -27,6 +27,7 @@ const path = require('path');
 const fs = require('fs').promises;
 const { Transfer } = require('../models/sql'); // Phase 1.1 SQL Model
 const Checkpointer = require('../torrentEngine/checkpointer'); // Phase 1.2 CAS
+const ResumeService = require('../torrentEngine/resumeService'); // Phase 1.3 Idempotent Resume
 
 // Helper to validate ObjectId
 const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
@@ -486,7 +487,8 @@ exports.pauseTorrent = async (req, res) => {
 exports.resumeTorrent = async (req, res) => {
   try {
     const { id } = req.params;
-    
+    const requestId = req.requestId; // Phase 1.3: correlation ID
+
     let dbTorrent;
     if (isValidObjectId(id)) {
       dbTorrent = await Torrent.findById(id);
@@ -498,25 +500,68 @@ exports.resumeTorrent = async (req, res) => {
       return res.status(404).json({ message: 'Torrent not found' });
     }
 
-    // Get from engine
     const engineTorrent = defaultEngine.getTorrent(dbTorrent.infoHash);
-    
+
     if (!engineTorrent) {
-      return res.status(400).json({ 
-        message: 'Torrent not loaded in engine. Please re-add or start the torrent.' 
+      return res.status(400).json({
+        message: 'Torrent not loaded in engine. Please re-add or start the torrent.'
       });
     }
 
-    // Resume the torrent
+    // ── Phase 1.3: CAS-aware resume ────────────────────────────────────────
+    let resumeContext = null;
+    try {
+      resumeContext = await ResumeService.getResumeContext(dbTorrent.infoHash);
+
+      if (resumeContext) {
+        if (resumeContext.isFullyVerified) {
+          // All chunks verified in DB — nothing to re-download
+          console.log(`[TorrentController] [${requestId}] All chunks verified for ${dbTorrent.infoHash}, skipping re-download`);
+          dbTorrent.status = 'completed';
+          await dbTorrent.save();
+          return res.json({
+            ...mergeTorrentData(dbTorrent, engineTorrent),
+            resumeContext: { isFullyVerified: true, verifiedChunks: resumeContext.totalTracked }
+          });
+        }
+
+        // Reset any failed chunks so they will be re-attempted
+        if (resumeContext.failedIndices.length > 0) {
+          await ResumeService.resetFailedChunks(dbTorrent.infoHash);
+          console.log(`[TorrentController] [${requestId}] Reset ${resumeContext.failedIndices.length} failed chunks for retry`);
+        }
+
+        // Hand the verified piece list to the engine so it skips those pieces
+        if (resumeContext.verifiedIndices.length > 0 && typeof engineTorrent.setCompletedPieces === 'function') {
+          engineTorrent.setCompletedPieces(resumeContext.verifiedIndices);
+          console.log(`[TorrentController] [${requestId}] Restored ${resumeContext.verifiedIndices.length} verified pieces to engine, resuming from index ${resumeContext.resumeFromIndex}`);
+        }
+      }
+    } catch (resumeErr) {
+      // Non-fatal: fall back to standard resume if DB is unavailable
+      console.warn(`[TorrentController] [${requestId}] ResumeService failed (non-fatal): ${resumeErr.message}`);
+    }
+
+    // Resume the engine
     engineTorrent.resume();
-    
+
     // Update MongoDB status
     dbTorrent.status = 'downloading';
     await dbTorrent.save();
 
-    console.log(`[TorrentController] Resumed torrent: ${dbTorrent.name}`);
-    
-    res.json(mergeTorrentData(dbTorrent, engineTorrent));
+    console.log(`[TorrentController] [${requestId}] Resumed torrent: ${dbTorrent.name}`);
+
+    res.json({
+      ...mergeTorrentData(dbTorrent, engineTorrent),
+      ...(resumeContext && {
+        resumeContext: {
+          resumeFromIndex: resumeContext.resumeFromIndex,
+          verifiedChunks:  resumeContext.verifiedIndices.length,
+          pendingChunks:   resumeContext.pendingIndices.length,
+          failedChunks:    resumeContext.failedIndices.length,
+        }
+      })
+    });
   } catch (error) {
     console.error('[TorrentController] resumeTorrent error:', error);
     res.status(500).json({ message: 'Server error: ' + error.message });

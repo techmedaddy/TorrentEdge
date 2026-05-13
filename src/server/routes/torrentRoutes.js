@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const torrentController = require('../controllers/torrentController');
 const authMiddleware = require('../middleware/authMiddleware');
+const { idempotencyGuard } = require('../middleware/idempotency');
 const multer = require('multer');
 
 // ── Multer: .torrent file uploads (existing) ──────────────────────────────────
@@ -50,10 +51,8 @@ router.get('/', torrentController.getAllTorrents);
 router.post('/create', uploadTorrent.single('torrent'), torrentController.createTorrent);
 router.post('/upload', uploadTorrent.single('torrent'), torrentController.createTorrent);
 
-// ── Phase 2.1: Create torrent FROM any user file ──────────────────────────────
-// POST /api/torrent/create-from-file
-// Multer error handler wraps the route so LIMIT_FILE_SIZE surfaces as 413
-router.post('/create-from-file', (req, res, next) => {
+// Phase 1.3: Idempotency guard on file-creation (heavy, non-idempotent by default)
+router.post('/create-from-file', idempotencyGuard(), (req, res, next) => {
   uploadAnyFile.single('file')(req, res, (err) => {
     if (err && err.code === 'LIMIT_FILE_SIZE') {
       const limitMB = (MAX_SEED_FILE_BYTES / (1024 * 1024)).toFixed(0);

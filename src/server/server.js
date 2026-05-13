@@ -7,6 +7,7 @@ const morgan = require('morgan');
 const mongoose = require('mongoose');
 const path = require('path');
 const { connectSQL, sequelize } = require('./db/sql');
+const requestId = require('./middleware/requestId');
 
 dotenv.config();
 
@@ -118,6 +119,9 @@ app.use(
     credentials: true,
   })
 );
+
+// Phase 1.3: Attach X-Request-ID correlation ID to every request
+app.use(requestId);
 
 app.use(express.json());
 

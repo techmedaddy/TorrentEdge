@@ -6,11 +6,15 @@ const winston = require('winston');
 const morgan = require('morgan');
 const mongoose = require('mongoose');
 const path = require('path');
+const { connectSQL, sequelize } = require('./db/sql');
 
 dotenv.config();
 
 const app = express();
 const server = http.createServer(app);
+
+// Initialize PostgreSQL connection
+connectSQL();
 
 // Logger - write to logs directory
 const logsDir = path.join(__dirname, '../../logs');
@@ -194,6 +198,12 @@ async function gracefulShutdown(signal) {
     // Close MongoDB connection
     await mongoose.connection.close();
     logger.info('MongoDB connection closed');
+
+    // Close PostgreSQL connection
+    if (sequelize) {
+      await sequelize.close();
+      logger.info('PostgreSQL connection closed');
+    }
 
     logger.info('Graceful shutdown complete');
     process.exit(0);

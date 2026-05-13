@@ -28,6 +28,7 @@ const fs = require('fs').promises;
 const { Transfer } = require('../models/sql'); // Phase 1.1 SQL Model
 const Checkpointer = require('../torrentEngine/checkpointer'); // Phase 1.2 CAS
 const ResumeService = require('../torrentEngine/resumeService'); // Phase 1.3 Idempotent Resume
+const { defaultDispatcher, DIRECTIVE_TYPES } = require('../torrentEngine'); // Phase 2.1 Dispatcher
 
 // Helper to validate ObjectId
 const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
@@ -190,17 +191,37 @@ exports.createTorrent = async (req, res) => {
       return res.status(400).json({ message: 'Must provide torrent file or magnet URI' });
     }
 
-    // Add to engine
+    // Add to engine via Dispatcher (Phase 2.1: decoupled from direct engine call)
     let engineTorrent;
     try {
-      engineTorrent = await defaultEngine.addTorrent({
-        torrentPath: torrentPath,
-        torrentBuffer: torrentBuffer,
-        magnetURI: magnetURI || null,
-        autoStart: autoStart
-      });
+      // Dispatch through the Dispatcher which will route to
+      // Kafka (distributed) or local engine (embedded)
+      await defaultDispatcher.dispatch(
+        DIRECTIVE_TYPES.JOB_ASSIGNED,
+        {
+          torrentPath: torrentPath,
+          torrentBuffer: torrentBuffer ? torrentBuffer.toString('base64') : null,
+          magnetUri: magnetURI || null,
+          autoStart: autoStart,
+          downloadPath: process.env.DOWNLOAD_PATH || './downloads',
+        },
+        { requestId: req.requestId }
+      );
+
+      // In local mode, the engine executed synchronously above.
+      // Retrieve the torrent instance from the engine for response building.
+      // For distributed mode, we would query the Transfer table instead.
+      if (magnetURI) {
+        const { parseMagnet } = require('../torrentEngine/magnet');
+        const magnetInfo = parseMagnet(magnetURI);
+        engineTorrent = defaultEngine.getTorrent(magnetInfo.infoHash);
+      } else {
+        // For .torrent file uploads, iterate to find the newly added one
+        const allTorrents = Array.from(defaultEngine.torrents.values());
+        engineTorrent = allTorrents[allTorrents.length - 1];
+      }
     } catch (error) {
-      console.error('[TorrentController] Engine addTorrent error:', error);
+      console.error('[TorrentController] Dispatcher error:', error);
       
       // Clean up saved file
       if (torrentPath) {
@@ -467,16 +488,22 @@ exports.pauseTorrent = async (req, res) => {
       });
     }
 
-    // Pause the torrent
-    engineTorrent.pause();
+    // Phase 2.1: Pause via Dispatcher (routes to Kafka or local engine)
+    await defaultDispatcher.dispatch(
+      DIRECTIVE_TYPES.JOB_PAUSED,
+      { infoHash: dbTorrent.infoHash },
+      { requestId: req.requestId }
+    );
     
     // Update MongoDB status
     dbTorrent.status = 'paused';
     await dbTorrent.save();
 
-    console.log(`[TorrentController] Paused torrent: ${dbTorrent.name}`);
+    console.log(`[TorrentController] [${req.requestId}] Paused torrent: ${dbTorrent.name}`);
     
-    res.json(mergeTorrentData(dbTorrent, engineTorrent));
+    // Re-fetch engine state for response
+    const engineTorrentAfter = defaultEngine.getTorrent(dbTorrent.infoHash);
+    res.json(mergeTorrentData(dbTorrent, engineTorrentAfter));
   } catch (error) {
     console.error('[TorrentController] pauseTorrent error:', error);
     res.status(500).json({ message: 'Server error: ' + error.message });
@@ -542,8 +569,12 @@ exports.resumeTorrent = async (req, res) => {
       console.warn(`[TorrentController] [${requestId}] ResumeService failed (non-fatal): ${resumeErr.message}`);
     }
 
-    // Resume the engine
-    engineTorrent.resume();
+    // Phase 2.1: Resume via Dispatcher
+    await defaultDispatcher.dispatch(
+      DIRECTIVE_TYPES.JOB_RESUMED,
+      { infoHash: dbTorrent.infoHash },
+      { requestId }
+    );
 
     // Update MongoDB status
     dbTorrent.status = 'downloading';

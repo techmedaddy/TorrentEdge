@@ -161,7 +161,12 @@ const { initializeSocket, cleanup: cleanupSocket } = require('./socket');
 initializeSocket(server);
 
 // Import engine for graceful shutdown
-const { defaultEngine, closeProducer } = require('./torrentEngine');
+const { defaultEngine, closeProducer, defaultWorker } = require('./torrentEngine');
+
+// Phase 2.1: Start embedded worker consumer
+defaultWorker.start().catch(err => {
+  logger.warn(`Embedded worker start failed (non-fatal): ${err.message}`);
+});
 
 // Graceful Shutdown Handler
 let isShuttingDown = false;
@@ -197,6 +202,12 @@ async function gracefulShutdown(signal) {
     if (typeof closeProducer === 'function') {
       await closeProducer();
       logger.info('Kafka producer closed');
+    }
+
+    // Phase 2.1: Stop embedded worker consumer
+    if (defaultWorker && typeof defaultWorker.stop === 'function') {
+      await defaultWorker.stop();
+      logger.info('Worker consumer stopped');
     }
 
     // Close MongoDB connection

@@ -31,6 +31,11 @@ const { RetryManager, PeerBanManager, TimeoutManager } = require('./retryManager
 const { TorrentEventProducer, getProducer, closeProducer, EVENT_TYPES } = require('./kafkaProducer');
 const { TorrentEventConsumer, createAnalyticsConsumer } = require('./kafkaConsumer');
 
+// Phase 2.1: Service Decomposition
+const { DIRECTIVE_TYPES, TOPICS, buildDirective, validateDirective } = require('./jobDirective');
+const Dispatcher = require('./dispatcher');
+const WorkerConsumer = require('./workerConsumer');
+
 // DHT components
 const DHTNode = require('./dht/node');
 const RoutingTable = require('./dht/routingTable');
@@ -56,6 +61,21 @@ const defaultEngine = new TorrentEngine({
     brokers: (process.env.KAFKA_BROKERS || 'localhost:9092').split(','),
     topic: process.env.KAFKA_TOPIC || 'torrent-events'
   }
+});
+
+// Phase 2.1: Singleton Dispatcher + embedded Worker
+const defaultDispatcher = new Dispatcher({
+  engine: defaultEngine,
+  kafkaEnabled: process.env.KAFKA_ENABLED === 'true',
+});
+
+const defaultWorker = new WorkerConsumer({
+  engine: defaultEngine,
+  nodeId: process.env.WORKER_NODE_ID || `local-${process.pid}`,
+  kafka: process.env.KAFKA_ENABLED === 'true' ? {
+    brokers: (process.env.KAFKA_BROKERS || 'localhost:9092').split(','),
+    groupId: process.env.KAFKA_CONSUMER_GROUP || 'torrentedge-workers',
+  } : null,
 });
 
 module.exports = {
@@ -113,6 +133,16 @@ module.exports = {
   
   // ===== Factory Functions =====
   createEngine,
+  
+  // ===== Phase 2.1: Service Decomposition =====
+  DIRECTIVE_TYPES,
+  TOPICS,
+  buildDirective,
+  validateDirective,
+  Dispatcher,
+  WorkerConsumer,
+  defaultDispatcher,
+  defaultWorker,
   
   // ===== Default Instance =====
   defaultEngine

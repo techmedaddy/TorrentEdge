@@ -13,7 +13,7 @@ const Chunk = sequelize.define('Chunk', {
   },
   chunk_hash: {
     type: DataTypes.CHAR(64),
-    allowNull: false
+    allowNull: true
   },
   status: {
     type: DataTypes.ENUM('pending', 'downloading', 'verified', 'failed'),

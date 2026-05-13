@@ -25,6 +25,8 @@ const { defaultEngine } = require('../torrentEngine');
 const { broadcast } = require('../socket');
 const path = require('path');
 const fs = require('fs').promises;
+const { Transfer } = require('../models/sql'); // Phase 1.1 SQL Model
+const Checkpointer = require('../torrentEngine/checkpointer'); // Phase 1.2 CAS
 
 // Helper to validate ObjectId
 const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
@@ -896,6 +898,26 @@ exports.createTorrentFromFile = async (req, res) => {
     });
 
     await torrent.save();
+
+    // ── 8.1 Dual Write to PostgreSQL & Initialize CAS Chunks ────────────────
+    try {
+      const sqlTransfer = await Transfer.create({
+        name: created.name,
+        info_hash: created.infoHash,
+        magnet_uri: created.magnetURI,
+        size_bytes: created.fileSize,
+        status: 'seeding'
+      });
+      
+      if (created.chunkHashes && created.chunkHashes.length > 0) {
+        await Checkpointer.initializeChunks(created.infoHash, created.chunkHashes, sqlTransfer.id);
+        
+        // Since we are creating from an existing local file (seeding), verify all immediately via bulk update
+        await Checkpointer.markChunksVerifiedBulk(created.infoHash, created.chunkHashes);
+      }
+    } catch (sqlErr) {
+      console.error('[TorrentController] SQL Dual-Write failed:', sqlErr.message);
+    }
 
     console.log(`[TorrentController] Created torrent from file: ${created.name} (${created.infoHash})`);
 

@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const EventEmitter = require('events');
+const Checkpointer = require('./checkpointer');
 
 /**
  * Manages piece verification and restoration for torrent downloads
@@ -46,16 +47,18 @@ class PieceManager extends EventEmitter {
       const pieceIndex = completedPieces[i];
       
       try {
-        const isValid = await this._verifyPiece(pieceIndex);
+        const { isValid, sha256 } = await this._verifyPiece(pieceIndex);
         
         if (isValid) {
           result.valid.push(pieceIndex);
           result.verified++;
           this.completedPieces.add(pieceIndex);
+          await this._notifyCheckpointer(true, pieceIndex, sha256);
         } else {
           result.invalid.push(pieceIndex);
           result.failed++;
           console.warn(`[PieceManager] Piece ${pieceIndex} failed verification`);
+          await this._notifyCheckpointer(false, pieceIndex);
         }
       } catch (error) {
         // Piece is missing or unreadable
@@ -121,16 +124,18 @@ class PieceManager extends EventEmitter {
       const pieceIndex = completedPieces[i];
       
       try {
-        const isValid = await this._verifyPiece(pieceIndex);
+        const { isValid, sha256 } = await this._verifyPiece(pieceIndex);
         
         if (isValid) {
           result.valid.push(pieceIndex);
           result.verified++;
           this.completedPieces.add(pieceIndex);
+          await this._notifyCheckpointer(true, pieceIndex, sha256);
         } else {
           result.invalid.push(pieceIndex);
           result.failed++;
           console.warn(`[PieceManager] Piece ${pieceIndex} failed background verification`);
+          await this._notifyCheckpointer(false, pieceIndex);
         }
       } catch (error) {
         result.missing.push(pieceIndex);
@@ -189,9 +194,30 @@ class PieceManager extends EventEmitter {
   }
   
   /**
+   * Safely notifies the Checkpointer to persist chunk status without interrupting the flow.
+   * @private
+   */
+  async _notifyCheckpointer(isValid, pieceIndex, sha256 = null) {
+    if (!this.torrentInfo || !this.torrentInfo.infoHash) return;
+    try {
+      const infoHashHex = Buffer.isBuffer(this.torrentInfo.infoHash) 
+        ? this.torrentInfo.infoHash.toString('hex') 
+        : this.torrentInfo.infoHash;
+        
+      if (isValid) {
+        await Checkpointer.markChunkVerified(infoHashHex, pieceIndex, sha256);
+      } else {
+        await Checkpointer.markChunkFailed(infoHashHex, pieceIndex);
+      }
+    } catch (err) {
+      console.warn(`[PieceManager] Checkpointer notification failed for piece ${pieceIndex}:`, err.message);
+    }
+  }
+
+  /**
    * Verifies a single piece
    * @param {number} pieceIndex
-   * @returns {Promise<boolean>} True if piece is valid
+   * @returns {Promise<{isValid: boolean, sha256: string|null}>} Validation result with CAS hash
    * @private
    */
   async _verifyPiece(pieceIndex) {
@@ -204,7 +230,7 @@ class PieceManager extends EventEmitter {
       const pieceData = await this.fileWriter.readPiece(pieceIndex);
       
       if (!pieceData || pieceData.length === 0) {
-        return false;
+        return { isValid: false, sha256: null };
       }
       
       // Calculate SHA1 hash
@@ -218,7 +244,10 @@ class PieceManager extends EventEmitter {
       }
       
       // Compare hashes
-      return calculatedHash.equals(expectedHash);
+      const isValid = calculatedHash.equals(expectedHash);
+      const sha256 = isValid ? crypto.createHash('sha256').update(pieceData).digest('hex') : null;
+      
+      return { isValid, sha256 };
       
     } catch (error) {
       console.error(`[PieceManager] Error verifying piece ${pieceIndex}: ${error.message}`);

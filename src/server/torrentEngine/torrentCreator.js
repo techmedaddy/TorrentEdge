@@ -72,7 +72,7 @@ function createTorrent(fileBuffer, options = {}) {
   const createdAt  = Math.floor(Date.now() / 1000); // Unix timestamp
 
   // ── Step 1: Hash pieces ───────────────────────────────────────────────────
-  const piecesBuffer = hashPieces(fileBuffer, pieceSize, options.onProgress);
+  const { piecesBuffer, chunkHashes } = hashPieces(fileBuffer, pieceSize, options.onProgress);
   const pieceCount   = Math.ceil(fileBuffer.length / pieceSize);
 
   // ── Step 2: Build info dict (BEP-3 single-file mode) ─────────────────────
@@ -111,6 +111,7 @@ function createTorrent(fileBuffer, options = {}) {
     pieceLength: pieceSize,
     pieceCount,
     fileSize: fileBuffer.length,
+    chunkHashes, // Added for CAS tracking
   };
 }
 
@@ -129,20 +130,27 @@ function createTorrent(fileBuffer, options = {}) {
 function hashPieces(fileBuffer, pieceSize, onProgress) {
   const pieceCount  = Math.ceil(fileBuffer.length / pieceSize);
   const hashBuffers = [];
+  const chunkHashes = []; // CAS (SHA-256) tracking
 
   for (let i = 0; i < pieceCount; i++) {
     const start  = i * pieceSize;
     const end    = Math.min(start + pieceSize, fileBuffer.length);
     const piece  = fileBuffer.slice(start, end);
     const hash   = crypto.createHash('sha1').update(piece).digest();
+    const sha256 = crypto.createHash('sha256').update(piece).digest('hex'); // CAS hash
+
     hashBuffers.push(hash);
+    chunkHashes.push(sha256);
 
     if (onProgress) {
       onProgress(i + 1, pieceCount);
     }
   }
 
-  return Buffer.concat(hashBuffers); // 20 bytes × N pieces
+  return {
+    piecesBuffer: Buffer.concat(hashBuffers), // 20 bytes × N pieces
+    chunkHashes
+  };
 }
 
 /**
@@ -391,6 +399,7 @@ function createTorrentWithMagnet(fileBuffer, options = {}) {
     pieceCount:    created.pieceCount,
     fileSize:      created.fileSize,
     trackers:      extracted.trackers,
+    chunkHashes:   created.chunkHashes, // Expose CAS hashes
   };
 }
 

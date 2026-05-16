@@ -465,6 +465,8 @@ npm run test:integration
 npm run test:coverage
 ```
 
+![alt text](image.png)
+
 ## 📊 Performance
 
 - ✅ Handles **100+ concurrent torrents**

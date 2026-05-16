@@ -275,8 +275,16 @@ docker-compose down
 ```
 
 The application will be available at:
-- **API**: http://localhost:3000
-- **WebSocket**: ws://localhost:3000
+- **API**: http://localhost:3029
+- **WebSocket**: ws://localhost:3029
+
+Observability endpoints are available when using Docker Compose:
+- **Prometheus**: http://localhost:9090
+- **Grafana**: http://localhost:3000 (`admin` / `admin`)
+- **Tempo**: http://localhost:3200
+- **Metrics**: http://localhost:3029/metrics
+
+See [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) for metric names and OpenTelemetry configuration.
 
 ## 📡 API Reference
 

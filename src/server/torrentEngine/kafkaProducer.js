@@ -1,5 +1,7 @@
 const { Kafka, Partitioners } = require('kafkajs');
 const EventEmitter = require('events');
+const metrics = require('../observability/metrics');
+const tracing = require('../observability/tracing');
 
 /**
  * Event type constants
@@ -159,7 +161,7 @@ class TorrentEventProducer extends EventEmitter {
     if (!this.isConnected) {
       throw new Error('Producer not connected. Call connect() first.');
     }
-    
+
     try {
       // Validate event
       this._validateEvent(event);
@@ -169,25 +171,22 @@ class TorrentEventProducer extends EventEmitter {
         return this._bufferEvent(event);
       }
       
-      // Send immediately for other events
-      const message = {
+      const topic = event.topic || this.topic;
+      const { topic: _topic, headers: eventHeaders, ...eventPayload } = event;
+
+      return this.sendMessage({
+        topic,
         key: event.infoHash,
-        value: JSON.stringify({
-          ...event,
-          timestamp: event.timestamp || Date.now()
-        }),
+        value: {
+          ...eventPayload,
+          timestamp: event.timestamp || Date.now(),
+        },
         headers: {
+          ...(eventHeaders || {}),
           eventType: event.type,
-          clientId: this.clientId
-        }
-      };
-      
-      await this.producer.send({
-        topic: this.topic,
-        messages: [message]
+        },
+        type: event.type,
       });
-      
-      console.log(`[Kafka] Sent event: ${event.type} for ${event.infoHash?.substring(0, 8)}...`);
       
     } catch (error) {
       console.error(`[Kafka] Failed to send event: ${error.message}`);
@@ -219,25 +218,69 @@ class TorrentEventProducer extends EventEmitter {
     try {
       // Validate all events
       events.forEach(event => this._validateEvent(event));
-      
-      // Convert events to Kafka messages
-      const messages = events.map(event => ({
-        key: event.infoHash,
-        value: JSON.stringify({
-          ...event,
-          timestamp: event.timestamp || Date.now()
-        }),
-        headers: {
-          eventType: event.type,
-          clientId: this.clientId
+
+      const eventsByTopic = new Map();
+      for (const event of events) {
+        const topic = event.topic || this.topic;
+        if (!eventsByTopic.has(topic)) {
+          eventsByTopic.set(topic, []);
         }
-      }));
-      
-      await this.producer.send({
-        topic: this.topic,
-        messages
-      });
-      
+        eventsByTopic.get(topic).push(event);
+      }
+
+      for (const [topic, topicEvents] of eventsByTopic.entries()) {
+        const endTimer = metrics.startKafkaTimer('producer', topic, 'batch');
+
+        await tracing.withSpan('kafka.produce.batch', {
+          'messaging.system': 'kafka',
+          'messaging.destination.name': topic,
+          'messaging.operation': 'publish',
+          'messaging.batch.message_count': topicEvents.length,
+        }, async () => {
+          try {
+            const messages = topicEvents.map(event => {
+              const { topic: _topic, headers: eventHeaders, ...eventPayload } = event;
+              return {
+                key: event.infoHash,
+                value: JSON.stringify({
+                  ...eventPayload,
+                  timestamp: event.timestamp || Date.now(),
+                }),
+                headers: tracing.injectKafkaHeaders({
+                  ...(eventHeaders || {}),
+                  eventType: event.type,
+                  clientId: this.clientId,
+                }),
+              };
+            });
+
+            await this.producer.send({
+              topic,
+              messages,
+            });
+
+            metrics.recordKafkaMessage({
+              boundary: 'producer',
+              topic,
+              type: 'batch',
+              result: 'success',
+              count: topicEvents.length,
+            });
+            endTimer('success');
+          } catch (error) {
+            metrics.recordKafkaMessage({
+              boundary: 'producer',
+              topic,
+              type: 'batch',
+              result: 'error',
+              count: topicEvents.length,
+            });
+            endTimer('error');
+            throw error;
+          }
+        });
+      }
+
       console.log(`[Kafka] Sent batch of ${events.length} events`);
       
     } catch (error) {
@@ -261,6 +304,71 @@ class TorrentEventProducer extends EventEmitter {
         console.error(`[Kafka] Buffer flush error: ${error.message}`);
       });
     }
+  }
+
+  /**
+   * Send a raw Kafka message. Used for directive envelopes that are not
+   * torrent lifecycle events but still need tracing and metrics.
+   *
+   * @param {Object} message
+   * @param {string} message.topic
+   * @param {string} message.key
+   * @param {Object|string|Buffer} message.value
+   * @param {Object} [message.headers]
+   * @param {string} [message.type]
+   */
+  async sendMessage(message) {
+    if (!this.isConnected) {
+      throw new Error('Producer not connected. Call connect() first.');
+    }
+
+    const topic = message.topic || this.topic;
+    const type = message.type || message.headers?.eventType || 'message';
+    const endTimer = metrics.startKafkaTimer('producer', topic, type);
+
+    return tracing.withSpan('kafka.produce', {
+      'messaging.system': 'kafka',
+      'messaging.destination.name': topic,
+      'messaging.operation': 'publish',
+      'messaging.message.conversation_id': message.key || undefined,
+      'torrentedge.kafka.message_type': type,
+    }, async () => {
+      try {
+        const value = Buffer.isBuffer(message.value) || typeof message.value === 'string'
+          ? message.value
+          : JSON.stringify(message.value);
+
+        await this.producer.send({
+          topic,
+          messages: [{
+            key: message.key,
+            value,
+            headers: tracing.injectKafkaHeaders({
+              ...(message.headers || {}),
+              clientId: this.clientId,
+            }),
+          }],
+        });
+
+        metrics.recordKafkaMessage({
+          boundary: 'producer',
+          topic,
+          type,
+          result: 'success',
+        });
+        endTimer('success');
+        console.log(`[Kafka] Sent message: ${type} to ${topic}`);
+      } catch (error) {
+        metrics.recordKafkaMessage({
+          boundary: 'producer',
+          topic,
+          type,
+          result: 'error',
+        });
+        endTimer('error');
+        throw error;
+      }
+    });
   }
   
   /**

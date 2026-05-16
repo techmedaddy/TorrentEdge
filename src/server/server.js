@@ -1,15 +1,23 @@
+const dotenv = require('dotenv');
+dotenv.config();
+
+const { startTracing, shutdownTracing } = require('./observability/tracing');
+startTracing();
+
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
-const dotenv = require('dotenv');
 const winston = require('winston');
 const morgan = require('morgan');
 const mongoose = require('mongoose');
 const path = require('path');
 const { connectSQL, sequelize } = require('./db/sql');
 const requestId = require('./middleware/requestId');
-
-dotenv.config();
+const {
+  createHttpMetricsMiddleware,
+  createMetricsHandler,
+  observeEngineMetrics,
+} = require('./observability/metrics');
 
 const app = express();
 const server = http.createServer(app);
@@ -123,6 +131,8 @@ app.use(
 // Phase 1.3: Attach X-Request-ID correlation ID to every request
 app.use(requestId);
 
+app.use(createHttpMetricsMiddleware());
+
 app.use(express.json());
 
 app.use(
@@ -132,6 +142,15 @@ app.use(
     },
   })
 );
+
+const { defaultEngine, closeProducer, defaultWorker } = require('./torrentEngine');
+
+const metricsHandler = createMetricsHandler({
+  collect: () => observeEngineMetrics(defaultEngine, defaultWorker),
+});
+
+app.get('/metrics', metricsHandler);
+app.get('/api/metrics', metricsHandler);
 
 // Routes
 app.use('/api/auth', require('./routes/authRoutes'));
@@ -159,9 +178,6 @@ app.use((err, req, res, next) => {
 // Socket Layer
 const { initializeSocket, cleanup: cleanupSocket } = require('./socket');
 initializeSocket(server);
-
-// Import engine for graceful shutdown
-const { defaultEngine, closeProducer, defaultWorker } = require('./torrentEngine');
 
 // Phase 2.1: Start embedded worker consumer
 defaultWorker.start().catch(err => {
@@ -219,6 +235,9 @@ async function gracefulShutdown(signal) {
       await sequelize.close();
       logger.info('PostgreSQL connection closed');
     }
+
+    await shutdownTracing();
+    logger.info('OpenTelemetry tracing closed');
 
     logger.info('Graceful shutdown complete');
     process.exit(0);

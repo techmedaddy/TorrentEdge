@@ -54,6 +54,9 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_PASS=postgres
       - REDIS_URL=redis://redis:6379
+      - OTEL_ENABLED=true
+      - OTEL_SERVICE_NAME=torrentedge-backend
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
     depends_on:
       kafka:
         condition: service_healthy
@@ -63,6 +66,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      otel-collector:
+        condition: service_started
     networks:
       - app-network
       - kafka-network
@@ -139,6 +144,74 @@ services:
       timeout: 5s
       retries: 5
 
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: torrentedge-prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      backend:
+        condition: service_started
+    networks:
+      - app-network
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    container_name: torrentedge-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      prometheus:
+        condition: service_started
+      tempo:
+        condition: service_started
+    networks:
+      - app-network
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    container_name: torrentedge-tempo
+    command:
+      - "-config.file=/etc/tempo.yml"
+    ports:
+      - "3200:3200"
+    volumes:
+      - ./observability/tempo/tempo.yml:/etc/tempo.yml:ro
+      - tempo-data:/tmp/tempo
+    networks:
+      - app-network
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.111.0
+    container_name: torrentedge-otel-collector
+    command:
+      - "--config=/etc/otelcol/config.yml"
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "8888:8888"
+    volumes:
+      - ./observability/otel-collector/config.yml:/etc/otelcol/config.yml:ro
+    depends_on:
+      tempo:
+        condition: service_started
+    networks:
+      - app-network
+
 networks:
   kafka-network:
     driver: bridge
@@ -151,4 +224,10 @@ volumes:
   postgres-data:
     driver: local
   torrent-downloads:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+  tempo-data:
     driver: local

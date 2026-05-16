@@ -18,8 +18,11 @@
  */
 
 const EventEmitter = require('events');
+const { SpanStatusCode } = require('@opentelemetry/api');
 const { DIRECTIVE_TYPES, TOPICS, buildDirective, validateDirective } = require('./jobDirective');
 const LeaseManager = require('./leaseManager');
+const metrics = require('../observability/metrics');
+const tracing = require('../observability/tracing');
 
 class WorkerConsumer extends EventEmitter {
   /**
@@ -75,52 +78,64 @@ class WorkerConsumer extends EventEmitter {
    * @param {object} directive - A validated Job Directive envelope
    */
   async processDirective(directive) {
-    const validation = validateDirective(directive);
-    if (!validation.valid) {
-      console.error(`[Worker:${this._nodeId}] Invalid directive: ${validation.error}`);
-      this._failedCount++;
-      return;
-    }
-
-    const { type, payload, meta } = directive;
-    console.log(`[Worker:${this._nodeId}] Processing: ${type} (requestId: ${meta?.requestId || 'none'})`);
-
-    try {
-      switch (type) {
-        case DIRECTIVE_TYPES.JOB_ASSIGNED:
-          await this._handleJobAssigned(payload, meta);
-          break;
-
-        case DIRECTIVE_TYPES.JOB_PAUSED:
-          await this._handleJobPaused(payload, meta);
-          break;
-
-        case DIRECTIVE_TYPES.JOB_RESUMED:
-          await this._handleJobResumed(payload, meta);
-          break;
-
-        case DIRECTIVE_TYPES.JOB_CANCELLED:
-          await this._handleJobCancelled(payload, meta);
-          break;
-
-        default:
-          console.warn(`[Worker:${this._nodeId}] Unhandled directive type: ${type}`);
+    return tracing.withSpan('worker.directive', {
+      'torrentedge.worker.node_id': this._nodeId,
+      'torrentedge.directive.type': directive?.type || 'unknown',
+      'torrentedge.request_id': directive?.meta?.requestId || undefined,
+    }, async (span) => {
+      const validation = validateDirective(directive);
+      if (!validation.valid) {
+        console.error(`[Worker:${this._nodeId}] Invalid directive: ${validation.error}`);
+        this._failedCount++;
+        metrics.recordWorkerDirective({ type: directive?.type || 'unknown', result: 'invalid' });
+        span.setStatus({ code: SpanStatusCode.ERROR, message: validation.error });
+        return;
       }
 
-      this._processedCount++;
+      const { type, payload, meta } = directive;
+      console.log(`[Worker:${this._nodeId}] Processing: ${type} (requestId: ${meta?.requestId || 'none'})`);
 
-    } catch (err) {
-      console.error(`[Worker:${this._nodeId}] Directive ${type} failed: ${err.message}`);
-      this._failedCount++;
+      try {
+        switch (type) {
+          case DIRECTIVE_TYPES.JOB_ASSIGNED:
+            await this._handleJobAssigned(payload, meta);
+            break;
 
-      // Emit failure event back to Control Plane
-      this.emit('directive:failed', {
-        type,
-        payload,
-        error: err.message,
-        nodeId: this._nodeId,
-      });
-    }
+          case DIRECTIVE_TYPES.JOB_PAUSED:
+            await this._handleJobPaused(payload, meta);
+            break;
+
+          case DIRECTIVE_TYPES.JOB_RESUMED:
+            await this._handleJobResumed(payload, meta);
+            break;
+
+          case DIRECTIVE_TYPES.JOB_CANCELLED:
+            await this._handleJobCancelled(payload, meta);
+            break;
+
+          default:
+            console.warn(`[Worker:${this._nodeId}] Unhandled directive type: ${type}`);
+        }
+
+        this._processedCount++;
+        metrics.recordWorkerDirective({ type, result: 'success' });
+
+      } catch (err) {
+        console.error(`[Worker:${this._nodeId}] Directive ${type} failed: ${err.message}`);
+        this._failedCount++;
+        metrics.recordWorkerDirective({ type, result: 'error' });
+        span.recordException(err);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+
+        // Emit failure event back to Control Plane
+        this.emit('directive:failed', {
+          type,
+          payload,
+          error: err.message,
+          nodeId: this._nodeId,
+        });
+      }
+    });
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -237,14 +252,46 @@ class WorkerConsumer extends EventEmitter {
       });
 
       await this._consumer.run({
-        eachMessage: async ({ message }) => {
-          try {
-            const directive = JSON.parse(message.value.toString());
-            await this.processDirective(directive);
-          } catch (parseErr) {
-            console.error(`[Worker:${this._nodeId}] Failed to parse Kafka message: ${parseErr.message}`);
-            this._failedCount++;
-          }
+        eachMessage: async ({ topic, partition, message }) => {
+          const parentContext = tracing.extractKafkaContext(message.headers || {});
+          const messageTypeHeader = message.headers?.directiveType || message.headers?.eventType;
+          const messageType = Buffer.isBuffer(messageTypeHeader)
+            ? messageTypeHeader.toString()
+            : (messageTypeHeader ? String(messageTypeHeader) : 'unknown');
+          const endTimer = metrics.startKafkaTimer('consumer', topic, messageType);
+
+          await tracing.withSpan('kafka.consume', {
+            'messaging.system': 'kafka',
+            'messaging.destination.name': topic,
+            'messaging.operation': 'process',
+            'messaging.kafka.partition': partition,
+            'torrentedge.kafka.message_type': messageType,
+          }, async (span) => {
+            try {
+              const directive = JSON.parse(message.value.toString());
+              span.setAttribute('torrentedge.directive.type', directive.type || messageType);
+              await this.processDirective(directive);
+              metrics.recordKafkaMessage({
+                boundary: 'consumer',
+                topic,
+                type: directive.type || messageType,
+                result: 'success',
+              });
+              endTimer('success');
+            } catch (parseErr) {
+              console.error(`[Worker:${this._nodeId}] Failed to parse Kafka message: ${parseErr.message}`);
+              this._failedCount++;
+              metrics.recordKafkaMessage({
+                boundary: 'consumer',
+                topic,
+                type: messageType,
+                result: 'error',
+              });
+              endTimer('error');
+              span.recordException(parseErr);
+              span.setStatus({ code: SpanStatusCode.ERROR, message: parseErr.message });
+            }
+          }, parentContext);
         },
       });
 
@@ -293,6 +340,8 @@ class WorkerConsumer extends EventEmitter {
         },
         { nodeId: this._nodeId }
       ));
+
+      metrics.recordWorkerHeartbeat(this._nodeId);
     }, this._heartbeatIntervalMs);
 
     if (this._heartbeatTimer.unref) {

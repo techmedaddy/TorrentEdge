@@ -17,6 +17,8 @@
 
 const { DIRECTIVE_TYPES, TOPICS, buildDirective, validateDirective } = require('./jobDirective');
 const { getProducer, hasProducer } = require('./kafkaProducer');
+const metrics = require('../observability/metrics');
+const tracing = require('../observability/tracing');
 
 class Dispatcher {
   /**
@@ -40,50 +42,64 @@ class Dispatcher {
    * @returns {Promise<{ dispatched: boolean, mode: 'kafka'|'local', directiveId: string }>}
    */
   async dispatch(type, payload, meta = {}) {
-    const directive = buildDirective(type, payload, meta);
+    const directiveId = `${type}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+    const directive = buildDirective(type, payload, { ...meta, directiveId });
     const validation = validateDirective(directive);
 
     if (!validation.valid) {
+      metrics.recordDirective({ type, mode: 'validation', result: 'error' });
       throw new Error(`Invalid directive: ${validation.error}`);
     }
-
-    const directiveId = `${type}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
 
     // Log for observability
     this._logDispatch(directiveId, directive);
 
-    // ── Strategy: Kafka-first, local fallback ────────────────────────────
-    if (this._kafkaEnabled && hasProducer()) {
-      try {
-        const producer = await getProducer();
-        await producer.sendEvent({
-          type,
-          infoHash: payload.infoHash || payload.info_hash || 'system',
-          timestamp: directive.timestamp,
-          data: {
-            ...payload,
-            _directiveId: directiveId,
-            _meta: directive.meta,
-          },
-        });
+    return tracing.withSpan('control.dispatch', {
+      'torrentedge.directive.type': type,
+      'torrentedge.directive.id': directiveId,
+      'torrentedge.request_id': directive.meta.requestId || undefined,
+    }, async (span) => {
+      // Strategy: Kafka-first, local fallback.
+      if (this._kafkaEnabled && hasProducer()) {
+        try {
+          const producer = await getProducer();
+          await producer.sendMessage({
+            topic: TOPICS.JOB_DISPATCH,
+            key: payload.infoHash || payload.info_hash || 'system',
+            value: directive,
+            type,
+            headers: {
+              directiveType: type,
+              directiveId,
+              requestId: directive.meta.requestId || '',
+            },
+          });
 
-        console.log(`[Dispatcher] [Kafka] Dispatched ${type} → ${TOPICS.JOB_DISPATCH} (${directiveId})`);
-        return { dispatched: true, mode: 'kafka', directiveId };
+          span.setAttribute('torrentedge.dispatch.mode', 'kafka');
+          metrics.recordDirective({ type, mode: 'kafka', result: 'success' });
+          console.log(`[Dispatcher] [Kafka] Dispatched ${type} -> ${TOPICS.JOB_DISPATCH} (${directiveId})`);
+          return { dispatched: true, mode: 'kafka', directiveId };
 
-      } catch (kafkaErr) {
-        console.warn(`[Dispatcher] Kafka dispatch failed, falling back to local: ${kafkaErr.message}`);
-        // Fall through to local execution
+        } catch (kafkaErr) {
+          span.addEvent('kafka_dispatch_failed', { error: kafkaErr.message });
+          metrics.recordDirective({ type, mode: 'kafka', result: 'error' });
+          console.warn(`[Dispatcher] Kafka dispatch failed, falling back to local: ${kafkaErr.message}`);
+          // Fall through to local execution.
+        }
       }
-    }
 
-    // ── Local execution (in-process) ─────────────────────────────────────
-    if (this._engine) {
-      await this._executeLocal(type, payload, meta);
-      console.log(`[Dispatcher] [Local] Executed ${type} in-process (${directiveId})`);
-      return { dispatched: true, mode: 'local', directiveId };
-    }
+      // Local execution (in-process).
+      if (this._engine) {
+        await this._executeLocal(type, payload, meta);
+        span.setAttribute('torrentedge.dispatch.mode', 'local');
+        metrics.recordDirective({ type, mode: 'local', result: 'success' });
+        console.log(`[Dispatcher] [Local] Executed ${type} in-process (${directiveId})`);
+        return { dispatched: true, mode: 'local', directiveId };
+      }
 
-    throw new Error(`[Dispatcher] Cannot dispatch ${type}: no Kafka and no local engine available`);
+      metrics.recordDirective({ type, mode: 'none', result: 'error' });
+      throw new Error(`[Dispatcher] Cannot dispatch ${type}: no Kafka and no local engine available`);
+    });
   }
 
   /**

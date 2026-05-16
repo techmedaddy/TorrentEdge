@@ -95,6 +95,48 @@ const workerHeartbeatsTotal = new client.Counter({
   registers: [register],
 });
 
+// Phase 4.1: Peer-Assisted Replication
+const internalPeersGauge = new client.Gauge({
+  name: 'torrentedge_internal_peers',
+  help: 'Number of internal (VPC) peers discovered per infoHash.',
+  labelNames: ['info_hash'],
+  registers: [register],
+});
+
+// Phase 4.2: Deduplication
+const dedupChunksTotal = new client.Counter({
+  name: 'torrentedge_dedup_chunks_total',
+  help: 'Chunks satisfied from CAS (deduplication hits).',
+  registers: [register],
+});
+
+const dedupBytesTotal = new client.Counter({
+  name: 'torrentedge_dedup_bytes_total',
+  help: 'Total bytes saved by deduplication.',
+  registers: [register],
+});
+
+const casHitRate = new client.Gauge({
+  name: 'torrentedge_cas_hit_rate',
+  help: 'CAS hit rate (0-1).',
+  registers: [register],
+});
+
+// Phase 2.2: Lease management
+const leaseAcquisitionsTotal = new client.Counter({
+  name: 'torrentedge_lease_acquisitions_total',
+  help: 'Lease acquisition attempts.',
+  labelNames: ['result'],
+  registers: [register],
+});
+
+const leaseRenewalsTotal = new client.Counter({
+  name: 'torrentedge_lease_renewals_total',
+  help: 'Lease renewal attempts.',
+  labelNames: ['result'],
+  registers: [register],
+});
+
 function normalizeRoute(req) {
   const routePath = req.route && req.route.path;
   if (routePath) {
@@ -238,6 +280,27 @@ function recordWorkerHeartbeat(nodeId = NODE_ID) {
   activeWorkers.set({ node_id: nodeId }, 1);
 }
 
+function recordInternalPeers(infoHash, count) {
+  internalPeersGauge.set({ info_hash: (infoHash || '').substring(0, 12) }, count);
+}
+
+function recordDedupHit(bytes = 0) {
+  dedupChunksTotal.inc();
+  dedupBytesTotal.inc(bytes);
+}
+
+function recordCasHitRate(rate) {
+  casHitRate.set(Number(rate) || 0);
+}
+
+function recordLeaseAcquisition(result = 'success') {
+  leaseAcquisitionsTotal.inc({ result });
+}
+
+function recordLeaseRenewal(result = 'success') {
+  leaseRenewalsTotal.inc({ result });
+}
+
 module.exports = {
   register,
   createHttpMetricsMiddleware,
@@ -248,4 +311,9 @@ module.exports = {
   recordWorkerDirective,
   recordWorkerHeartbeat,
   startKafkaTimer,
+  recordInternalPeers,
+  recordDedupHit,
+  recordCasHitRate,
+  recordLeaseAcquisition,
+  recordLeaseRenewal,
 };

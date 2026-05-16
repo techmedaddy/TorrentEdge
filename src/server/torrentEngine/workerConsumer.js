@@ -18,11 +18,16 @@
  */
 
 const EventEmitter = require('events');
-const { SpanStatusCode } = require('@opentelemetry/api');
+let SpanStatusCode;
+try { SpanStatusCode = require('@opentelemetry/api').SpanStatusCode; } catch { SpanStatusCode = { ERROR: 2 }; }
 const { DIRECTIVE_TYPES, TOPICS, buildDirective, validateDirective } = require('./jobDirective');
 const LeaseManager = require('./leaseManager');
-const metrics = require('../observability/metrics');
-const tracing = require('../observability/tracing');
+const InternalPeerDiscovery = require('./internalPeerDiscovery');
+const PeerRegistry = require('./peerRegistry');
+const DeduplicationService = require('./deduplicationService');
+let metrics, tracing;
+try { metrics = require('../observability/metrics'); } catch { metrics = { recordWorkerDirective: () => {}, recordWorkerHeartbeat: () => {} }; }
+try { tracing = require('../observability/tracing'); } catch { tracing = { withSpan: (n, a, fn) => fn({ setStatus: () => {}, recordException: () => {}, setAttribute: () => {} }) }; }
 
 class WorkerConsumer extends EventEmitter {
   /**
@@ -45,6 +50,18 @@ class WorkerConsumer extends EventEmitter {
     // Heartbeat interval (every 10s)
     this._heartbeatTimer = null;
     this._heartbeatIntervalMs = 10_000;
+
+    // Phase 4.1: Internal peer discovery
+    this._peerDiscovery = new InternalPeerDiscovery({
+      nodeId: this._nodeId,
+      nodeIp: process.env.WORKER_IP || '127.0.0.1',
+      bittorrentPort: parseInt(process.env.BT_PORT) || 6881,
+    });
+
+    // Phase 4.2: Deduplication service
+    this._dedup = new DeduplicationService({
+      downloadPath: opts.engine?.downloadPath || process.env.DOWNLOAD_PATH || './downloads',
+    });
   }
 
   /**
@@ -163,6 +180,40 @@ class WorkerConsumer extends EventEmitter {
       throw new Error(`Lease denied for ${torrent.infoHash}`);
     }
 
+    // Phase 4.1: Register in peer registry and start internal discovery
+    try {
+      if (torrent.peerManager) {
+        await this._peerDiscovery.startDiscovery(torrent.infoHash, torrent.peerManager, {
+          completedPieces: 0,
+          totalPieces: torrent.numPieces || 0,
+        });
+      }
+    } catch (discoveryErr) {
+      console.warn(`[Worker:${this._nodeId}] Internal peer discovery failed (non-fatal): ${discoveryErr.message}`);
+    }
+
+    // Phase 4.2: Attempt to pre-populate from CAS (deduplication)
+    try {
+      if (torrent.fileWriter && torrent.pieceLength) {
+        const dedupResult = await this._dedup.prePopulate(
+          torrent.infoHash,
+          torrent.fileWriter,
+          torrent.pieceLength
+        );
+        if (dedupResult.deduped.length > 0) {
+          // Mark deduped pieces as complete in the engine
+          for (const pieceIndex of dedupResult.deduped) {
+            if (torrent.pieceManager) {
+              torrent.pieceManager.markComplete(pieceIndex);
+            }
+          }
+          console.log(`[Worker:${this._nodeId}] Dedup saved ${dedupResult.deduped.length} pieces for ${torrent.infoHash.substring(0, 8)}`);
+        }
+      }
+    } catch (dedupErr) {
+      console.warn(`[Worker:${this._nodeId}] Dedup pre-populate failed (non-fatal): ${dedupErr.message}`);
+    }
+
     this.emit('lifecycle', buildDirective(
       DIRECTIVE_TYPES.TRANSFER_STARTED,
       {
@@ -185,6 +236,9 @@ class WorkerConsumer extends EventEmitter {
     // Phase 2.2: Release lease
     await LeaseManager.releaseLease(payload.infoHash, this._nodeId);
 
+    // Phase 4.1: Deregister from peer registry
+    await this._peerDiscovery.stopDiscovery(payload.infoHash).catch(() => {});
+
     this.emit('lifecycle', buildDirective(
       DIRECTIVE_TYPES.TRANSFER_PAUSED,
       { infoHash: payload.infoHash },
@@ -206,6 +260,15 @@ class WorkerConsumer extends EventEmitter {
 
     torrent.resume();
 
+    // Phase 4.1: Re-register in peer registry
+    try {
+      if (torrent.peerManager) {
+        await this._peerDiscovery.startDiscovery(payload.infoHash, torrent.peerManager);
+      }
+    } catch (discoveryErr) {
+      console.warn(`[Worker:${this._nodeId}] Internal peer discovery on resume failed (non-fatal): ${discoveryErr.message}`);
+    }
+
     this.emit('lifecycle', buildDirective(
       DIRECTIVE_TYPES.TRANSFER_RESUMED,
       { infoHash: payload.infoHash },
@@ -220,6 +283,9 @@ class WorkerConsumer extends EventEmitter {
 
     // Phase 2.2: Release lease
     await LeaseManager.releaseLease(payload.infoHash, this._nodeId);
+
+    // Phase 4.1: Deregister from peer registry
+    await this._peerDiscovery.stopDiscovery(payload.infoHash).catch(() => {});
 
     this.emit('lifecycle', buildDirective(
       DIRECTIVE_TYPES.TRANSFER_COMPLETED,
@@ -314,16 +380,25 @@ class WorkerConsumer extends EventEmitter {
       const stats = this._engine ? this._engine.getGlobalStats() : {};
 
       // Phase 2.2: Renew leases for all active torrents
+      // Phase 4.1: Refresh peer registry TTLs
+      const activeInfoHashes = [];
       if (this._engine) {
         for (const [infoHash, torrent] of this._engine.torrents.entries()) {
           // Only renew if not paused/stopped
           if (torrent.state !== 'paused' && torrent.state !== 'stopped' && torrent.state !== 'error') {
+            activeInfoHashes.push(infoHash);
             const renewed = await LeaseManager.renewLease(infoHash, this._nodeId);
             if (!renewed) {
               console.warn(`[Worker:${this._nodeId}] Lost lease for ${infoHash}! Pausing torrent to prevent split-brain.`);
               torrent.pause();
+              await this._peerDiscovery.stopDiscovery(infoHash).catch(() => {});
             }
           }
+        }
+
+        // Phase 4.1: Bulk refresh peer registry TTLs
+        if (activeInfoHashes.length > 0) {
+          await PeerRegistry.refreshAll(this._nodeId, activeInfoHashes).catch(() => {});
         }
       }
 
@@ -366,6 +441,9 @@ class WorkerConsumer extends EventEmitter {
       this._consumer = null;
     }
 
+    // Phase 4.1: Shutdown peer discovery
+    await this._peerDiscovery.shutdown().catch(() => {});
+
     console.log(`[Worker:${this._nodeId}] Worker consumer stopped (processed: ${this._processedCount}, failed: ${this._failedCount})`);
     this.emit('stopped', { nodeId: this._nodeId });
   }
@@ -377,6 +455,8 @@ class WorkerConsumer extends EventEmitter {
       processedCount: this._processedCount,
       failedCount:    this._failedCount,
       hasKafka:       !!this._consumer,
+      peerDiscovery:  this._peerDiscovery.getStats(),
+      deduplication:  this._dedup.getStats(),
     };
   }
 }

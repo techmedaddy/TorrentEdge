@@ -1,11 +1,24 @@
 const { Chunk, Transfer } = require('../models/sql');
+const CASStore = require('./casStore');
 
 /**
  * Persists chunk completion status to PostgreSQL.
  * Part of Phase 1.2: Chunking & Integrity (CAS).
+ * Phase 4.2: Also stores verified chunk data in the CAS for deduplication.
  */
 class Checkpointer {
   static transferIdCache = new Map();
+  static _casStore = null;
+
+  /**
+   * Gets or creates the singleton CAS Store instance.
+   */
+  static _getCAS() {
+    if (!this._casStore) {
+      this._casStore = new CASStore(process.env.DOWNLOAD_PATH || './downloads');
+    }
+    return this._casStore;
+  }
 
   /**
    * Helper to get transfer ID with caching to prevent race conditions and excessive queries.
@@ -53,11 +66,14 @@ class Checkpointer {
 
   /**
    * Marks a chunk as verified and completed.
+   * Phase 4.2: Also stores chunk data in CAS for deduplication.
+   *
    * @param {string} infoHash - The info hash of the transfer
    * @param {number} chunkIndex - The index of the completed chunk
    * @param {string} [chunkHash] - The computed SHA-256 CAS hash of the chunk
+   * @param {Buffer} [chunkData] - Raw chunk data (stored in CAS if provided)
    */
-  static async markChunkVerified(infoHash, chunkIndex, chunkHash = null) {
+  static async markChunkVerified(infoHash, chunkIndex, chunkHash = null, chunkData = null) {
     try {
       const transferId = await this._getTransferId(infoHash);
       if (!transferId) {
@@ -85,6 +101,16 @@ class Checkpointer {
       
       if (affectedRows === 0) {
         console.warn(`[Checkpointer] Chunk ${chunkIndex} not found or already verified for ${infoHash}`);
+      }
+
+      // Phase 4.2: Store in CAS for cross-transfer deduplication
+      if (chunkData && chunkHash) {
+        try {
+          await this._getCAS().store(chunkData, chunkHash);
+        } catch (casErr) {
+          // Non-fatal: CAS write failure shouldn't block verification
+          console.warn(`[Checkpointer] CAS store failed for chunk ${chunkIndex}: ${casErr.message}`);
+        }
       }
     } catch (err) {
       console.error(`[Checkpointer] Failed to mark chunk verified for ${infoHash}:`, err.message);

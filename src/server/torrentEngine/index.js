@@ -36,6 +36,14 @@ const { DIRECTIVE_TYPES, TOPICS, buildDirective, validateDirective } = require('
 const Dispatcher = require('./dispatcher');
 const WorkerConsumer = require('./workerConsumer');
 
+// Phase 4.1: Peer-Assisted Replication
+const PeerRegistry = require('./peerRegistry');
+const InternalPeerDiscovery = require('./internalPeerDiscovery');
+
+// Phase 4.2: Deduplication
+const CASStore = require('./casStore');
+const DeduplicationService = require('./deduplicationService');
+
 // DHT components
 const DHTNode = require('./dht/node');
 const RoutingTable = require('./dht/routingTable');
@@ -143,6 +151,14 @@ module.exports = {
   WorkerConsumer,
   defaultDispatcher,
   defaultWorker,
+
+  // ===== Phase 4.1: Peer-Assisted Replication =====
+  PeerRegistry,
+  InternalPeerDiscovery,
+
+  // ===== Phase 4.2: Deduplication =====
+  CASStore,
+  DeduplicationService,
   
   // ===== Default Instance =====
   defaultEngine

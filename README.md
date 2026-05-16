@@ -217,7 +217,7 @@ sequenceDiagram
     participant K as Kafka
     participant S as Socket.IO
 
-    C->>A: POST /api/torrents (file/magnet)
+    C->>A: POST /api/torrent/create (file/magnet)
     A->>E: addTorrent()
     E->>T: announce / scrape
     T-->>E: peer list
@@ -268,7 +268,7 @@ npm run dev
 docker-compose up -d
 
 # View logs
-docker-compose logs -f torrentedge
+docker-compose logs -f backend
 
 # Stop services
 docker-compose down
@@ -280,7 +280,7 @@ The application will be available at:
 
 Observability endpoints are available when using Docker Compose:
 - **Prometheus**: http://localhost:9090
-- **Grafana**: http://localhost:3000 (`admin` / `admin`)
+- **Grafana**: http://localhost:3033 (`admin` / `admin`)
 - **Tempo**: http://localhost:3200
 - **Metrics**: http://localhost:3029/metrics
 
@@ -291,15 +291,15 @@ See [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) for metric names and OpenTele
 ### Add Torrent from File
 
 ```bash
-curl -X POST http://localhost:3000/api/torrents \
+curl -X POST http://localhost:3029/api/torrent/create \
   -H "Authorization: Bearer YOUR_TOKEN" \
-  -F "file=@ubuntu.torrent"
+  -F "torrent=@ubuntu.torrent"
 ```
 
 ### Add Magnet Link
 
 ```bash
-curl -X POST http://localhost:3000/api/torrents \
+curl -X POST http://localhost:3029/api/torrent/create \
   -H "Authorization: Bearer YOUR_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -310,14 +310,14 @@ curl -X POST http://localhost:3000/api/torrents \
 ### Get All Torrents
 
 ```bash
-curl http://localhost:3000/api/torrents \
+curl http://localhost:3029/api/torrent \
   -H "Authorization: Bearer YOUR_TOKEN"
 ```
 
 ### Get Torrent Status
 
 ```bash
-curl http://localhost:3000/api/torrents/:infoHash \
+curl http://localhost:3029/api/torrent/:infoHash \
   -H "Authorization: Bearer YOUR_TOKEN"
 ```
 
@@ -325,34 +325,34 @@ curl http://localhost:3000/api/torrents/:infoHash \
 
 ```bash
 # Pause
-curl -X POST http://localhost:3000/api/torrents/:infoHash/pause \
+curl -X POST http://localhost:3029/api/torrent/:infoHash/pause \
   -H "Authorization: Bearer YOUR_TOKEN"
 
 # Resume
-curl -X POST http://localhost:3000/api/torrents/:infoHash/resume \
+curl -X POST http://localhost:3029/api/torrent/:infoHash/resume \
   -H "Authorization: Bearer YOUR_TOKEN"
 ```
 
 ### Remove Torrent
 
 ```bash
-curl -X DELETE http://localhost:3000/api/torrents/:infoHash \
+curl -X DELETE http://localhost:3029/api/torrent/:infoHash \
   -H "Authorization: Bearer YOUR_TOKEN"
 ```
 
-### Set Priority
+### Update Torrent Metadata
 
 ```bash
-curl -X PUT http://localhost:3000/api/torrents/:infoHash/priority \
+curl -X PUT http://localhost:3029/api/torrent/:mongoId \
   -H "Authorization: Bearer YOUR_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"priority": "high"}'
+  -d '{"status": "paused"}'
 ```
 
 ### Get Statistics
 
 ```bash
-curl http://localhost:3000/api/statistics \
+curl http://localhost:3029/api/statistics \
   -H "Authorization: Bearer YOUR_TOKEN"
 ```
 
@@ -361,7 +361,7 @@ curl http://localhost:3000/api/statistics \
 ### Client → Server
 
 ```javascript
-const socket = io('http://localhost:3000');
+const socket = io('http://localhost:3029');
 
 // Authenticate
 socket.emit('authenticate', { token: 'YOUR_TOKEN' });

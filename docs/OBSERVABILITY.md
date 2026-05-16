@@ -30,7 +30,7 @@ docker-compose up -d
 Local observability URLs:
 
 - Prometheus: `http://localhost:9090`
-- Grafana: `http://localhost:3000` (`admin` / `admin`)
+- Grafana: `http://localhost:3033` (`admin` / `admin`)
 - Tempo: `http://localhost:3200`
 - OpenTelemetry Collector OTLP/HTTP: `http://localhost:4318`
 - OpenTelemetry Collector OTLP/gRPC: `localhost:4317`

@@ -6,17 +6,18 @@
  * live engine stats for real-time data.
  * 
  * API Endpoints:
- * - GET    /api/torrents              - Get all user's torrents with live stats
- * - GET    /api/torrents/:id          - Get torrent by ID/infoHash with live stats
- * - POST   /api/torrents/create       - Upload .torrent file and add to engine
- * - PUT    /api/torrents/:id          - Update torrent metadata
- * - DELETE /api/torrents/:id          - Delete torrent (?deleteFiles=true to remove files)
- * - GET    /api/torrents/search       - Search torrents by name
- * - POST   /api/torrents/:id/start    - Start downloading torrent
- * - POST   /api/torrents/:id/pause    - Pause torrent download
- * - POST   /api/torrents/:id/resume   - Resume paused torrent
- * - GET    /api/torrents/:id/stats    - Get real-time torrent statistics
- * - GET    /api/torrents/stats/global - Get global engine statistics
+ * - GET    /api/torrent               - Get all user's torrents with live stats
+ * - GET    /api/torrent/:id           - Get torrent by ID/infoHash with live stats
+ * - POST   /api/torrent/create        - Upload .torrent file or magnet URI and add to engine
+ * - POST   /api/torrent/create-from-file - Generate a torrent from an uploaded source file
+ * - PUT    /api/torrent/:id           - Update torrent metadata
+ * - DELETE /api/torrent/:id           - Delete torrent (?deleteFiles=true to remove files)
+ * - GET    /api/torrent/search        - Search torrents by name
+ * - POST   /api/torrent/:id/start     - Start downloading torrent
+ * - POST   /api/torrent/:id/pause     - Pause torrent download
+ * - POST   /api/torrent/:id/resume    - Resume paused torrent
+ * - GET    /api/torrent/:id/stats     - Get real-time torrent statistics
+ * - GET    /api/torrent/engine/stats  - Get global engine statistics
  */
 
 const Torrent = require('../models/torrent');

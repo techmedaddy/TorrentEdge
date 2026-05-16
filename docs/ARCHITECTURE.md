@@ -1073,7 +1073,7 @@ services:
   torrentedge:
     build: ./src/server
     ports:
-      - "3000:3000"
+      - "3029:3029"
       - "6881:6881"  # BitTorrent port
     environment:
       - MONGODB_URI=mongodb://mongo:27017/torrentedge

@@ -8,6 +8,12 @@ scrape_configs:
     static_configs:
       - targets:
           - backend:3029
+        labels:
+          env: docker
+      - targets:
+          - host.docker.internal:3029
+        labels:
+          env: local
 
   - job_name: prometheus
     static_configs:

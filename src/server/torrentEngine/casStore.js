@@ -153,7 +153,7 @@ class CASStore {
    */
   async remove(sha256) {
     try {
-      await fs.unlink(this._pathForHso what is current ash(sha256));
+      await fs.unlink(this._pathForHash(sha256));
     } catch (err) {
       if (err.code !== 'ENOENT') {
         console.warn(`[CAS] Remove error for ${sha256.substring(0, 12)}...: ${err.message}`);

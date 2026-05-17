@@ -14,6 +14,8 @@ This project exists to provide a service-oriented torrent runtime that can be in
 - resumable state across process restarts,
 - and machine-consumable live telemetry.
 
+![alt text](image-2.png)
+
 ## 4) Engineering highlights
 
 - **Distributed peer discovery paths**: tracker announce + DHT integration for decentralized peer intake.
@@ -24,6 +26,8 @@ This project exists to provide a service-oriented torrent runtime that can be in
   - Socket.IO for low-latency UI/state updates.
   - Kafka producer path for downstream analytics/event pipelines.
 - **Restart resilience**: engine state persisted on interval and flushed on graceful shutdown.
+
+![alt text](image-3.png)
 
 ## 5) Architecture overview
 
@@ -65,6 +69,8 @@ Core server entrypoints and modules:
    - Socket.IO room-scoped updates for UI.
    - Kafka events when Kafka is enabled.
 8. State snapshots are periodically persisted; shutdown path flushes pending state and closes dependencies.
+
+![alt text](image-4.png)
 
 ## 7) Key design decisions
 
@@ -121,6 +127,8 @@ Core server entrypoints and modules:
   - `GET /api/statistics/dht`
 - **Socket event surface** for per-torrent and global rooms (`subscribe:torrent`, `subscribe:all`).
 - **Event stream diagnostics** through Kafka topic output when enabled.
+
+![alt text](image-5.png)
 
 ## 10) Demo
 
@@ -235,6 +243,8 @@ sequenceDiagram
     A-->>C: final status
 ```
 
+![alt text](image-6.png)
+
 ## 🚀 Quick Start
 
 ### Prerequisites
@@ -306,6 +316,8 @@ curl -X POST http://localhost:3029/api/torrent/create \
     "magnetURI": "magnet:?xt=urn:btih:HASH&dn=Name&tr=tracker_url"
   }'
 ```
+
+![alt text](image-7.png)
 
 ### Get All Torrents
 

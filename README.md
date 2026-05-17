@@ -465,7 +465,7 @@ npm run test:integration
 npm run test:coverage
 ```
 
-![alt text](image.png)
+![alt text](image-1.png)
 
 ## 📊 Performance
 

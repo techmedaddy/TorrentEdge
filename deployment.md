@@ -123,6 +123,3 @@ graph LR
 4.  **Phase 5.4 (CI/CD)**: Set up GitHub Actions for automated Docker builds and EKS rollouts.
 
 ---
-
-> [!IMPORTANT]
-> **Next Step**: Should we proceed with creating the **Terraform scripts** to provision this infrastructure, or would you like to see the **Kubernetes Deployment manifests** first?

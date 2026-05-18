@@ -120,6 +120,6 @@ graph LR
 1.  **Phase 5.1 (Terraform)**: Provision VPC, MSK, RDS, and EKS.
 2.  **Phase 5.2 (Secrets)**: Integrate AWS Secrets Manager with EKS using External Secrets Operator.
 3.  **Phase 5.3 (Helm)**: Deploy API, Workers, and Grafana using Helm charts.
-4.  **Phase 5.4 (CI/CD)**: Set up GitHub Actions for automated Docker builds and EKS rollouts.
+4.  **Phase 5.4 (CI/CD)**: Set up Jenkins pipelines for automated Docker builds and EKS rollouts.
 
 ---

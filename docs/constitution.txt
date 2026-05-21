@@ -1,0 +1,102 @@
+TorrentEdge Engineering Constitution
+Document Status: Core Directive
+Scope: All protocol design, architecture, and feature development.
+
+Preamble
+TorrentEdge is an infrastructure-grade, self-hosted artifact distribution platform. It exists to solve a singular, highly technical problem: the reliable, high-speed delivery of massive datasets (e.g., ML checkpoints, container layers) across distributed nodes without saturating network gateways.
+
+This constitution defines the immutable engineering principles required to maintain operational credibility, prevent architecture drift, and defend the system against feature bloat.
+
+1. Architectural Principles
+Infra-First, Operator-Centric: TorrentEdge is built for machines to execute and Site Reliability Engineers to monitor. Automation, predictability, and observability supersede frontend UX.
+
+Predictable Over Clever: Favor explicit configuration and deterministic behavior over "automagic" routing or hidden state changes.
+
+East-West Optimization: The architecture fundamentally assumes that East-West (internal VPC/LAN) bandwidth is abundant and cheap, while North-South (internet gateway) bandwidth is bottlenecked and expensive.
+
+Graceful Degradation: The failure of one subsystem must not cascade. If the Control Plane degrades, active Data Plane workers MUST continue existing P2P swarms using locally cached peer registries.
+
+2. Service Boundaries & Modularity
+The system MUST maintain a strict, physical boundary between orchestration and execution:
+
+Control Plane (State & API): Handles user intent, metadata, Merkle tree generation, and artifact indexing. Backed strictly by ACID-compliant storage (PostgreSQL).
+
+Data Plane (Workers): Horizontally scalable, stateless daemons responsible for I/O and network transfer. Workers MUST NOT share memory or disk state directly; they coordinate exclusively via the event bus (Kafka) and distributed leases (Redis).
+
+3. Reliability & Failure Handling Rules
+Crash-Only Design: Workers must be designed to be brutally killed (OOM, preempted node) at any millisecond without corrupting the local artifact.
+
+State Recovery: Upon restart, a worker MUST reconstruct its exact state by scanning the local disk (Checkpointer log) before resuming network I/O.
+
+Split-Brain Prevention: Two workers on the same logical volume MUST NOT be able to write to the same artifact checkpoint simultaneously. Distributed leases (Redis) with strict TTLs are mandatory for all I/O mutation.
+
+Fail-Closed Verification: If a chunk fails cryptographic verification, it is instantly discarded, the peer is deprioritized, and the chunk is re-queued. The system assumes a hostile or lossy network.
+
+4. Retry & Idempotency Rules
+Idempotency by Default: Every state-mutating API endpoint (POST, PUT, DELETE) MUST require an X-Request-ID or equivalent idempotency key. Duplicate requests within a 24-hour window MUST return the cached success response without re-triggering side effects.
+
+Event Idempotency: Kafka consumer logic must be idempotent. Processing the same job directive twice must yield the exact same disk and database state.
+
+Backoff Strategy: All network retries (API calls, peer connections) MUST utilize exponential backoff with randomized jitter to prevent thundering herd phenomena during network recovery.
+
+5. Storage Philosophy (CAS)
+Immutability: Once a piece of data is hashed and verified, it is immutable.
+
+Content-Addressable Storage (CAS): Storage is driven by cryptographic identity (SHA-256), not file paths.
+
+Zero Redundant I/O: The system MUST deduplicate locally. If a required chunk already exists in the CAS from a previous transfer, the worker MUST symlink or hardlink it into the current artifact directory rather than executing network or disk copying.
+
+6. Observability Standards
+No Blind Spots: If it moves data, it emits telemetry. OpenTelemetry is the mandatory standard for all tracing and metrics.
+
+Actionable Metrics: The system MUST expose business-value metrics alongside operational metrics: Egress Bandwidth Saved (bytes), CAS Hit Ratio (%), active peers, and chunk validation latency.
+
+Distributed Tracing: Every API request and resulting Kafka event MUST carry a trace context header. An operator must be able to trace a single "Start Download" click all the way down to a worker's disk write.
+
+7. Deployment Standards
+Kubernetes-Native: The system assumes a container-orchestrated environment. Helm is the standard packaging format.
+
+Non-Root Execution: All Docker containers MUST run as unprivileged users.
+
+Probes & Health: Deep health checks are mandatory. A Liveness probe MUST fail if the worker loses connection to the event bus; a Readiness probe MUST wait until the local CAS directory is indexed.
+
+8. Security Requirements
+Zero-Trust Chunking: The system MUST NOT trust peers. Every incoming chunk is cryptographically verified against the Control Plane's source-of-truth hash list before being committed to the CAS.
+
+Network Assumption: While designed for internal VPCs, the application layer MUST support TLS for all peer-to-peer and internal service communication.
+
+Blast Radius Containment: Worker tokens/credentials MUST be scoped strictly to the artifacts they are currently assigned to transfer.
+
+9. API Conventions
+RESTful Strictness: APIs adhere strictly to HTTP verbs and status codes.
+
+Predictable Errors: All errors MUST follow RFC 7807 (Problem Details for HTTP APIs) to ensure programmatic parsability by CI/CD scripts.
+
+Pagination & Filtering: Any endpoint returning a collection MUST implement cursor-based or offset-based pagination.
+
+10. Scalability Philosophy
+Swarm Economics: The system scales via peer-assistance. More workers pulling an artifact MUST result in faster global distribution, not bottlenecking.
+
+Stateless Workers: Scaling the Data Plane is achieved purely by adding more worker pods.
+
+Database Offloading: The Control Plane database (Postgres) is for metadata, not telemetry. High-frequency telemetry (speed, current chunks) MUST route through Redis or time-series databases to protect relational locks.
+
+11. Coding Standards & Testing Philosophy
+Chaos by Default: The test suite MUST randomly terminate worker processes mid-transfer to validate lease expiration, state recovery, and chunk integrity.
+
+Integration Over Unit: While unit tests validate hashing logic, the core value is in integration. Tests MUST spin up ephemeral Postgres, Redis, and Kafka containers to validate the distributed state machine.
+
+Strict Typing: Backend code MUST enforce static typing/schema validation at the API boundary and database boundary (e.g., Zod, JSON Schema).
+
+12. Explicit Anti-Goals (The "Reject" List)
+Any Pull Request introducing the following will be immediately rejected:
+
+Consumer Media Features: No streaming protocols, media playback UI, or desktop-native OS clients (macOS/Windows GUI).
+
+SaaS/Multi-Tenant Billing: No Stripe integrations, tiered user plans, or complex corporate billing hierarchies. This is an open-source/self-hosted infrastructure tool.
+
+Web3 / Blockchain: No decentralized ledgers, tokenomics, or public DHTs. The Control Plane is the absolute authority.
+
+AI/LLM "Fluff": TorrentEdge distributes AI checkpoints. It does not run LLMs, generate prompts, or feature a chatbot. Keep the engine pure.
+
+Frontend Bloat: The dashboard exists for observability and debugging, not consumer engagement. Avoid complex state management in the UI if the backend can serve pre-computed metrics.

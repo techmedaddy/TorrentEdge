@@ -1,0 +1,125 @@
+TorrentEdge: 12-Week Production Execution Roadmap
+Context: Solo-engineer velocity, infrastructure-first priority, Kubernetes-native deployment.
+
+Phase 1: Deployment Foundations (Weeks 1–3)
+Primary Focus: Deployment Goals. Moving the backend from local processes to scalable, orchestrated containers.
+
+Week 1: Containerization & Local Orchestration
+Architectural Goal: Eradicate local environment dependencies.
+
+Concrete Task: Build multi-stage, non-root Dockerfiles for the API Control Plane and the Worker daemon.
+
+Concrete Task: Write a standalone docker-compose.yml that provisions Postgres, Redis, Kafka (KRaft mode), and two worker nodes for local evaluation.
+
+Shippable Deliverable: v0.1.0-alpha Docker images pushed to a private registry; make up successfully completes a 2-node local transfer.
+
+Week 2: Infrastructure as Code (AWS/Terraform)
+Architectural Goal: Reproducible, stateful cloud infrastructure.
+
+Concrete Task: Write Terraform modules to provision an isolated AWS VPC (Private/Public subnets).
+
+Concrete Task: Provision Amazon EKS (Kubernetes), Amazon RDS (Postgres), Amazon MSK (Kafka), and ElastiCache (Redis) via Terraform.
+
+Shippable Deliverable: Committed .tf state files; successfully applying infrastructure from zero to ready in under 15 minutes.
+
+Week 3: Kubernetes Stateful Operations
+Deployment Goal: K8s-native lifecycle management.
+
+Concrete Task: Package the Control Plane and Workers into a versioned Helm Chart (charts/torrentedge).
+
+Concrete Task: Implement HTTP Liveness/Readiness probes in K8s mapped directly to the backend's /api/health subsystem dependency checks (verifying Postgres/Kafka connectivity before routing traffic).
+
+Shippable Deliverable: A 3-node Kubernetes worker cluster deployed via helm install, successfully connecting to the managed MSK and RDS instances.
+
+Phase 2: Chaos Engineering & Hardening (Weeks 4–5)
+Primary Focus: Testing Goals. Proving the system survives hostile network environments and compute failures.
+
+Week 4: Compute Failure & State Recovery
+Testing Goal: Validate distributed idempotency and lease mechanics.
+
+Concrete Task: Deploy Chaos Mesh to the EKS cluster. Configure an experiment to forcefully SIGKILL 30% of active worker pods mid-download.
+
+Concrete Task: Implement and verify Redis lease expiry recovery. Ensure the Control Plane detects the dropped lease, re-queues the Kafka job, and a new pod resumes the artifact download without corrupting the .safetensors chunks.
+
+Shippable Deliverable: Automated integration test script (test-pod-preemption.sh) that passes 100% of the time under compute duress.
+
+Week 5: Network Partitioning & Throttling
+Testing Goal: Validate East-West traffic prioritization and fail-closed integrity.
+
+Concrete Task: Use Linux tc (Traffic Control) to artificially throttle worker node North-South internet bandwidth to 10Mbps, while leaving East-West VPC bandwidth unrestricted.
+
+Concrete Task: Benchmark chunk replication throughput under throttling to verify nodes preferentially pull from local peers via the internal PeerRegistry.
+
+Shippable Deliverable: Network resilience benchmark report detailing local CAS hit rates vs. degraded internet connectivity.
+
+Phase 3: Telemetry & Value Realization (Weeks 6–7)
+Primary Focus: Observability Goals. Exposing business value and operational health without frontend bloat.
+
+Week 6: Distributed Tracing & Metric Export
+Observability Goal: No blind spots in the distributed state machine.
+
+Concrete Task: Deploy OpenTelemetry (OTel) Collector to the EKS cluster.
+
+Concrete Task: Instrument the backend to export custom Prometheus metrics: torrentedge_cas_hit_bytes_total, torrentedge_active_peer_count, and torrentedge_chunk_verification_seconds.
+
+Shippable Deliverable: A functional Grafana dashboard (dashboards/torrentedge-overview.json) rendering real-time Kafka throughput and worker CAS hit ratios.
+
+Week 7: Operator Dashboard (Vue.js)
+Observability Goal: Provide operators with ammunition to justify the tool's infrastructure footprint.
+
+Concrete Task: Wire the existing Vue.js frontend exclusively to the custom metrics endpoints.
+
+Concrete Task: Build the "Value Card": a UI component displaying aggregate "Egress Bandwidth Saved (TB)" by subtracting CAS bytes from total downloaded bytes.
+
+Shippable Deliverable: Compiled frontend static assets served by Nginx, exposing a read-only Admin Dashboard displaying the fleet's bandwidth savings.
+
+Phase 4: S3 Gateway & CI/CD Hooks (Weeks 8–10)
+Primary Focus: Architectural Goals. Bridging the gap between standard cloud storage and P2P distribution.
+
+Week 8: The S3 "Cold Start" Bridge
+Architectural Goal: Eliminate manual seeding of artifacts.
+
+Concrete Task: Implement an S3 fallback handler in the worker daemon. If a torrent request has 0 active seeders in the Swarm, the worker dynamically streams the object from AWS S3, chunks it in memory, writes to the local CAS, and registers as the primary seeder.
+
+Shippable Deliverable: Merged PR containing the S3ColdStartService; successful test downloading a zero-seeder artifact via the S3 bridge.
+
+Week 9: Pipeline Integration (Webhooks & CLI)
+Architectural Goal: programmatic triggers for infrastructure pipelines.
+
+Concrete Task: Build a lightweight, statically compiled Go CLI (tedge) or a GitHub Action to trigger the API.
+
+Concrete Task: Expose a secure /v1/dispatch REST endpoint that accepts a target artifact URI and a node selector tag (e.g., gpu-fleet-a).
+
+Shippable Deliverable: A functional GitHub Action workflow file that builds a dummy binary and pushes the distribution directive to the TorrentEdge API.
+
+Week 10: Thundering Herd & Concurrency Limits
+Testing Goal: Prevent database deadlocks under massive concurrent load.
+
+Concrete Task: Execute a load test firing 500 simultaneous "Start Download" API requests for the identical artifact.
+
+Concrete Task: Verify the IdempotencyGuard successfully caches the 200 OK response for 499 of the requests without generating duplicate Kafka events or overwhelming Postgres connections.
+
+Shippable Deliverable: Artillery/K6 load test script and output report proving zero 5xx errors under 500 RPS concurrency.
+
+Phase 5: Production Fleet Benchmarking (Weeks 11–12)
+Primary Focus: Demo/Benchmark Goals. Proving the core product thesis at scale.
+
+Week 11: Fleet-Scale 50-Node Benchmark
+Demo/Benchmark Goal: Mathematically prove TorrentEdge outperforms centralized S3 pulls.
+
+Concrete Task: Deploy a 50-node Kubernetes worker cluster (using spot instances).
+
+Concrete Task: Execute the "Killer Demo": Dispatch a 50GB dummy .safetensors file to all 50 nodes simultaneously.
+
+Concrete Task: Measure P99 completion time and total internet egress consumed. Compare this against a script running aws s3 cp concurrently on 50 nodes.
+
+Shippable Deliverable: A published Markdown benchmark report (with Grafana screenshots) proving network saturation was avoided and total transfer time dropped.
+
+Week 12: Operator Runbooks & Final Release
+Deployment Goal: Ensure a solo infrastructure engineer can safely operate and debug the system at 3:00 AM.
+
+Concrete Task: Write OPERATIONS.md. Document the exact CLI commands to purge a corrupted node CAS cache, force-expire a stuck Redis lease, and safely drain a worker node.
+
+Concrete Task: Write DISASTER_RECOVERY.md. Detail the steps to recover the PostgreSQL metadata database from an RDS snapshot and resync the Kafka offset.
+
+Shippable Deliverable: Release v1.0.0 tagged on GitHub, complete with infrastructure templates, Helm charts, and SRE runbooks.

@@ -734,10 +734,16 @@ class TorrentEngine extends EventEmitter {
         await fs.symlink(path.resolve(sourcePath), linkedPath);
         console.log(`[TorrentEngine] seedFromFile: symlinked ${sourcePath} → ${linkedPath}`);
       } catch (symlinkErr) {
-        // Symlink failed (e.g. cross-device, Windows) — fall back to hard copy
-        console.warn(`[TorrentEngine] seedFromFile: symlink failed (${symlinkErr.code}), copying file`);
-        await fs.copyFile(sourcePath, linkedPath);
-        console.log(`[TorrentEngine] seedFromFile: copied ${sourcePath} → ${linkedPath}`);
+        // Symlink failed (e.g. cross-device, Windows) — try hardlink first (Fix #8)
+        try {
+          await fs.link(path.resolve(sourcePath), linkedPath);
+          console.log(`[TorrentEngine] seedFromFile: hardlinked ${sourcePath} → ${linkedPath}`);
+        } catch (linkErr) {
+          // Hardlink also failed (cross-filesystem) — fall back to full copy
+          console.warn(`[TorrentEngine] seedFromFile: hardlink failed (${linkErr.code}), copying file`);
+          await fs.copyFile(sourcePath, linkedPath);
+          console.log(`[TorrentEngine] seedFromFile: copied ${sourcePath} → ${linkedPath}`);
+        }
       }
     }
 
@@ -1904,8 +1910,8 @@ class TorrentEngine extends EventEmitter {
 
     socket.on('data', onData);
 
-    // 30s timeout for handshake — close dead connections
-    socket.setTimeout(30_000, () => {
+    // 5s timeout for handshake — prevent slowloris DoS (Fix #9)
+    socket.setTimeout(5_000, () => {
       if (buffer.length < HANDSHAKE_LEN) {
         console.warn(`[TorrentEngine] Handshake timeout from ${remoteAddr}`);
         socket.destroy();

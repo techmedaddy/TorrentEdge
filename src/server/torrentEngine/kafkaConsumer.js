@@ -175,10 +175,21 @@ class TorrentEventConsumer extends EventEmitter {
       this.isRunning = true;
       
       await this.consumer.run({
-        autoCommit: true,
-        autoCommitInterval: 5000,
+        autoCommit: false,
         eachMessage: async ({ topic, partition, message }) => {
           await this._handleMessage(topic, partition, message);
+
+          // Manually commit offset ONLY after successful processing
+          // This prevents event loss if the pod crashes mid-processing
+          try {
+            await this.consumer.commitOffsets([{
+              topic,
+              partition,
+              offset: (BigInt(message.offset) + 1n).toString(),
+            }]);
+          } catch (commitErr) {
+            console.error(`[KafkaConsumer] Offset commit failed: ${commitErr.message}`);
+          }
         }
       });
       
@@ -373,6 +384,8 @@ class TorrentEventConsumer extends EventEmitter {
 
 /**
  * Create pre-configured consumer for analytics
+ * Uses a write buffer for progress snapshots to prevent overwhelming Postgres
+ * under high-throughput conditions (Fix #7).
  * @param {Object} dbClient - Database client for writing analytics
  * @returns {TorrentEventConsumer}
  */
@@ -383,12 +396,46 @@ function createAnalyticsConsumer(dbClient) {
     groupId: 'torrentedge-analytics',
     topics: ['torrent-events']
   });
-  
+
+  // ── Fix #7: Batched write buffer for progress snapshots ──
+  const progressBuffer = [];
+  const FLUSH_INTERVAL_MS = 2000;
+  const MAX_BUFFER_SIZE = 500;
+
+  async function flushProgressBuffer() {
+    if (progressBuffer.length === 0 || !dbClient) return;
+
+    const batch = progressBuffer.splice(0, progressBuffer.length);
+
+    try {
+      // Build a bulk INSERT with multiple value tuples
+      const values = [];
+      const params = [];
+      let paramIndex = 1;
+
+      for (const row of batch) {
+        values.push(`($${paramIndex++}, $${paramIndex++}, $${paramIndex++}, $${paramIndex++}, $${paramIndex++}, $${paramIndex++})`);
+        params.push(row.infoHash, row.progress, row.downloadSpeed, row.uploadSpeed, row.peers, row.timestamp);
+      }
+
+      await dbClient.query(
+        `INSERT INTO torrent_progress_snapshots (info_hash, progress, download_speed, upload_speed, peers, timestamp) VALUES ${values.join(', ')}`,
+        params
+      );
+    } catch (error) {
+      console.error(`[KafkaConsumer] Analytics batch flush error (${batch.length} rows):`, error.message);
+    }
+  }
+
+  // Flush periodically
+  const flushTimer = setInterval(flushProgressBuffer, FLUSH_INTERVAL_MS);
+  // Allow process to exit cleanly
+  if (flushTimer.unref) flushTimer.unref();
+
   // Register analytics handlers
   consumer.registerHandler(EVENT_TYPES.TORRENT_ADDED, async (event) => {
     if (dbClient) {
       try {
-        // Example: Write to database
         await dbClient.query(
           'INSERT INTO torrent_events (info_hash, event_type, name, size, timestamp) VALUES ($1, $2, $3, $4, $5)',
           [event.infoHash, 'added', event.data.name, event.data.size, new Date(event.timestamp)]
@@ -422,23 +469,19 @@ function createAnalyticsConsumer(dbClient) {
   });
   
   consumer.registerHandler(EVENT_TYPES.TORRENT_PROGRESS, async (event) => {
-    if (dbClient) {
-      try {
-        // Aggregate progress data
-        await dbClient.query(
-          'INSERT INTO torrent_progress_snapshots (info_hash, progress, download_speed, upload_speed, peers, timestamp) VALUES ($1, $2, $3, $4, $5, $6)',
-          [
-            event.infoHash,
-            event.data.progress,
-            event.data.downloadSpeed,
-            event.data.uploadSpeed,
-            event.data.peers,
-            new Date(event.timestamp)
-          ]
-        );
-      } catch (error) {
-        console.error(`[KafkaConsumer] Analytics DB error:`, error);
-      }
+    // Buffer the progress event instead of writing immediately (Fix #7)
+    progressBuffer.push({
+      infoHash: event.infoHash,
+      progress: event.data.progress,
+      downloadSpeed: event.data.downloadSpeed,
+      uploadSpeed: event.data.uploadSpeed,
+      peers: event.data.peers,
+      timestamp: new Date(event.timestamp),
+    });
+
+    // Force flush if buffer is getting large
+    if (progressBuffer.length >= MAX_BUFFER_SIZE) {
+      await flushProgressBuffer();
     }
   });
   

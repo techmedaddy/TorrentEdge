@@ -9,8 +9,8 @@ const http = require('http');
 const cors = require('cors');
 const winston = require('winston');
 const morgan = require('morgan');
-const mongoose = require('mongoose');
 const path = require('path');
+const fs = require('fs').promises;
 const { connectSQL, sequelize } = require('./db/sql');
 const requestId = require('./middleware/requestId');
 const {
@@ -50,74 +50,76 @@ if (process.env.NODE_ENV !== 'production') {
   );
 }
 
-// MongoDB Connection + post-connect seed restore
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/torrentedge')
-  .then(async () => {
-    logger.info('MongoDB connected successfully');
+// PostgreSQL-based seed restore (replaces MongoDB)
+// Uses async I/O to avoid blocking the event loop (Fix #4)
+(async () => {
+  try {
+    const { Transfer } = require('./models/sql');
+    const { defaultEngine } = require('./torrentEngine');
+    const pathLib = require('path');
 
-    // Phase 3.2 — Restore seeding for createdFromUpload torrents on startup
-    try {
-      const TorrentModel  = require('./models/torrent');
-      const { defaultEngine } = require('./torrentEngine');
-      const fsSync        = require('fs');
-      const pathLib       = require('path');
+    const seedTransfers = await Transfer.findAll({
+      where: { created_from_upload: true },
+    }).catch(() => []);
 
-      const seedTorrents = await TorrentModel.find({ createdFromUpload: true });
-      if (seedTorrents.length > 0) {
-        logger.info(`[SeedRestore] Restoring ${seedTorrents.length} seeded torrent(s)...`);
-        for (const doc of seedTorrents) {
+    if (seedTransfers.length > 0) {
+      logger.info(`[SeedRestore] Restoring ${seedTransfers.length} seeded torrent(s)...`);
+      for (const transfer of seedTransfers) {
+        try {
+          const torrentFilePath = pathLib.resolve(transfer.torrent_file_path || '');
+          const sourcePath = pathLib.resolve(transfer.source_path || '');
+
+          // Async existence check (Fix #4: no readFileSync)
           try {
-            const torrentFilePath = pathLib.resolve(doc.torrentFilePath);
-            const sourcePath      = pathLib.resolve(doc.sourcePath);
-
-            if (!fsSync.existsSync(torrentFilePath)) {
-              logger.warn(`[SeedRestore] .torrent file missing for "${doc.name}", skipping`);
-              continue;
-            }
-            if (!fsSync.existsSync(sourcePath)) {
-              logger.warn(`[SeedRestore] Source file missing for "${doc.name}", skipping`);
-              continue;
-            }
-
-            const torrentBuffer = fsSync.readFileSync(torrentFilePath);
-            const downloadPath  = pathLib.resolve(
-              process.env.DOWNLOAD_PATH || './downloads', 'seeds'
-            );
-
-            setImmediate(async () => {
-              try {
-                await defaultEngine.seedFromFile({ torrentBuffer, sourcePath, downloadPath, autoStart: true });
-                logger.info(`[SeedRestore] Resumed seeding: "${doc.name}"`);
-
-                // Force-transition to seeding — file is already 100% on disk
-                // so downloadManager:complete never fires automatically
-                const engineTorrent = defaultEngine.getTorrent(doc.infoHash);
-                if (engineTorrent && typeof engineTorrent._transitionToSeeding === 'function') {
-                  if (engineTorrent._state !== 'seeding') {
-                    await engineTorrent._transitionToSeeding();
-                    logger.info(`[SeedRestore] Force-transitioned to seeding: "${doc.name}"`);
-                  }
-                }
-
-                // Sync DB status
-                await TorrentModel.findOneAndUpdate(
-                  { infoHash: doc.infoHash },
-                  { status: 'seeding', progress: 100 }
-                );
-              } catch (err) {
-                logger.warn(`[SeedRestore] Failed to resume "${doc.name}": ${err.message}`);
-              }
-            });
-          } catch (err) {
-            logger.warn(`[SeedRestore] Error processing "${doc.name}": ${err.message}`);
+            await fs.access(torrentFilePath);
+          } catch {
+            logger.warn(`[SeedRestore] .torrent file missing for "${transfer.name}", skipping`);
+            continue;
           }
+          try {
+            await fs.access(sourcePath);
+          } catch {
+            logger.warn(`[SeedRestore] Source file missing for "${transfer.name}", skipping`);
+            continue;
+          }
+
+          // Async file read (Fix #4: prevents event loop blocking)
+          const torrentBuffer = await fs.readFile(torrentFilePath);
+          const downloadPath = pathLib.resolve(
+            process.env.DOWNLOAD_PATH || './downloads', 'seeds'
+          );
+
+          setImmediate(async () => {
+            try {
+              await defaultEngine.seedFromFile({ torrentBuffer, sourcePath, downloadPath, autoStart: true });
+              logger.info(`[SeedRestore] Resumed seeding: "${transfer.name}"`);
+
+              const engineTorrent = defaultEngine.getTorrent(transfer.info_hash);
+              if (engineTorrent && typeof engineTorrent._transitionToSeeding === 'function') {
+                if (engineTorrent._state !== 'seeding') {
+                  await engineTorrent._transitionToSeeding();
+                  logger.info(`[SeedRestore] Force-transitioned to seeding: "${transfer.name}"`);
+                }
+              }
+
+              // Update PostgreSQL status
+              await Transfer.update(
+                { status: 'seeding', progress: 100 },
+                { where: { info_hash: transfer.info_hash } }
+              );
+            } catch (err) {
+              logger.warn(`[SeedRestore] Failed to resume "${transfer.name}": ${err.message}`);
+            }
+          });
+        } catch (err) {
+          logger.warn(`[SeedRestore] Error processing "${transfer.name}": ${err.message}`);
         }
       }
-    } catch (err) {
-      logger.warn(`[SeedRestore] Restore pass failed (non-fatal): ${err.message}`);
     }
-  })
-  .catch((err) => logger.error('MongoDB connection error:', err));
+  } catch (err) {
+    logger.warn(`[SeedRestore] Restore pass failed (non-fatal): ${err.message}`);
+  }
+})();
 
 // Middleware
 app.use(
@@ -226,9 +228,7 @@ async function gracefulShutdown(signal) {
       logger.info('Worker consumer stopped');
     }
 
-    // Close MongoDB connection
-    await mongoose.connection.close();
-    logger.info('MongoDB connection closed');
+
 
     // Close PostgreSQL connection
     if (sequelize) {

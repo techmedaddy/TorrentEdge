@@ -172,9 +172,9 @@ class WorkerConsumer extends EventEmitter {
 
     const torrent = await this._engine.addTorrent(opts);
 
-    // Phase 2.2: Acquire lease
-    const acquired = await LeaseManager.acquireLease(torrent.infoHash, this._nodeId);
-    if (!acquired) {
+    // Phase 2.2: Acquire lease (returns fencing token or null)
+    const fencingToken = await LeaseManager.acquireLease(torrent.infoHash, this._nodeId);
+    if (fencingToken === null) {
       console.warn(`[Worker:${this._nodeId}] Failed to acquire lease for new job ${torrent.infoHash}. Removing...`);
       await this._engine.removeTorrent(torrent.infoHash);
       throw new Error(`Lease denied for ${torrent.infoHash}`);

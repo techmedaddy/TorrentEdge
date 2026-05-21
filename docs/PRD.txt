@@ -1,0 +1,138 @@
+Product Requirements Document (PRD): TorrentEdge
+Document Status: V1.0 - Draft
+
+Target Architecture: Self-Hosted, Kubernetes-Native Distributed System
+
+Primary Paradigm: Peer-Assisted Artifact Distribution & Reliability
+
+1. Product Vision
+TorrentEdge is a self-hosted, peer-assisted artifact distribution platform engineered to reliably transfer massive datasets, model checkpoints, and build artifacts across distributed infrastructure. By leveraging chunk-based delivery, internal VPC peering, and robust idempotency mechanisms, TorrentEdge eliminates centralized network bottlenecks, slashing S3 egress costs and dramatically reducing P99 transfer times for multi-node fleet deployments.
+
+2. Exact Target Users
+MLOps Engineers: Distributing 50GB+ .safetensors or .pt model checkpoints simultaneously to dozens of GPU training or inference nodes without saturating the network backbone.
+
+Platform / Infrastructure Engineers: Replacing fragile, sequential SCP/rsync scripts with a fault-tolerant, orchestratable transfer protocol.
+
+DevOps / CI/CD Pipeline Managers: Pushing heavy container layers or compiled binaries to globally distributed staging and production edge nodes.
+
+3. Core Operational Pain Points
+The "Thundering Herd" Network Collapse: When a 50-node GPU cluster is commanded to pull a new 70GB Llama-3 checkpoint from S3 simultaneously, the top-of-rack switches and NAT gateways become instantly bottlenecked.
+
+Astronomical Egress Costs: Paying cloud providers for identical multi-gigabyte payload transfers across the public internet to hundreds of downstream instances.
+
+Fragile State & Restart Penalties: Standard direct-download scripts fail violently on network hiccups. Restarting a 90% complete 100GB transfer wastes massive amounts of time and bandwidth.
+
+Lack of Telemetry: Total absence of observability into distributed pull success rates, node-level bandwidth consumption, and transfer health.
+
+4. Non-Goals
+We are not building a public BitTorrent client or tracker.
+
+We are not building a managed SaaS; this is strictly a self-hosted infra tool.
+
+We are not building a long-term data archival or backup system (like Ceph or MinIO).
+
+We are not supporting consumer desktop operating systems natively (macOS/Windows desktop clients are out of scope; focus is Linux/container environments).
+
+5. Core Workflows
+Artifact Ingestion & Hashing: An artifact is pushed to the TorrentEdge API. The backend orchestrator chunks the file, calculates SHA-256 cryptographic hashes for piece-level integrity, and logs metadata.
+
+Event-Driven Dispatch: The Control Plane publishes a distribution directive to an event bus. Stateless workers pick up the job and evaluate their local storage state.
+
+VPC-Aware Swarming: Workers query a peer registry to locate the closest internal nodes holding required chunks, prioritizing East-West internal traffic over North-South internet traffic.
+
+Content-Addressable Execution: Upon receiving a chunk, the worker verifies the cryptographic hash and writes it to a local CAS (Content-Addressable Store). If another scheduled transfer requires the same chunk, the worker utilizes a local symlink instead of initiating network I/O.
+
+6. MVP Scope
+The Minimum Viable Product focuses strictly on the core engine and necessary deployment scaffolding:
+
+Strictly Separated Architecture:
+
+Control Plane: REST API managing transfer state, node registration, and metadata.
+
+Data Plane: Horizontally scalable stateless worker daemons executing the chunk transfers.
+
+State & Orchestration Components: Relational metadata store, event bus for job dispatch, and distributed caching/locking mechanism for state management.
+
+CAS Deduplication Layer: Local node-level deduplication to prevent redundant disk writes.
+
+Idempotent Execution Engine: System must safely handle duplicate API requests and overlapping worker directives without split-brain corruption.
+
+Observability Base: Standardized metrics exposition (active peers, transfer rates, CAS hit ratios) and distributed tracing hooks.
+
+7. Phase-Wise Roadmap
+Phase 1: Hardened Execution Engine (Complete/Current) * Chunk integrity tracking, idempotent retries, Kafka-based job dispatch, distributed leases to prevent disk collision, VPC peer replication.
+
+Phase 2: "Time-to-Value" Optimization & Deployment (Next)
+
+Infrastructure as Code (Terraform) and Kubernetes Helm charts.
+
+Single-command docker-compose evaluation mode for local testing.
+
+Admin dashboard focused on value realization (Egress Bandwidth Saved, Local Cache Hit Rates).
+
+Phase 3: Ecosystem Bridges (Future)
+
+S3 "Cold Start" Gateway: Automatic pull and chunking of zero-seed artifacts from AWS S3.
+
+Native GitHub Actions / GitLab CI hooks.
+
+Automated Hugging Face model registry sync.
+
+8. System Constraints
+Network Topology: Relies on the assumption that East-West bandwidth between cluster nodes is significantly cheaper and faster than North-South gateway bandwidth.
+
+Disk IOPS: Hash calculation and concurrent chunk writes are heavily disk-bound. Workers require NVMe or high-IOPS SSDs to function optimally.
+
+State Expiration: Distributed worker leases must have strict TTLs. If a worker dies mid-transfer, the system must detect the dropped lease and predictably re-queue the directive.
+
+9. Security Assumptions
+Zero-Trust Chunk Verification: The system must never trust peer-provided data blindly. Every piece must be validated against the Control Plane's Merkle tree/hash list before being written to disk. This prevents artifact poisoning.
+
+Network Isolation: Deployment assumes an internal, secure VPC footprint.
+
+Role-Based Access: API endpoints for mutating state (adding/deleting torrents) require strict authentication.
+
+10. Failure Scenarios
+Scenario A: Worker Node OOM / Crash. Mid-download, a worker pod is terminated.
+
+Resolution: Distributed lease expires. The orchestrator detects the timeout, re-publishes the job directive. A new worker evaluates the local checkpoint log, verifying existing chunks, and resumes only what is missing.
+
+Scenario B: Control Plane Outage. The PostgreSQL/REST API layer goes down.
+
+Resolution: Data Plane workers continue active P2P transfers using cached peer lists. No new transfers can be initiated until the Control Plane recovers.
+
+Scenario C: Network Partition (Split-Brain).
+
+Resolution: Strict idempotency and transactional locks guarantee that two workers on the same physical volume cannot simultaneously write to the same artifact checkpoint.
+
+11. Deployment Model
+Architecture: Packaged via Docker and deployed via Kubernetes Helm Charts.
+
+Dependencies: * PostgreSQL (ACID-compliant relational data, metadata)
+
+Apache Kafka (Event bus, asynchronous worker dispatch)
+
+Redis (Fast peer registry, distributed locking/leases)
+
+Probes: Native K8s Liveness, Readiness, and Startup HTTP probes connected to backend subsystem health checks.
+
+12. Metrics of Success
+Primary Metric: Aggregate external Egress Bandwidth Saved (in TB).
+
+Secondary Metric: Time-to-Deployment reduction (e.g., P99 time to push a 50GB file to 100 nodes drops from 45 minutes to <5 minutes).
+
+Tertiary Metric: CAS Hit Ratio (percentage of chunks resolved locally via symlink vs network download).
+
+13. Competitive Positioning
+Versus S3 Direct Pulls: Infinitely scalable for concurrent fleet requests; eliminates the network chokepoint and egress fees.
+
+Versus standard BitTorrent / Transmission: Provides internal corporate tracking, robust API observability, distributed tracing, and specialized caching mechanisms lacking in consumer software.
+
+Versus Enterprise P2P (Dragonfly, Kraken): Considerably lighter weight. Does not require deep, invasive container runtime integration (like intercepting Containerd API calls); behaves as a predictable, standalone artifact router.
+
+14. Features Explicitly Rejected
+Decentralized Hash Tables (DHT) & Trackerless Swarms: Unnecessary and insecure for internal corporate VPC deployments. The Control Plane acts as the absolute source of truth.
+
+Protocol Encryption (MSE/PE): Within a secured VPC/Service Mesh (e.g., Istio, Linkerd), application-level chunk encryption introduces useless CPU overhead. Network security is deferred to the transport layer.
+
+Streaming Video/Audio Playback: Consumer features meant for media consumption hold zero value for infrastructure artifact delivery.

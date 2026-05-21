@@ -786,8 +786,10 @@ exports.createTorrentFromFile = async (req, res) => {
       return res.status(400).json({ error: 'No file uploaded. Send a file in the "file" field.' });
     }
 
-    const fileBuffer = req.file.buffer;
-    if (!fileBuffer || fileBuffer.length === 0) {
+    // With diskStorage, req.file.path is the temp file on disk (not in RAM)
+    const uploadedFilePath = req.file.path;
+    const fileSize = req.file.size;
+    if (!uploadedFilePath || fileSize === 0) {
       return res.status(400).json({ error: 'Uploaded file is empty.' });
     }
 
@@ -795,12 +797,15 @@ exports.createTorrentFromFile = async (req, res) => {
     // Multer already enforces this at HTTP layer but we double-check here so
     // the limit is respected even if the route is called programmatically.
     const MAX_BYTES = parseInt(process.env.MAX_SEED_FILE_SIZE, 10) || (2 * 1024 * 1024 * 1024);
-    if (fileBuffer.length > MAX_BYTES) {
+    if (fileSize > MAX_BYTES) {
       const limitMB = (MAX_BYTES / (1024 * 1024)).toFixed(0);
+      // Clean up temp file
+      const fsCleanup = require('fs').promises;
+      await fsCleanup.unlink(uploadedFilePath).catch(() => {});
       return res.status(413).json({
         error:    `File too large. Maximum allowed size is ${limitMB} MB.`,
         maxBytes: MAX_BYTES,
-        fileBytes: fileBuffer.length,
+        fileBytes: fileSize,
       });
     }
 

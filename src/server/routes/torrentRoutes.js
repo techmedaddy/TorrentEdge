@@ -24,11 +24,27 @@ const uploadTorrent = multer({
 // ── Multer: any file for torrent creation (Phase 2.1) ─────────────────────────
 // Accepts PDF, MP3, MP4, ZIP, DOCX — anything the user wants to share.
 // Size limit is configurable via MAX_SEED_FILE_SIZE env var (default 2GB).
-// Multer enforces the limit at the HTTP layer — controller double-checks below.
+// Uses diskStorage to STREAM uploads to a temp directory instead of buffering
+// the entire file in Node.js RAM (prevents OOM kills in K8s pods).
 const MAX_SEED_FILE_BYTES = parseInt(process.env.MAX_SEED_FILE_SIZE, 10) || (2 * 1024 * 1024 * 1024);
+const os = require('os');
+const path = require('path');
+const crypto = require('crypto');
+
+const uploadDiskStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, process.env.UPLOAD_TEMP_DIR || os.tmpdir());
+  },
+  filename: (req, file, cb) => {
+    // Use a unique temp name to avoid collisions
+    const uniqueSuffix = crypto.randomUUID().replace(/-/g, '').substring(0, 16);
+    const ext = path.extname(file.originalname);
+    cb(null, `te-upload-${uniqueSuffix}${ext}`);
+  },
+});
 
 const uploadAnyFile = multer({
-  storage: multer.memoryStorage(),
+  storage: uploadDiskStorage,
   limits: { fileSize: MAX_SEED_FILE_BYTES },
   // No fileFilter — accept all MIME types intentionally (controller warns, never blocks)
 });

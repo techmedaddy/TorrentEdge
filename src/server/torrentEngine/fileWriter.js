@@ -25,6 +25,11 @@ class FileWriter extends EventEmitter {
     this.fileHandles = new Map();
     this.isInitialized = false;
 
+    // LRU file descriptor cache — avoids open/close per piece
+    // Default limit is conservative; most Linux systems allow 1024 open FDs
+    this._fdCache = new Map();            // filePath -> { fd, lastUsed }
+    this._maxOpenFds = parseInt(process.env.MAX_OPEN_FDS, 10) || 256;
+
     // Per-file progress tracking
     this._fileProgress = new Map(); // fileIndex -> { downloaded, size, percent, complete }
     
@@ -175,15 +180,77 @@ class FileWriter extends EventEmitter {
       const filePath = this.getFilePath(fileIndex);
       const chunk = data.slice(dataOffset, dataOffset + length);
 
-      const fd = await fs.open(filePath, 'r+');
+      // Use LRU FD cache instead of open/close per piece
+      const fd = await this._getOrOpenFd(filePath, 'r+');
       await fd.write(chunk, 0, length, fileOffset);
-      await fd.close();
 
       dataOffset += length;
       
       // Update file progress
       this._updateFileProgress(fileIndex, length);
     }
+  }
+
+  /**
+   * LRU file descriptor cache — gets an existing FD or opens a new one.
+   * Evicts the least-recently-used FD if the cache exceeds _maxOpenFds.
+   * @param {string} filePath
+   * @param {string} mode - File open mode ('r+', 'r', 'w', etc.)
+   * @returns {Promise<import('fs').FileHandle>}
+   */
+  async _getOrOpenFd(filePath, mode) {
+    const entry = this._fdCache.get(filePath);
+    if (entry) {
+      entry.lastUsed = Date.now();
+      return entry.fd;
+    }
+
+    // Evict LRU if cache is full
+    if (this._fdCache.size >= this._maxOpenFds) {
+      await this._evictLruFd();
+    }
+
+    const fd = await fs.open(filePath, mode);
+    this._fdCache.set(filePath, { fd, lastUsed: Date.now() });
+    return fd;
+  }
+
+  /**
+   * Evicts the least-recently-used file descriptor from the cache.
+   * @private
+   */
+  async _evictLruFd() {
+    let oldestKey = null;
+    let oldestTime = Infinity;
+
+    for (const [key, entry] of this._fdCache) {
+      if (entry.lastUsed < oldestTime) {
+        oldestTime = entry.lastUsed;
+        oldestKey = key;
+      }
+    }
+
+    if (oldestKey) {
+      const entry = this._fdCache.get(oldestKey);
+      this._fdCache.delete(oldestKey);
+      try {
+        await entry.fd.close();
+      } catch {
+        // FD may already be closed
+      }
+    }
+  }
+
+  /**
+   * Closes all cached file descriptors. Call on transfer completion or cleanup.
+   */
+  async closeAllFds() {
+    const promises = [];
+    for (const [, entry] of this._fdCache) {
+      promises.push(entry.fd.close().catch(() => {}));
+    }
+    await Promise.all(promises);
+    this._fdCache.clear();
   }
   
   /**
@@ -250,9 +317,8 @@ class FileWriter extends EventEmitter {
       const filePath = this.getFilePath(fileIndex);
       const buffer = Buffer.allocUnsafe(length);
 
-      const fd = await fs.open(filePath, 'r');
+      const fd = await this._getOrOpenFd(filePath, 'r');
       await fd.read(buffer, 0, length, fileOffset);
-      await fd.close();
 
       buffers.push(buffer);
     }

@@ -128,6 +128,45 @@ class LeaseManager {
     const result = await redis.eval(luaScript, 2, leaseKey, tokenKey, nodeId);
     return result === 1;
   }
+
+  /**
+   * Bulk renews leases for multiple infoHashes in a single Redis pipeline.
+   * Returns an array of fencing tokens (or null if the lease was lost).
+   *
+   * @param {string[]} infoHashes - Array of transfer identifiers.
+   * @param {string} nodeId - The worker node ID.
+   * @param {number} ttlSeconds - Lease duration in seconds.
+   * @returns {Promise<(number|null)[]>}
+   */
+  static async renewLeasesBulk(infoHashes, nodeId, ttlSeconds = 30) {
+    if (infoHashes.length === 0) return [];
+
+    const pipeline = redis.pipeline();
+
+    const luaScript = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        redis.call("expire", KEYS[1], ARGV[2])
+        redis.call("expire", KEYS[2], ARGV[2])
+        local token = redis.call("get", KEYS[2])
+        return tonumber(token)
+      else
+        return -1
+      end
+    `;
+
+    for (const infoHash of infoHashes) {
+      const leaseKey = `lease:transfer:${infoHash}`;
+      const tokenKey = `lease:token:${infoHash}`;
+      pipeline.eval(luaScript, 2, leaseKey, tokenKey, nodeId, ttlSeconds);
+    }
+
+    const results = await pipeline.exec();
+
+    return results.map(([err, result]) => {
+      if (err || result === -1) return null;
+      return Number(result);
+    });
+  }
 }
 
 module.exports = LeaseManager;

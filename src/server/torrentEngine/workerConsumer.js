@@ -363,6 +363,14 @@ class WorkerConsumer extends EventEmitter {
 
       console.log(`[Worker:${this._nodeId}] Kafka consumer subscribed to ${TOPICS.JOB_DISPATCH}`);
 
+      // Listen for mid-flight Kafka crashes (e.g. broker goes down 3 hours later)
+      // Without this, the worker becomes a zombie that K8s doesn't know is dead
+      this._consumer.on('consumer.crash', async ({ payload }) => {
+        console.error(`[Worker:${this._nodeId}] FATAL: Kafka consumer crashed: ${payload?.error?.message}`);
+        console.error(`[Worker:${this._nodeId}] Exiting to allow K8s to restart the pod...`);
+        process.exit(1);
+      });
+
     } catch (err) {
       console.error(`[Worker:${this._nodeId}] Kafka consumer failed: ${err.message}`);
       throw err;
@@ -379,19 +387,26 @@ class WorkerConsumer extends EventEmitter {
     this._heartbeatTimer = setInterval(async () => {
       const stats = this._engine ? this._engine.getGlobalStats() : {};
 
-      // Phase 2.2: Renew leases for all active torrents
+      // Phase 2.2: Bulk renew leases for all active torrents in a single pipeline
       // Phase 4.1: Refresh peer registry TTLs
       const activeInfoHashes = [];
       if (this._engine) {
         for (const [infoHash, torrent] of this._engine.torrents.entries()) {
-          // Only renew if not paused/stopped
           if (torrent.state !== 'paused' && torrent.state !== 'stopped' && torrent.state !== 'error') {
             activeInfoHashes.push(infoHash);
-            const renewed = await LeaseManager.renewLease(infoHash, this._nodeId);
-            if (!renewed) {
-              console.warn(`[Worker:${this._nodeId}] Lost lease for ${infoHash}! Pausing torrent to prevent split-brain.`);
-              torrent.pause();
-              await this._peerDiscovery.stopDiscovery(infoHash).catch(() => {});
+          }
+        }
+
+        // Bulk lease renewal via Redis pipeline (1 round-trip instead of N)
+        if (activeInfoHashes.length > 0) {
+          const results = await LeaseManager.renewLeasesBulk(activeInfoHashes, this._nodeId);
+          for (let i = 0; i < activeInfoHashes.length; i++) {
+            if (results[i] === null) {
+              const lostHash = activeInfoHashes[i];
+              console.warn(`[Worker:${this._nodeId}] Lost lease for ${lostHash}! Pausing torrent to prevent split-brain.`);
+              const torrent = this._engine.torrents.get(lostHash);
+              if (torrent) torrent.pause();
+              await this._peerDiscovery.stopDiscovery(lostHash).catch(() => {});
             }
           }
         }

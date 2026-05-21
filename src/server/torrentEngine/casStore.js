@@ -131,7 +131,9 @@ class CASStore {
     await fs.mkdir(shardDir, { recursive: true });
 
     // Atomic write: write to temp, then rename
-    const tmpPath = `${filePath}.${process.pid}.tmp`;
+    // Use UUID instead of process.pid — in Kubernetes, all containers run as PID 1
+    const uniqueSuffix = crypto.randomUUID().replace(/-/g, '').substring(0, 12);
+    const tmpPath = `${filePath}.${uniqueSuffix}.tmp`;
     try {
       await fs.writeFile(tmpPath, data);
       await fs.rename(tmpPath, filePath);

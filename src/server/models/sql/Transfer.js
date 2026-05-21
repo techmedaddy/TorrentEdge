@@ -35,6 +35,22 @@ const Transfer = sequelize.define('Transfer', {
   lease_expires_at: {
     type: DataTypes.DATE,
     allowNull: true
+  },
+  progress: {
+    type: DataTypes.FLOAT,
+    defaultValue: 0
+  },
+  source_path: {
+    type: DataTypes.STRING,
+    allowNull: true
+  },
+  torrent_file_path: {
+    type: DataTypes.STRING,
+    allowNull: true
+  },
+  created_from_upload: {
+    type: DataTypes.BOOLEAN,
+    defaultValue: false
   }
 }, {
   tableName: 'transfers'

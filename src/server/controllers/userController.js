@@ -1,9 +1,9 @@
-const User = require('../models/User');
+const { User } = require('../models/sql');
 
 // Function to get user profile (excludes password)
 exports.getUserProfile = async (req, res) => {
     try {
-        const user = await User.findById(req.user.userId || req.user.id).select('-password');
+        const user = await User.findByPk(req.user.userId || req.user.id, { attributes: { exclude: ['password'] } });
         if (!user) {
             return res.status(404).json({ message: 'User not found' });
         }
@@ -26,11 +26,8 @@ exports.updateUserProfile = async (req, res) => {
             }
         }
 
-        const user = await User.findByIdAndUpdate(
-            req.user.userId || req.user.id,
-            updates,
-            { new: true, runValidators: true }
-        ).select('-password');
+        await User.update(updates, { where: { id: req.user.userId || req.user.id } });
+        const user = await User.findByPk(req.user.userId || req.user.id, { attributes: { exclude: ['password'] } });
 
         if (!user) {
             return res.status(404).json({ message: 'User not found' });
@@ -54,7 +51,7 @@ exports.changePassword = async (req, res) => {
             return res.status(400).json({ message: 'New password must be at least 6 characters' });
         }
 
-        const user = await User.findById(req.user.userId || req.user.id);
+        const user = await User.findByPk(req.user.userId || req.user.id);
         if (!user) {
             return res.status(404).json({ message: 'User not found' });
         }
@@ -64,7 +61,7 @@ exports.changePassword = async (req, res) => {
             return res.status(401).json({ message: 'Current password is incorrect' });
         }
 
-        user.password = newPassword; // Will be hashed by pre-save hook
+        user.password = newPassword; // Will be hashed by beforeSave hook
         await user.save();
 
         res.json({ message: 'Password changed successfully' });

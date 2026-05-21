@@ -1,7 +1,5 @@
 const express = require('express');
 const router = express.Router();
-const mongoose = require('mongoose');
-
 /**
  * Phase 3.1/3.2 — Health & Readiness Probes
  *
@@ -34,28 +32,14 @@ router.get('/ready', async (req, res) => {
   const checks = {};
   let healthy = true;
 
-  // 1. MongoDB
-  try {
-    const mongoState = mongoose.connection.readyState;
-    // 0 = disconnected, 1 = connected, 2 = connecting, 3 = disconnecting
-    checks.mongodb = mongoState === 1 ? 'connected' : `state_${mongoState}`;
-    if (mongoState !== 1) healthy = false;
-  } catch (err) {
-    checks.mongodb = `error: ${err.message}`;
-    healthy = false;
-  }
-
-  // 2. PostgreSQL (via Sequelize)
+  // 1. PostgreSQL (via Sequelize)
   try {
     const { sequelize } = require('../db/sql');
     await sequelize.authenticate();
     checks.postgres = 'connected';
   } catch (err) {
     checks.postgres = `error: ${err.message}`;
-    // Postgres is not strictly required in dev — warn but don't fail
-    if (process.env.NODE_ENV === 'production') {
-      healthy = false;
-    }
+    healthy = false;
   }
 
   // 3. Redis

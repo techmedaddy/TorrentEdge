@@ -9,6 +9,13 @@ const Chunk = require('./Chunk');
 User.hasMany(Transfer, { foreignKey: 'uploaded_by', as: 'uploads' });
 Transfer.belongsTo(User, { foreignKey: 'uploaded_by', as: 'uploader' });
 
+// Users can leech many Transfers
+const { sequelize } = require('../../db/sql');
+const TransferLeecher = sequelize.define('TransferLeecher', {}, { tableName: 'transfer_leechers', timestamps: false });
+
+User.belongsToMany(Transfer, { through: TransferLeecher, as: 'leeched_transfers', foreignKey: 'user_id' });
+Transfer.belongsToMany(User, { through: TransferLeecher, as: 'leechers', foreignKey: 'transfer_id' });
+
 // Transfers belong to a Node (Owner)
 Node.hasMany(Transfer, { foreignKey: 'owner_node_id', as: 'owned_transfers' });
 Transfer.belongsTo(Node, { foreignKey: 'owner_node_id', as: 'owner_node' });
@@ -25,5 +32,6 @@ module.exports = {
   User,
   Node,
   Transfer,
-  Chunk
+  Chunk,
+  TransferLeecher
 };

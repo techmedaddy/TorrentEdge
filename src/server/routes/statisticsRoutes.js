@@ -1,8 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const { defaultEngine } = require('../torrentEngine');
-const Torrent = require('../models/torrent');
-const User = require('../models/User');
+const { Transfer, User } = require('../models/sql');
+const { Op } = require('sequelize');
 const authMiddleware = require('../middleware/authMiddleware');
 
 /**
@@ -18,9 +18,9 @@ router.get('/', async (req, res) => {
   try {
     // Get counts from database
     const [totalTorrents, totalUsers, activeTorrents] = await Promise.all([
-      Torrent.countDocuments(),
-      User.countDocuments(),
-      Torrent.countDocuments({ status: { $in: ['downloading', 'seeding'] } })
+      Transfer.count(),
+      User.count(),
+      Transfer.count({ where: { status: { [Op.in]: ['downloading', 'seeding'] } } })
     ]);
 
     // Get engine stats if available
@@ -122,7 +122,7 @@ router.get('/user', authMiddleware, async (req, res) => {
     const userId = req.user.id;
 
     // Get user's torrent stats from database
-    const userTorrents = await Torrent.find({ uploadedBy: userId });
+    const userTorrents = await Transfer.findAll({ where: { uploaded_by: userId } });
     
     const stats = {
       totalTorrents: userTorrents.length,
@@ -140,14 +140,14 @@ router.get('/user', authMiddleware, async (req, res) => {
 
     userTorrents.forEach(t => {
       stats.byStatus[t.status] = (stats.byStatus[t.status] || 0) + 1;
-      stats.totalSize += t.size || 0;
-      stats.totalDownloaded += (t.size || 0) * (t.progress || 0) / 100;
+      stats.totalSize += t.size_bytes || 0;
+      stats.totalDownloaded += (t.size_bytes || 0) * (t.progress || 0) / 100;
     });
 
     // Get live stats from engine for user's torrents
     const liveStats = [];
     for (const torrent of userTorrents) {
-      const engineTorrent = defaultEngine.getTorrent(torrent.infoHash);
+      const engineTorrent = defaultEngine.getTorrent(torrent.info_hash);
       if (engineTorrent) {
         try {
           liveStats.push(engineTorrent.getStats());

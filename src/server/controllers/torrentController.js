@@ -20,29 +20,28 @@
  * - GET    /api/torrent/engine/stats  - Get global engine statistics
  */
 
-const Torrent = require('../models/torrent');
-const mongoose = require('mongoose');
+const { Transfer, User, TransferLeecher } = require('../models/sql'); // Phase 1.1 SQL Model
 const { defaultEngine } = require('../torrentEngine');
 const { broadcast } = require('../socket');
 const path = require('path');
 const fs = require('fs').promises;
-const { Transfer } = require('../models/sql'); // Phase 1.1 SQL Model
 const Checkpointer = require('../torrentEngine/checkpointer'); // Phase 1.2 CAS
 const ResumeService = require('../torrentEngine/resumeService'); // Phase 1.3 Idempotent Resume
 const { defaultDispatcher, DIRECTIVE_TYPES } = require('../torrentEngine'); // Phase 2.1 Dispatcher
 
-// Helper to validate ObjectId
-const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
+// Helper to validate UUID
+const isValidObjectId = (id) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
 
 // Helper to merge MongoDB data with live engine stats
 const mergeTorrentData = (dbTorrent, engineTorrent) => {
+  const data = dbTorrent.toJSON ? dbTorrent.toJSON() : dbTorrent;
   if (!engineTorrent) {
-    return dbTorrent.toObject();
+    return data;
   }
 
   const stats = engineTorrent.getStats();
   return {
-    ...dbTorrent.toObject(),
+    ...data,
     status: stats.state,
     progress: stats.percentage,
     downloadSpeed: stats.downloadSpeed,
@@ -64,22 +63,26 @@ exports.getAllTorrents = async (req, res) => {
     const userId = req.user.userId || req.user.id;
 
     // 2.1 — show torrents where user is uploader OR downloader
-    const torrents = await Torrent.find({
-      $or: [
-        { uploadedBy: userId },
-        { downloadedBy: userId }
-      ]
-    })
-      .sort({ addedAt: -1 })
-      .populate('uploadedBy', 'username');
+    const qry = {
+      include: [
+        { model: User, as: 'uploader', attributes: ['id', 'username'] },
+        { model: User, as: 'leechers', attributes: ['id'] }
+      ],
+      order: [['createdAt', 'DESC']]
+    };
+    
+    const allTorrents = await Transfer.findAll(qry);
+    
+    const torrents = allTorrents.filter(t => 
+      t.uploaded_by === userId || 
+      t.leechers.some(l => l.id === userId)
+    );
 
     // Merge with live engine stats + attach isOwner flag
     const mergedTorrents = torrents.map(torrent => {
-      const engineTorrent = defaultEngine.getTorrent(torrent.infoHash);
+      const engineTorrent = defaultEngine.getTorrent(torrent.info_hash);
       const merged = mergeTorrentData(torrent, engineTorrent);
-      merged.isOwner = torrent.uploadedBy._id
-        ? torrent.uploadedBy._id.toString() === userId.toString()
-        : torrent.uploadedBy.toString() === userId.toString();
+      merged.isOwner = torrent.uploaded_by === userId;
       return merged;
     });
 
@@ -95,34 +98,33 @@ exports.getTorrentById = async (req, res) => {
   try {
     let torrent;
 
-    // Check if it's MongoDB ObjectId or infoHash
+    const qry = {
+      include: [
+        { model: User, as: 'uploader', attributes: ['id', 'username', 'email'] },
+        { model: User, as: 'leechers', attributes: ['id'] }
+      ]
+    };
+
     if (isValidObjectId(req.params.id)) {
-      torrent = await Torrent.findById(req.params.id)
-        .populate('uploadedBy', 'username email');
+      torrent = await Transfer.findByPk(req.params.id, qry);
     } else {
-      // Assume it's an infoHash
-      torrent = await Torrent.findOne({ infoHash: req.params.id.toLowerCase() })
-        .populate('uploadedBy', 'username email');
+      torrent = await Transfer.findOne({ where: { info_hash: req.params.id.toLowerCase() }, ...qry });
     }
 
     if (!torrent) {
       return res.status(404).json({ message: 'Torrent not found' });
     }
 
-    // 2.4 — allow access if user is uploader OR in downloadedBy
     const userId = req.user.userId || req.user.id;
-    const uploaderId = torrent.uploadedBy._id
-      ? torrent.uploadedBy._id.toString()
-      : torrent.uploadedBy.toString();
-    const isOwner = uploaderId === userId.toString();
-    const isLeecher = torrent.downloadedBy.map(id => id.toString()).includes(userId.toString());
+    const isOwner = torrent.uploader && torrent.uploader.id === userId;
+    const isLeecher = torrent.leechers && torrent.leechers.some(l => l.id === userId);
 
     if (!isOwner && !isLeecher) {
       return res.status(403).json({ message: 'Not authorized to view this torrent' });
     }
 
     // Merge with live engine stats + attach isOwner flag
-    const engineTorrent = defaultEngine.getTorrent(torrent.infoHash);
+    const engineTorrent = defaultEngine.getTorrent(torrent.info_hash);
     const mergedData = mergeTorrentData(torrent, engineTorrent);
     mergedData.isOwner = isOwner;
 
@@ -162,26 +164,28 @@ exports.createTorrent = async (req, res) => {
       }
       
       // 2.2 — if torrent already exists, add this user as a downloader instead of erroring
-      const existingTorrent = await Torrent.findOne({ infoHash: magnetInfo.infoHash });
+      const existingTorrent = await Transfer.findOne({ 
+        where: { info_hash: magnetInfo.infoHash.toLowerCase() },
+        include: [{ model: User, as: 'leechers', attributes: ['id'] }]
+      });
       if (existingTorrent) {
         const userId = req.user.userId || req.user.id;
-        const alreadyOwner = existingTorrent.uploadedBy.toString() === userId.toString();
-        const alreadyLeeching = existingTorrent.downloadedBy.map(id => id.toString()).includes(userId.toString());
+        const alreadyOwner = existingTorrent.uploaded_by === userId;
+        const alreadyLeeching = existingTorrent.leechers && existingTorrent.leechers.some(l => l.id === userId);
 
         if (alreadyOwner || alreadyLeeching) {
           // User already has this torrent — return it with isOwner flag
-          const engineTorrent = defaultEngine.getTorrent(existingTorrent.infoHash);
+          const engineTorrent = defaultEngine.getTorrent(existingTorrent.info_hash);
           const merged = mergeTorrentData(existingTorrent, engineTorrent);
           merged.isOwner = alreadyOwner;
           return res.status(200).json({ message: 'Already in your list', torrent: merged });
         }
 
         // New leecher — add them to downloadedBy
-        existingTorrent.downloadedBy.push(userId);
-        await existingTorrent.save();
+        await TransferLeecher.create({ transfer_id: existingTorrent.id, user_id: userId });
         console.log(`[TorrentController] User ${userId} added as leecher for: ${existingTorrent.name}`);
 
-        const engineTorrent = defaultEngine.getTorrent(existingTorrent.infoHash);
+        const engineTorrent = defaultEngine.getTorrent(existingTorrent.info_hash);
         const merged = mergeTorrentData(existingTorrent, engineTorrent);
         merged.isOwner = false;
         return res.status(200).json(merged);
@@ -236,15 +240,17 @@ exports.createTorrent = async (req, res) => {
       throw error;
     }
 
-    // Check if torrent already exists in MongoDB (e.g. added via .torrent file with same hash)
-    const existingTorrent = await Torrent.findOne({ infoHash: engineTorrent.infoHash });
+    // Check if torrent already exists in DB (e.g. added via .torrent file with same hash)
+    const existingTorrent = await Transfer.findOne({ 
+      where: { info_hash: engineTorrent.infoHash.toLowerCase() },
+      include: [{ model: User, as: 'leechers', attributes: ['id'] }]
+    });
     if (existingTorrent) {
       const userId = req.user.userId || req.user.id;
-      const alreadyOwner = existingTorrent.uploadedBy.toString() === userId.toString();
-      const alreadyLeeching = existingTorrent.downloadedBy.map(id => id.toString()).includes(userId.toString());
+      const alreadyOwner = existingTorrent.uploaded_by === userId;
+      const alreadyLeeching = existingTorrent.leechers && existingTorrent.leechers.some(l => l.id === userId);
       if (!alreadyOwner && !alreadyLeeching) {
-        existingTorrent.downloadedBy.push(userId);
-        await existingTorrent.save();
+        await TransferLeecher.create({ transfer_id: existingTorrent.id, user_id: userId });
       }
       const merged = mergeTorrentData(existingTorrent, engineTorrent);
       merged.isOwner = alreadyOwner;
@@ -268,26 +274,19 @@ exports.createTorrent = async (req, res) => {
     }
     const name = engineTorrent.name || displayName || `Magnet-${engineTorrent.infoHash.substring(0, 8)}`;
 
-    // Save to MongoDB
-    const torrent = new Torrent({
+    // Save to DB
+    const torrent = await Transfer.create({
       name: name,
-      infoHash: engineTorrent.infoHash,
-      magnetURI: magnetURI || null,
-      size: engineTorrent.size || 0,
-      trackers: engineTorrent._metadata?.announce ? [engineTorrent._metadata.announce] : [],
-      uploadedBy: req.user.userId || req.user.userId || req.user.id,
+      info_hash: engineTorrent.infoHash.toLowerCase(),
+      magnet_uri: magnetURI || null,
+      size_bytes: engineTorrent.size || 0,
+      uploaded_by: req.user.userId || req.user.id,
       status: engineTorrent.state || (magnetURI ? 'fetching_metadata' : 'pending'),
       progress: stats?.percentage || 0,
-      files: (engineTorrent.files || []).map(f => ({
-        name: path.basename(f.path || f.name),
-        size: f.length || f.size,
-        path: f.path || f.name
-      }))
+      source_path: torrentPath || null
     });
 
-    await torrent.save();
-
-    console.log(`[TorrentController] Created torrent: ${torrent.name} (${torrent.infoHash})`);
+    console.log(`[TorrentController] Created torrent: ${torrent.name} (${torrent.info_hash})`);
     
     // 5.3 — always include isOwner in response
     const response = mergeTorrentData(torrent, engineTorrent);
@@ -308,21 +307,26 @@ exports.updateTorrent = async (req, res) => {
 
     const { status, progress, seeds, leeches, downloadSpeed, uploadSpeed } = req.body;
     
-    const torrent = await Torrent.findById(req.params.id);
+    let torrent;
+    if (isValidObjectId(req.params.id)) {
+      torrent = await Transfer.findByPk(req.params.id);
+    } else {
+      torrent = await Transfer.findOne({ where: { info_hash: req.params.id.toLowerCase() } });
+    }
+
     if (!torrent) {
       return res.status(404).json({ message: 'Torrent not found' });
     }
 
-    // Update allowed fields
-    if (status) torrent.status = status;
-    if (progress !== undefined) torrent.progress = progress;
-    if (seeds !== undefined) torrent.seeds = seeds;
-    if (leeches !== undefined) torrent.leeches = leeches;
-    if (downloadSpeed !== undefined) torrent.downloadSpeed = downloadSpeed;
-    if (uploadSpeed !== undefined) torrent.uploadSpeed = uploadSpeed;
+    const updateData = {};
+    if (status) updateData.status = status;
+    if (progress !== undefined) updateData.progress = progress;
 
-    await torrent.save();
-    res.json(torrent);
+    if (Object.keys(updateData).length > 0) {
+      await Transfer.update(updateData, { where: { id: torrent.id } });
+    }
+    
+    res.json({ ...torrent.toJSON(), ...updateData });
   } catch (error) {
     res.status(500).json({ message: 'Server error: ' + error.message });
   }
@@ -335,18 +339,19 @@ exports.deleteTorrent = async (req, res) => {
     const userId = req.user.userId || req.user.id;
 
     let torrent;
+    const qry = { include: [{ model: User, as: 'leechers', attributes: ['id'] }] };
     if (isValidObjectId(req.params.id)) {
-      torrent = await Torrent.findById(req.params.id);
+      torrent = await Transfer.findByPk(req.params.id, qry);
     } else {
-      torrent = await Torrent.findOne({ infoHash: req.params.id.toLowerCase() });
+      torrent = await Transfer.findOne({ where: { info_hash: req.params.id.toLowerCase() }, ...qry });
     }
 
     if (!torrent) {
       return res.status(404).json({ message: 'Torrent not found' });
     }
 
-    const isOwner = torrent.uploadedBy.toString() === userId.toString();
-    const isLeecher = torrent.downloadedBy.map(id => id.toString()).includes(userId.toString());
+    const isOwner = torrent.uploaded_by === userId;
+    const isLeecher = torrent.leechers && torrent.leechers.some(l => l.id === userId);
 
     if (!isOwner && !isLeecher) {
       return res.status(403).json({ message: 'Not authorized to remove this torrent' });
@@ -354,38 +359,27 @@ exports.deleteTorrent = async (req, res) => {
 
     // 5.2 — leechers just get removed from downloadedBy, torrent stays alive
     if (!isOwner && isLeecher) {
-      torrent.downloadedBy = torrent.downloadedBy.filter(id => id.toString() !== userId.toString());
-      await torrent.save();
+      await TransferLeecher.destroy({ where: { transfer_id: torrent.id, user_id: userId } });
       console.log(`[TorrentController] Leecher ${userId} removed from: ${torrent.name}`);
-
-      // 5.2 — if no leechers remain AND no owner (shouldn't happen, but guard it),
-      // or if this was the last reference to the torrent, clean up engine
-      // (Normal case: owner still seeds, so engine stays. Nothing to do.)
       return res.json({ message: 'Removed from your list' });
     }
 
-    // Owner deleting — remove from engine and DB entirely
-    // 5.2 — if leechers still exist, just remove owner's association
-    // Only fully purge when nobody else has it
-    if (torrent.downloadedBy && torrent.downloadedBy.length > 0) {
-      // Leechers still have it — transfer ownership to first leecher
-      // so the torrent stays alive, or just null out uploadedBy
-      // Simplest safe behavior: delete from engine & DB but leave leechers a tombstone
-      // Actually cleanest: just wipe it — owner made the call
-      console.log(`[TorrentController] Owner deleting torrent with ${torrent.downloadedBy.length} leecher(s) still attached`);
+    if (torrent.leechers && torrent.leechers.length > 0) {
+      console.log(`[TorrentController] Owner deleting torrent with ${torrent.leechers.length} leecher(s) still attached`);
     }
 
     try {
       await Promise.race([
-        defaultEngine.removeTorrent(torrent.infoHash, deleteFiles),
+        defaultEngine.removeTorrent(torrent.info_hash, deleteFiles),
         new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
       ]);
-      console.log(`[TorrentController] Removed from engine: ${torrent.infoHash}`);
+      console.log(`[TorrentController] Removed from engine: ${torrent.info_hash}`);
     } catch (error) {
       console.warn(`[TorrentController] Failed to remove from engine (non-fatal): ${error.message}`);
     }
 
-    await Torrent.findByIdAndDelete(torrent._id);
+    await TransferLeecher.destroy({ where: { transfer_id: torrent.id } });
+    await Transfer.destroy({ where: { id: torrent.id } });
 
     console.log(`[TorrentController] Deleted torrent: ${torrent.name}`);
     res.json({
@@ -406,13 +400,15 @@ exports.searchTorrents = async (req, res) => {
       return res.status(400).json({ message: 'Search query required' });
     }
 
-    const torrents = await Torrent.find({ $text: { $search: q } })
-      .sort({ score: { $meta: 'textScore' } })
-      .populate('uploadedBy', 'username');
+    const { Op } = require('sequelize');
+    const torrents = await Transfer.findAll({
+      where: { name: { [Op.iLike]: `%${q}%` } },
+      include: [{ model: User, as: 'uploader', attributes: ['username'] }]
+    });
 
     // Merge with live engine stats
     const mergedTorrents = torrents.map(torrent => {
-      const engineTorrent = defaultEngine.getTorrent(torrent.infoHash);
+      const engineTorrent = defaultEngine.getTorrent(torrent.info_hash);
       return mergeTorrentData(torrent, engineTorrent);
     });
 
@@ -430,9 +426,9 @@ exports.startTorrent = async (req, res) => {
     
     let dbTorrent;
     if (isValidObjectId(id)) {
-      dbTorrent = await Torrent.findById(id);
+      dbTorrent = await Transfer.findByPk(id);
     } else {
-      dbTorrent = await Torrent.findOne({ infoHash: id.toLowerCase() });
+      dbTorrent = await Transfer.findOne({ where: { info_hash: id.toLowerCase() } });
     }
 
     if (!dbTorrent) {
@@ -440,7 +436,7 @@ exports.startTorrent = async (req, res) => {
     }
 
     // Get from engine
-    let engineTorrent = defaultEngine.getTorrent(dbTorrent.infoHash);
+    let engineTorrent = defaultEngine.getTorrent(dbTorrent.info_hash);
     
     if (!engineTorrent) {
       return res.status(400).json({ 
@@ -451,9 +447,8 @@ exports.startTorrent = async (req, res) => {
     // Start the torrent
     await engineTorrent.start();
     
-    // Update MongoDB status
-    dbTorrent.status = 'downloading';
-    await dbTorrent.save();
+    // Update DB status
+    await Transfer.update({ status: 'downloading' }, { where: { id: dbTorrent.id } });
 
     console.log(`[TorrentController] Started torrent: ${dbTorrent.name}`);
     
@@ -471,9 +466,9 @@ exports.pauseTorrent = async (req, res) => {
     
     let dbTorrent;
     if (isValidObjectId(id)) {
-      dbTorrent = await Torrent.findById(id);
+      dbTorrent = await Transfer.findByPk(id);
     } else {
-      dbTorrent = await Torrent.findOne({ infoHash: id.toLowerCase() });
+      dbTorrent = await Transfer.findOne({ where: { info_hash: id.toLowerCase() } });
     }
 
     if (!dbTorrent) {
@@ -481,7 +476,7 @@ exports.pauseTorrent = async (req, res) => {
     }
 
     // Get from engine
-    const engineTorrent = defaultEngine.getTorrent(dbTorrent.infoHash);
+    const engineTorrent = defaultEngine.getTorrent(dbTorrent.info_hash);
     
     if (!engineTorrent) {
       return res.status(400).json({ 
@@ -492,18 +487,17 @@ exports.pauseTorrent = async (req, res) => {
     // Phase 2.1: Pause via Dispatcher (routes to Kafka or local engine)
     await defaultDispatcher.dispatch(
       DIRECTIVE_TYPES.JOB_PAUSED,
-      { infoHash: dbTorrent.infoHash },
+      { infoHash: dbTorrent.info_hash },
       { requestId: req.requestId }
     );
     
-    // Update MongoDB status
-    dbTorrent.status = 'paused';
-    await dbTorrent.save();
+    // Update DB status
+    await Transfer.update({ status: 'paused' }, { where: { id: dbTorrent.id } });
 
     console.log(`[TorrentController] [${req.requestId}] Paused torrent: ${dbTorrent.name}`);
     
     // Re-fetch engine state for response
-    const engineTorrentAfter = defaultEngine.getTorrent(dbTorrent.infoHash);
+    const engineTorrentAfter = defaultEngine.getTorrent(dbTorrent.info_hash);
     res.json(mergeTorrentData(dbTorrent, engineTorrentAfter));
   } catch (error) {
     console.error('[TorrentController] pauseTorrent error:', error);
@@ -519,16 +513,16 @@ exports.resumeTorrent = async (req, res) => {
 
     let dbTorrent;
     if (isValidObjectId(id)) {
-      dbTorrent = await Torrent.findById(id);
+      dbTorrent = await Transfer.findByPk(id);
     } else {
-      dbTorrent = await Torrent.findOne({ infoHash: id.toLowerCase() });
+      dbTorrent = await Transfer.findOne({ where: { info_hash: id.toLowerCase() } });
     }
 
     if (!dbTorrent) {
       return res.status(404).json({ message: 'Torrent not found' });
     }
 
-    const engineTorrent = defaultEngine.getTorrent(dbTorrent.infoHash);
+    const engineTorrent = defaultEngine.getTorrent(dbTorrent.info_hash);
 
     if (!engineTorrent) {
       return res.status(400).json({
@@ -539,14 +533,13 @@ exports.resumeTorrent = async (req, res) => {
     // ── Phase 1.3: CAS-aware resume ────────────────────────────────────────
     let resumeContext = null;
     try {
-      resumeContext = await ResumeService.getResumeContext(dbTorrent.infoHash);
+      resumeContext = await ResumeService.getResumeContext(dbTorrent.info_hash);
 
       if (resumeContext) {
         if (resumeContext.isFullyVerified) {
           // All chunks verified in DB — nothing to re-download
-          console.log(`[TorrentController] [${requestId}] All chunks verified for ${dbTorrent.infoHash}, skipping re-download`);
-          dbTorrent.status = 'completed';
-          await dbTorrent.save();
+          console.log(`[TorrentController] [${requestId}] All chunks verified for ${dbTorrent.info_hash}, skipping re-download`);
+          await Transfer.update({ status: 'completed' }, { where: { id: dbTorrent.id } });
           return res.json({
             ...mergeTorrentData(dbTorrent, engineTorrent),
             resumeContext: { isFullyVerified: true, verifiedChunks: resumeContext.totalTracked }
@@ -555,7 +548,7 @@ exports.resumeTorrent = async (req, res) => {
 
         // Reset any failed chunks so they will be re-attempted
         if (resumeContext.failedIndices.length > 0) {
-          await ResumeService.resetFailedChunks(dbTorrent.infoHash);
+          await ResumeService.resetFailedChunks(dbTorrent.info_hash);
           console.log(`[TorrentController] [${requestId}] Reset ${resumeContext.failedIndices.length} failed chunks for retry`);
         }
 
@@ -573,13 +566,12 @@ exports.resumeTorrent = async (req, res) => {
     // Phase 2.1: Resume via Dispatcher
     await defaultDispatcher.dispatch(
       DIRECTIVE_TYPES.JOB_RESUMED,
-      { infoHash: dbTorrent.infoHash },
+      { infoHash: dbTorrent.info_hash },
       { requestId }
     );
 
-    // Update MongoDB status
-    dbTorrent.status = 'downloading';
-    await dbTorrent.save();
+    // Update DB status
+    await Transfer.update({ status: 'downloading' }, { where: { id: dbTorrent.id } });
 
     console.log(`[TorrentController] [${requestId}] Resumed torrent: ${dbTorrent.name}`);
 
@@ -607,9 +599,9 @@ exports.getTorrentStats = async (req, res) => {
     
     let dbTorrent;
     if (isValidObjectId(id)) {
-      dbTorrent = await Torrent.findById(id);
+      dbTorrent = await Transfer.findByPk(id);
     } else {
-      dbTorrent = await Torrent.findOne({ infoHash: id.toLowerCase() });
+      dbTorrent = await Transfer.findOne({ where: { info_hash: id.toLowerCase() } });
     }
 
     if (!dbTorrent) {
@@ -617,7 +609,7 @@ exports.getTorrentStats = async (req, res) => {
     }
 
     // Get from engine
-    const engineTorrent = defaultEngine.getTorrent(dbTorrent.infoHash);
+    const engineTorrent = defaultEngine.getTorrent(dbTorrent.info_hash);
     
     if (!engineTorrent) {
       // Torrent is saved in DB but not currently loaded in the engine.
@@ -656,29 +648,25 @@ exports.getFiles = async (req, res) => {
     
     let dbTorrent;
     if (isValidObjectId(id)) {
-      dbTorrent = await Torrent.findById(id);
+      dbTorrent = await Transfer.findByPk(id);
     } else {
-      dbTorrent = await Torrent.findOne({ infoHash: id.toLowerCase() });
+      dbTorrent = await Transfer.findOne({ where: { info_hash: id.toLowerCase() } });
     }
 
     if (!dbTorrent) {
       return res.status(404).json({ message: 'Torrent not found' });
     }
 
-    const engineTorrent = defaultEngine.getTorrent(dbTorrent.infoHash);
+    const engineTorrent = defaultEngine.getTorrent(dbTorrent.info_hash);
     
     if (!engineTorrent) {
       // Return files from DB if engine not running
+      // We don't have files directly in the DB currently, they belong to chunks
+      // Return empty files array
       return res.json({
-        files: dbTorrent.files.map((f, index) => ({
-          index,
-          name: f.name,
-          path: f.path,
-          length: f.size,
-          selected: true
-        })),
-        selectedCount: dbTorrent.files.length,
-        totalCount: dbTorrent.files.length
+        files: [],
+        selectedCount: 0,
+        totalCount: 0
       });
     }
 
@@ -704,16 +692,16 @@ exports.selectFiles = async (req, res) => {
     
     let dbTorrent;
     if (isValidObjectId(id)) {
-      dbTorrent = await Torrent.findById(id);
+      dbTorrent = await Transfer.findByPk(id);
     } else {
-      dbTorrent = await Torrent.findOne({ infoHash: id.toLowerCase() });
+      dbTorrent = await Transfer.findOne({ where: { info_hash: id.toLowerCase() } });
     }
 
     if (!dbTorrent) {
       return res.status(404).json({ message: 'Torrent not found' });
     }
 
-    const engineTorrent = defaultEngine.getTorrent(dbTorrent.infoHash);
+    const engineTorrent = defaultEngine.getTorrent(dbTorrent.info_hash);
     
     if (!engineTorrent) {
       return res.status(400).json({ message: 'Torrent not running in engine' });
@@ -928,13 +916,13 @@ exports.createTorrentFromFile = async (req, res) => {
     // Check by infoHash — if same file + same name was already uploaded,
     // this catches it. We return the existing record so the client can
     // reuse the magnet link immediately rather than re-uploading.
-    const existing = await Torrent.findOne({ infoHash: created.infoHash });
+    const existing = await Transfer.findOne({ where: { info_hash: created.infoHash.toLowerCase() } });
     if (existing) {
       return res.status(409).json({
         error:    'This exact file has already been added (same content and name).',
         hint:     'Use the existing magnet link below to share it.',
         infoHash: created.infoHash,
-        magnetURI: existing.magnetURI || created.magnetURI,
+        magnetURI: existing.magnet_uri || created.magnetURI,
         torrent:  existing,
       });
     }
@@ -959,40 +947,22 @@ exports.createTorrentFromFile = async (req, res) => {
     console.log(`[TorrentController] Saved source file  : ${savedSourcePath}`);
     console.log(`[TorrentController] Saved .torrent file: ${savedTorrentPath}`);
 
-    // ── 8. Save to MongoDB ──────────────────────────────────────────────────
-    const torrent = new Torrent({
-      name:              created.name,
-      infoHash:          created.infoHash,
-      magnetURI:         created.magnetURI,
-      size:              created.fileSize,
-      trackers:          created.trackers,
-      uploadedBy:        req.user.userId || req.user.id,
-      status:            'seeding',
-      progress:          100,
-      sourcePath:        savedSourcePath,
-      torrentFilePath:   savedTorrentPath,
-      createdFromUpload: true,
-      files: [{
-        name: created.name,
-        size: created.fileSize,
-        path: savedSourcePath,
-      }],
-    });
-
-    await torrent.save();
-
-    // ── 8.1 Dual Write to PostgreSQL & Initialize CAS Chunks ────────────────
+    // ── 8. Save to DB & Initialize CAS Chunks ───────────────────────────────
+    let torrent;
     try {
-      const sqlTransfer = await Transfer.create({
+      torrent = await Transfer.create({
         name: created.name,
-        info_hash: created.infoHash,
+        info_hash: created.infoHash.toLowerCase(),
         magnet_uri: created.magnetURI,
         size_bytes: created.fileSize,
-        status: 'seeding'
+        status: 'seeding',
+        progress: 100,
+        uploaded_by: req.user.userId || req.user.id,
+        source_path: savedSourcePath
       });
       
       if (created.chunkHashes && created.chunkHashes.length > 0) {
-        await Checkpointer.initializeChunks(created.infoHash, created.chunkHashes, sqlTransfer.id);
+        await Checkpointer.initializeChunks(created.infoHash, created.chunkHashes, torrent.id);
         
         // Since we are creating from an existing local file (seeding), verify all immediately via bulk update
         await Checkpointer.markChunksVerifiedBulk(created.infoHash, created.chunkHashes);
@@ -1028,9 +998,9 @@ exports.createTorrentFromFile = async (req, res) => {
         }
 
         // Also update DB status to seeding
-        await Torrent.findOneAndUpdate(
-          { infoHash: created.infoHash },
-          { status: 'seeding', progress: 100 }
+        await Transfer.update(
+          { status: 'seeding', progress: 100 },
+          { where: { info_hash: created.infoHash.toLowerCase() } }
         );
       } catch (err) {
         // Don't crash — torrent is already saved, user has the magnet link
@@ -1050,7 +1020,7 @@ exports.createTorrentFromFile = async (req, res) => {
       torrentFile:     created.torrentBuffer.toString('base64'),
       sourcePath:      savedSourcePath,
       torrentFilePath: savedTorrentPath,
-      torrent:         { ...torrent.toObject(), isOwner: true },  // 5.3
+      torrent:         { ...(torrent ? torrent.toJSON() : {}), isOwner: true },  // 5.3
     };
 
     // Attach warnings if any (non-blocking)
@@ -1075,8 +1045,8 @@ exports.getGlobalStats = async (req, res) => {
   try {
     const globalStats = defaultEngine.getGlobalStats();
     
-    // Add MongoDB info
-    const totalInDb = await Torrent.countDocuments();
+    // Add DB info
+    const totalInDb = await Transfer.count();
     
     res.json({
       ...globalStats,

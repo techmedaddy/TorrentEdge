@@ -62,6 +62,9 @@ class WorkerConsumer extends EventEmitter {
     this._dedup = new DeduplicationService({
       downloadPath: opts.engine?.downloadPath || process.env.DOWNLOAD_PATH || './downloads',
     });
+
+    // Flow control backpressure
+    this._isPaused = false;
   }
 
   /**
@@ -386,6 +389,22 @@ class WorkerConsumer extends EventEmitter {
 
     this._heartbeatTimer = setInterval(async () => {
       const stats = this._engine ? this._engine.getGlobalStats() : {};
+      const activeTorrentsCount = stats.activeTorrents || 0;
+
+      // --- Flow Control / Backpressure Implementation ---
+      if (this._consumer) {
+        const maxCapacity = parseInt(process.env.WORKER_MAX_CAPACITY, 10) || 20;
+        
+        if (activeTorrentsCount >= maxCapacity && !this._isPaused) {
+          console.warn(`[Worker:${this._nodeId}] BACKPRESSURE: Node at capacity (${activeTorrentsCount}/${maxCapacity}). Pausing Kafka consumption.`);
+          this._consumer.pause([{ topic: TOPICS.JOB_DISPATCH }]);
+          this._isPaused = true;
+        } else if (activeTorrentsCount < maxCapacity * 0.8 && this._isPaused) {
+          console.log(`[Worker:${this._nodeId}] BACKPRESSURE: Capacity available (${activeTorrentsCount}/${maxCapacity}). Resuming Kafka consumption.`);
+          this._consumer.resume([{ topic: TOPICS.JOB_DISPATCH }]);
+          this._isPaused = false;
+        }
+      }
 
       // Phase 2.2: Bulk renew leases for all active torrents in a single pipeline
       // Phase 4.1: Refresh peer registry TTLs

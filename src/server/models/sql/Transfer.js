@@ -25,7 +25,7 @@ const Transfer = sequelize.define('Transfer', {
     allowNull: false
   },
   status: {
-    type: DataTypes.ENUM('created', 'queued', 'in_progress', 'paused', 'completed', 'failed'),
+    type: DataTypes.ENUM('created', 'queued', 'in_progress', 'paused', 'completed', 'failed', 'downloading', 'seeding', 'pending', 'fetching_metadata', 'idle', 'checking', 'error'),
     defaultValue: 'created'
   },
   priority: {

@@ -3,7 +3,7 @@ const router = express.Router();
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { OAuth2Client } = require('google-auth-library');
-const User = require('../models/User');
+const { User } = require('../models/sql');
 const { body, validationResult } = require('express-validator');
 const winston = require('winston');
 const authController = require('../controllers/authController');
@@ -30,7 +30,7 @@ const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 // Helper function to generate JWT token
 const generateToken = (user) => {
   return jwt.sign(
-    { userId: user._id, username: user.username, email: user.email },
+    { userId: user.id, username: user.username, email: user.email },
     process.env.JWT_SECRET,
     { expiresIn: '7d' }
   );
@@ -57,30 +57,29 @@ router.post('/google', async (req, res) => {
     logger.info(`Google auth attempt for: ${email}`);
 
     // Check if user exists by googleId
-    let user = await User.findOne({ googleId });
+    let user = await User.findOne({ where: { google_id: googleId } });
 
     if (!user) {
       // Check if user exists by email (link accounts)
-      user = await User.findOne({ email });
+      user = await User.findOne({ where: { email } });
 
       if (user) {
         // Link Google to existing account
-        user.googleId = googleId;
+        user.google_id = googleId;
         user.avatar = picture;
-        user.authProvider = user.authProvider === 'local' ? 'local' : 'google';
+        user.auth_provider = user.auth_provider === 'local' ? 'local' : 'google';
         await user.save();
         logger.info(`Linked Google account to existing user: ${email}`);
       } else {
         // Create new user
         const username = email.split('@')[0] + '_' + Math.random().toString(36).slice(-4);
-        user = new User({
+        user = await User.create({
           username,
           email,
-          googleId,
+          google_id: googleId,
           avatar: picture,
-          authProvider: 'google'
+          auth_provider: 'google'
         });
-        await user.save();
         logger.info(`Created new Google user: ${email}`);
       }
     }
@@ -91,11 +90,11 @@ router.post('/google', async (req, res) => {
     res.json({
       token,
       user: {
-        id: user._id,
+        id: user.id,
         username: user.username,
         email: user.email,
         avatar: user.avatar,
-        authProvider: user.authProvider
+        authProvider: user.auth_provider
       }
     });
 
@@ -160,14 +159,14 @@ router.post(
     try {
       logger.info(`Login attempt for email: ${email}`);
 
-      const user = await User.findOne({ email });
+      const user = await User.findOne({ where: { email } });
 
       if (!user) {
         logger.warn(`User not found: ${email}`);
         return res.status(401).json({ message: 'Invalid credentials.' });
       }
 
-      const isMatch = await bcrypt.compare(password, user.password);
+      const isMatch = await user.comparePassword(password);
 
       if (!isMatch) {
         logger.warn(`Invalid password for user: ${email}`);
@@ -175,7 +174,7 @@ router.post(
       }
 
       const token = jwt.sign(
-        { userId: user._id, username: user.username, email: user.email },
+        { userId: user.id, username: user.username, email: user.email },
         process.env.JWT_SECRET,
         { expiresIn: '1h' }
       );

@@ -7,7 +7,7 @@ exports.getUserProfile = async (req, res) => {
         if (!user) {
             return res.status(404).json({ message: 'User not found' });
         }
-        res.json(user);
+        res.json({ ...user.toJSON(), _id: user.id });
     } catch (error) {
         res.status(500).json({ message: 'Server error: ' + error.message });
     }
@@ -32,7 +32,7 @@ exports.updateUserProfile = async (req, res) => {
         if (!user) {
             return res.status(404).json({ message: 'User not found' });
         }
-        res.json(user);
+        res.json({ ...user.toJSON(), _id: user.id });
     } catch (error) {
         res.status(500).json({ message: 'Server error: ' + error.message });
     }

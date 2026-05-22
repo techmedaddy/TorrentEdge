@@ -42,6 +42,7 @@ const mergeTorrentData = (dbTorrent, engineTorrent) => {
   const stats = engineTorrent.getStats();
   return {
     ...data,
+    _id: data.id || data._id, // Map id to _id for frontend compatibility
     status: stats.state,
     progress: stats.percentage,
     downloadSpeed: stats.downloadSpeed,
@@ -861,6 +862,7 @@ exports.createTorrentFromFile = async (req, res) => {
 
     // ── 5. Create .torrent from file ────────────────────────────────────────
     const { createTorrentWithMagnet } = require('../torrentEngine/torrentCreator');
+    const fileBuffer = await fs.readFile(uploadedFilePath);
 
     // Throttle progress broadcasts — emit at most once every 100ms and
     // only when progress actually changes by ≥1% to avoid flooding the socket.

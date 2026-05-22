@@ -25,7 +25,11 @@ const logger = winston.createLogger({
 if (!process.env.GOOGLE_CLIENT_ID) {
   logger.warn('GOOGLE_CLIENT_ID not found in environment variables. Google login may fail.');
 }
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+const googleClient = new OAuth2Client(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  process.env.GOOGLE_CALLBACK_URL || 'http://localhost:3029/auth/google/callback'
+);
 
 // Helper function to generate JWT token
 const generateToken = (user) => {
@@ -120,6 +124,96 @@ router.post('/google', async (req, res) => {
       message: 'Google authentication failed.',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
+  }
+});
+
+// GET /api/auth/google/redirect - Server-side OAuth 2.0 redirect flow
+// Bypasses the GSI iframe button which Chrome can block on http:// origins
+router.get('/google/redirect', (req, res) => {
+  const clientId = (process.env.GOOGLE_CLIENT_ID || '').trim();
+  const callbackUrl = (process.env.GOOGLE_CALLBACK_URL || 'http://localhost:3029/auth/google/callback').trim();
+  
+  console.log('[Google OAuth] Redirect URI being sent:', callbackUrl);
+  
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: callbackUrl,
+    response_type: 'code',
+    scope: 'openid email profile',
+    access_type: 'offline',
+    prompt: 'select_account',
+  });
+
+  res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+});
+
+// GET /api/auth/google/callback - Handle Google OAuth callback
+router.get('/google/callback', async (req, res) => {
+  const { code, error: oauthError } = req.query;
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+
+  if (oauthError) {
+    logger.error(`Google OAuth error: ${oauthError}`);
+    return res.redirect(`${frontendUrl}?auth_error=${encodeURIComponent(oauthError)}`);
+  }
+
+  if (!code) {
+    return res.redirect(`${frontendUrl}?auth_error=no_code`);
+  }
+
+  try {
+    const callbackUrl = (process.env.GOOGLE_CALLBACK_URL || 'http://localhost:3029/auth/google/callback').trim();
+
+    // Exchange authorization code for tokens
+    const { tokens } = await googleClient.getToken({
+      code,
+      redirect_uri: callbackUrl,
+    });
+
+    // Verify the ID token
+    const ticket = await googleClient.verifyIdToken({
+      idToken: tokens.id_token,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+
+    const payload = ticket.getPayload();
+    const { sub: googleId, email, name, picture } = payload;
+
+    logger.info(`Google OAuth callback for: ${email}`);
+
+    // Find or create user (same logic as POST /google)
+    let user = await User.findOne({ where: { google_id: googleId } });
+
+    if (!user) {
+      user = await User.findOne({ where: { email } });
+
+      if (user) {
+        user.google_id = googleId;
+        user.avatar = picture;
+        user.auth_provider = user.auth_provider === 'local' ? 'local' : 'google';
+        await user.save();
+        logger.info(`Linked Google account to existing user: ${email}`);
+      } else {
+        const username = email.split('@')[0] + '_' + Math.random().toString(36).slice(-4);
+        user = await User.create({
+          username,
+          email,
+          google_id: googleId,
+          avatar: picture,
+          auth_provider: 'google'
+        });
+        logger.info(`Created new Google user: ${email}`);
+      }
+    }
+
+    // Generate JWT
+    const token = generateToken(user);
+
+    // Redirect back to frontend with token in URL fragment (not query param for security)
+    res.redirect(`${frontendUrl}?token=${encodeURIComponent(token)}`);
+  } catch (error) {
+    logger.error('Google OAuth callback error:', error);
+    res.redirect(`${frontendUrl}?auth_error=${encodeURIComponent('Authentication failed')}`);
   }
 });
 

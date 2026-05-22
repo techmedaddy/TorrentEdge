@@ -156,6 +156,7 @@ app.get('/api/metrics', metricsHandler);
 
 // Routes
 app.use('/api/auth', require('./routes/authRoutes'));
+app.use('/auth', require('./routes/authRoutes')); // Also mount at /auth for Google OAuth callback compatibility
 app.use('/api/user', require('./routes/userRoutes'));
 app.use('/api/torrent', require('./routes/torrentRoutes'));
 app.use('/api/statistics', require('./routes/statisticsRoutes'));

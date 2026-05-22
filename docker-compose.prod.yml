@@ -36,24 +36,6 @@ services:
       retries: 5
       start_period: 30s
 
-  mongodb:
-    image: mongo:6.0
-    container_name: torrentedge-mongodb
-    restart: unless-stopped
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-root}
-      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?MONGO_ROOT_PASSWORD is required}
-      MONGO_INITDB_DATABASE: torrentedge
-    volumes:
-      - mongo-data:/data/db
-    networks:
-      - app-network
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
   backend:
     build:
       context: ./src/server
@@ -64,12 +46,9 @@ services:
     environment:
       - NODE_ENV=production
       - PORT=3029
-      - MONGODB_URI=mongodb://${MONGO_ROOT_USER:-root}:${MONGO_ROOT_PASSWORD}@mongodb:27017/torrentedge?authSource=admin
       - KAFKA_BROKERS=kafka:9092
     depends_on:
       kafka:
-        condition: service_healthy
-      mongodb:
         condition: service_healthy
     networks:
       - app-network
@@ -116,7 +95,5 @@ networks:
     driver: bridge
 
 volumes:
-  mongo-data:
-    driver: local
   torrent-downloads:
     driver: local

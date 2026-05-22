@@ -47,7 +47,6 @@ services:
       - .env
     environment:
       - PORT=3029
-      - MONGODB_URI=mongodb://root:example@mongodb:27017/torrentedge?authSource=admin
       - KAFKA_BROKERS=kafka:9092
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
@@ -60,8 +59,6 @@ services:
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
     depends_on:
       kafka:
-        condition: service_healthy
-      mongodb:
         condition: service_healthy
       postgres:
         condition: service_healthy
@@ -94,24 +91,7 @@ services:
       - app-network
       - kafka-network
 
-  mongodb:
-    image: mongo:6.0
-    container_name: torrentedge-mongodb
-    ports:
-      - "3030:27017"
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: root
-      MONGO_INITDB_ROOT_PASSWORD: example
-      MONGO_INITDB_DATABASE: torrentedge
-    volumes:
-      - mongo-data:/data/db
-    networks:
-      - app-network
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+
 
   postgres:
     image: postgres:15-alpine
@@ -220,8 +200,6 @@ networks:
     driver: bridge
 
 volumes:
-  mongo-data:
-    driver: local
   postgres-data:
     driver: local
   torrent-downloads:

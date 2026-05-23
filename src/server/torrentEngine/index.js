@@ -86,6 +86,12 @@ const defaultWorker = new WorkerConsumer({
   } : null,
 });
 
+const LeaseSweeper = require('./leaseSweeper');
+const defaultSweeper = new LeaseSweeper({
+  dispatcher: defaultDispatcher,
+  intervalMs: 30000,
+});
+
 module.exports = {
   // ===== Main Classes =====
   TorrentEngine,
@@ -151,6 +157,7 @@ module.exports = {
   WorkerConsumer,
   defaultDispatcher,
   defaultWorker,
+  defaultSweeper,
 
   // ===== Phase 4.1: Peer-Assisted Replication =====
   PeerRegistry,

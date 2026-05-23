@@ -145,7 +145,7 @@ app.use(
   })
 );
 
-const { defaultEngine, closeProducer, defaultWorker } = require('./torrentEngine');
+const { defaultEngine, closeProducer, defaultWorker, defaultSweeper } = require('./torrentEngine');
 
 const metricsHandler = createMetricsHandler({
   collect: () => observeEngineMetrics(defaultEngine, defaultWorker),
@@ -187,6 +187,11 @@ defaultWorker.start().catch(err => {
   logger.warn(`Embedded worker start failed (non-fatal): ${err.message}`);
 });
 
+// Phase 2.3: Start the Control Plane Zombie Sweeper
+if (process.env.RUN_AS_WORKER_ONLY !== 'true') {
+  defaultSweeper.start();
+}
+
 // Graceful Shutdown Handler
 let isShuttingDown = false;
 
@@ -227,6 +232,11 @@ async function gracefulShutdown(signal) {
     if (defaultWorker && typeof defaultWorker.stop === 'function') {
       await defaultWorker.stop();
       logger.info('Worker consumer stopped');
+    }
+
+    if (defaultSweeper && typeof defaultSweeper.stop === 'function') {
+      defaultSweeper.stop();
+      logger.info('Lease Sweeper stopped');
     }
 
 

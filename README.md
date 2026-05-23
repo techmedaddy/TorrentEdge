@@ -136,6 +136,8 @@ Core server entrypoints and modules:
 - Real-time demo (placeholder): add short screen capture showing Socket.IO progress + speed history.
 - Failure demo (placeholder): add runbook clip showing restart/resume behavior after process kill.
 
+![alt text](image.png)
+
 ## 11) How to run
 
 ### Local

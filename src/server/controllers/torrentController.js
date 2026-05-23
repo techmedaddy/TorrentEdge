@@ -28,6 +28,7 @@ const fs = require('fs').promises;
 const Checkpointer = require('../torrentEngine/checkpointer'); // Phase 1.2 CAS
 const ResumeService = require('../torrentEngine/resumeService'); // Phase 1.3 Idempotent Resume
 const { defaultDispatcher, DIRECTIVE_TYPES } = require('../torrentEngine'); // Phase 2.1 Dispatcher
+const { parseTorrent } = require('../torrentEngine/torrentParser');
 
 // Helper to validate UUID
 const isValidObjectId = (id) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
@@ -35,14 +36,21 @@ const isValidObjectId = (id) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab
 // Helper to merge PostgreSQL data with live engine stats
 const mergeTorrentData = (dbTorrent, engineTorrent) => {
   const data = dbTorrent.toJSON ? dbTorrent.toJSON() : dbTorrent;
+  
+  // Always map id to _id and info_hash to infoHash for frontend compatibility
+  const mappedData = {
+    ...data,
+    _id: data.id || data._id,
+    infoHash: data.info_hash || data.infoHash
+  };
+
   if (!engineTorrent) {
-    return data;
+    return mappedData;
   }
 
   const stats = engineTorrent.getStats();
   return {
-    ...data,
-    _id: data.id || data._id, // Map id to _id for frontend compatibility
+    ...mappedData,
     status: stats.state,
     progress: stats.percentage,
     downloadSpeed: stats.downloadSpeed,
@@ -660,18 +668,40 @@ exports.getFiles = async (req, res) => {
 
     const engineTorrent = defaultEngine.getTorrent(dbTorrent.info_hash);
     
-    if (!engineTorrent) {
-      // Return files from DB if engine not running
-      // We don't have files directly in the DB currently, they belong to chunks
-      // Return empty files array
-      return res.json({
-        files: [],
-        selectedCount: 0,
-        totalCount: 0
-      });
+    let files = [];
+    if (engineTorrent) {
+      files = engineTorrent.getFilesWithSelection();
+    } else {
+      if (dbTorrent.torrent_file_path) {
+        // Container was restarted, engine memory is empty. Parse the .torrent file directly.
+        try {
+          const torrentBuffer = await fs.readFile(dbTorrent.torrent_file_path);
+          const parsed = parseTorrent(torrentBuffer);
+          const rawFiles = parsed.files || [{ path: parsed.name, length: parsed.length }];
+          files = rawFiles.map((f, index) => ({
+            index,
+            path: f.path,
+            name: Array.isArray(f.path) ? f.path[f.path.length - 1] : f.path,
+            length: f.length,
+            selected: true
+          }));
+        } catch (err) {
+          console.error('[TorrentController] Failed to parse .torrent fallback:', err);
+        }
+      }
+
+      // If we still have no files (e.g. magnet link without saved metadata), synthesize it from the database record
+      if (files.length === 0) {
+        files = [{
+          index: 0,
+          path: dbTorrent.name,
+          name: dbTorrent.name,
+          length: dbTorrent.size_bytes || 0,
+          selected: true
+        }];
+      }
     }
 
-    const files = engineTorrent.getFilesWithSelection();
     const selectedCount = files.filter(f => f.selected).length;
     
     res.json({
@@ -1056,6 +1086,114 @@ exports.getGlobalStats = async (req, res) => {
     });
   } catch (error) {
     console.error('[TorrentController] getGlobalStats error:', error);
+    res.status(500).json({ message: 'Server error: ' + error.message });
+  }
+};
+
+// ─── Direct File Download ──────────────────────────────────────────────────────
+
+// Download a specific file from a completed torrent
+exports.downloadTorrentFile = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const fileIndex = parseInt(req.query.fileIndex || 0, 10);
+    
+    let dbTorrent;
+    if (isValidObjectId(id)) {
+      dbTorrent = await Transfer.findByPk(id);
+    } else {
+      dbTorrent = await Transfer.findOne({ where: { info_hash: id.toLowerCase() } });
+    }
+
+    if (!dbTorrent) {
+      return res.status(404).json({ message: 'Torrent not found' });
+    }
+
+    if (dbTorrent.status !== 'completed' && dbTorrent.status !== 'seeding') {
+      return res.status(400).json({ message: 'Torrent has not finished downloading yet' });
+    }
+
+    const engineTorrent = defaultEngine.getTorrent(dbTorrent.info_hash);
+    
+    let files = [];
+    if (engineTorrent) {
+      files = engineTorrent.getFilesWithSelection();
+    } else {
+      if (dbTorrent.torrent_file_path) {
+        try {
+          const torrentBuffer = await fs.readFile(dbTorrent.torrent_file_path);
+          const parsed = parseTorrent(torrentBuffer);
+          const rawFiles = parsed.files || [{ path: parsed.name, length: parsed.length }];
+          files = rawFiles.map((f, index) => ({
+            index,
+            path: f.path,
+            name: Array.isArray(f.path) ? f.path[f.path.length - 1] : f.path,
+            length: f.length,
+            selected: true
+          }));
+        } catch (err) {
+          console.error('[TorrentController] Failed to parse .torrent fallback:', err);
+        }
+      }
+
+      // If we still have no files, synthesize it from the database record
+      if (files.length === 0) {
+        files = [{
+          index: 0,
+          path: dbTorrent.name,
+          name: dbTorrent.name,
+          length: dbTorrent.size_bytes || 0,
+          selected: true
+        }];
+      }
+    }
+
+    if (files.length === 0) {
+      return res.status(400).json({ message: 'Torrent not active in engine and no metadata could be reconstructed' });
+    }
+
+    if (fileIndex < 0 || fileIndex >= files.length) {
+      return res.status(404).json({ message: 'File index out of bounds' });
+    }
+
+    const selectedFile = files[fileIndex];
+    const baseDir = process.env.DOWNLOAD_PATH || './downloads';
+    
+    // Construct the absolute path based on the torrent's directory structure
+    const relativePath = Array.isArray(selectedFile.path) ? selectedFile.path.join(path.sep) : selectedFile.path;
+    let absolutePath = path.resolve(baseDir, relativePath);
+    const seedPath = path.resolve(baseDir, 'seeds', relativePath);
+    const sourcePath = dbTorrent.source_path ? path.resolve(dbTorrent.source_path) : null;
+
+    let finalPath = null;
+
+    // Check where the file actually lives
+    const pathsToTry = [absolutePath, seedPath];
+    if (sourcePath) pathsToTry.push(sourcePath);
+
+    for (const p of pathsToTry) {
+      try {
+        await fs.access(p);
+        finalPath = p;
+        break;
+      } catch (e) {
+        // Continue to next path
+      }
+    }
+
+    if (!finalPath) {
+      return res.status(404).json({ message: 'File not found on disk. Ensure worker has completed the transfer.' });
+    }
+
+    res.download(finalPath, selectedFile.name, (err) => {
+      if (err) {
+        console.error('[TorrentController] File download error:', err);
+        if (!res.headersSent) res.status(500).json({ message: 'Failed to download file' });
+      }
+    });
+
+  } catch (error) {
+    console.error('[TorrentController] downloadTorrentFile error:', error);
     res.status(500).json({ message: 'Server error: ' + error.message });
   }
 };

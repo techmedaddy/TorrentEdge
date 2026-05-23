@@ -164,6 +164,8 @@ This brings up backend + MongoDB + Kafka + Zookeeper + Nginx using [docker-compo
 npm test
 ```
 
+![alt text](image-1.png)
+
 ## 12) Project structure (brief)
 
 - [src/server](src/server): Express server, auth, REST routes, controllers.

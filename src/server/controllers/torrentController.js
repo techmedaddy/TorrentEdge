@@ -2,7 +2,7 @@
  * Torrent Controller
  * 
  * Manages torrent operations using the integrated BitTorrent engine.
- * All torrents are stored in MongoDB for persistence and merged with
+ * All torrents are stored in PostgreSQL for persistence and merged with
  * live engine stats for real-time data.
  * 
  * API Endpoints:
@@ -32,7 +32,7 @@ const { defaultDispatcher, DIRECTIVE_TYPES } = require('../torrentEngine'); // P
 // Helper to validate UUID
 const isValidObjectId = (id) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
 
-// Helper to merge MongoDB data with live engine stats
+// Helper to merge PostgreSQL data with live engine stats
 const mergeTorrentData = (dbTorrent, engineTorrent) => {
   const data = dbTorrent.toJSON ? dbTorrent.toJSON() : dbTorrent;
   if (!engineTorrent) {

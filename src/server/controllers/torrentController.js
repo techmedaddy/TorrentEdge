@@ -235,17 +235,46 @@ exports.createTorrent = async (req, res) => {
         engineTorrent = allTorrents[allTorrents.length - 1];
       }
     } catch (error) {
-      console.error('[TorrentController] Dispatcher error:', error);
-      
-      // Clean up saved file
+      // Clean up saved file on any error
       if (torrentPath) {
         await fs.unlink(torrentPath).catch(() => {});
       }
-      
-      if (error.message.includes('already exists')) {
-        return res.status(400).json({ message: 'Torrent already exists' });
+
+      if (error.message && error.message.toLowerCase().includes('already exists')) {
+        // The engine already has this torrent in memory (e.g. from a previous run
+        // that wasn't fully cleaned up, or a race condition under load).
+        // This is NOT a client error — it is expected idempotent behavior.
+        // Recover gracefully: return the existing record with 200.
+        try {
+          const { parseMagnet } = require('../torrentEngine/magnet');
+          const magnetInfo = magnetURI ? parseMagnet(magnetURI) : null;
+          const infoHash = magnetInfo?.infoHash?.toLowerCase();
+
+          if (infoHash) {
+            const existingTorrent = await Transfer.findOne({
+              where: { info_hash: infoHash },
+              include: [{ model: User, as: 'leechers', attributes: ['id'] }]
+            });
+
+            if (existingTorrent) {
+              const userId = req.user.userId || req.user.id;
+              const isOwner = existingTorrent.uploaded_by === userId;
+              const engineTorrent = defaultEngine.getTorrent(infoHash);
+              const merged = mergeTorrentData(existingTorrent, engineTorrent);
+              merged.isOwner = isOwner;
+              console.log(`[TorrentController] Idempotent recovery: returning existing record for ${infoHash.substring(0, 12)}`);
+              return res.status(200).json({ message: 'Already exists', torrent: merged });
+            }
+          }
+        } catch (recoveryErr) {
+          console.warn(`[TorrentController] Recovery lookup failed: ${recoveryErr.message}`);
+        }
+
+        // If DB lookup also fails, return a clean 409 rather than a 400 or 500
+        return res.status(409).json({ message: 'Transfer already in progress on this node' });
       }
-      
+
+      console.error('[TorrentController] Dispatcher error:', error);
       throw error;
     }
 

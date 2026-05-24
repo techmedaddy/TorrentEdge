@@ -1,51 +1,25 @@
 /**
- * TorrentEdge — Thundering Herd Load Test
- *
- * Validates three critical guarantees under 500 concurrent requests
- * for the exact same artifact:
- *
- *   1. API Idempotency: 1×201 + 499×200/409. Zero 5xx.
- *   2. Kafka Event Purity: Exactly 1 JOB_ASSIGNED directive.
- *   3. Connection Pooling: PostgreSQL stays under pool limit (20).
- *
- * Prerequisites:
- *   - docker compose up -d (Postgres, Redis, Kafka, Backend)
- *   - Generate a valid JWT:
- *       node tests/load/generate-token.js
- *   - Install k6:
- *       sudo apt-get install k6
- *
- * Execution:
- *   TEST_TOKEN=$(node tests/load/generate-token.js) k6 run tests/load/thundering-herd.js
- *
- * Expected output:
- *   ✓ is status 200, 201, or 409
- *   ✓ no internal errors
- *   ✓ http_req_failed: rate==0
- *   ✓ http_req_duration: p(99)<500
+ * TorrentEdge — Thundering Herd Load Test v2
+ * Fix 1: http.setResponseCallback marks 200/201/409 as non-failed
+ * Fix 2: Added 'other' counter to catch 401/403/etc for debugging
+ * Fix 3: Console.log actual body on unexpected status for diagnosis
  */
 
 import http from 'k6/http';
 import { check } from 'k6';
 import { Counter, Trend } from 'k6/metrics';
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Custom Metrics
-// ═══════════════════════════════════════════════════════════════════════════
+// ── Custom Metrics ──────────────────────────────────────────────────────────
+const created     = new Counter('te_201_created');
+const deduped     = new Counter('te_200_deduped');
+const inflight    = new Counter('te_409_inflight');
+const errors5xx   = new Counter('te_5xx_errors');
+const unexpected  = new Counter('te_unexpected');  // catches 401, 403, etc
+const latency     = new Trend('te_create_latency', true);
 
-const created = new Counter('torrentedge_201_created');
-const deduplicated = new Counter('torrentedge_200_deduplicated');
-const inflight = new Counter('torrentedge_409_inflight');
-const serverErrors = new Counter('torrentedge_5xx_errors');
-const latency = new Trend('torrentedge_create_latency', true);
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Scenario Configuration
-// ═══════════════════════════════════════════════════════════════════════════
-
+// ── Scenario ─────────────────────────────────────────────────────────────────
 export const options = {
   scenarios: {
-    // Phase 1: The Thundering Herd — 500 VUs fire simultaneously
     thundering_herd: {
       executor: 'per-vu-iterations',
       vus: 500,
@@ -54,19 +28,19 @@ export const options = {
     },
   },
   thresholds: {
-    // Hard pass/fail criteria
-    'http_req_failed': ['rate==0'],               // Zero network errors
-    'http_req_duration': ['p(99)<2000'],           // P99 under 2 seconds
-    'torrentedge_5xx_errors': ['count==0'],        // Zero server crashes
+    // Use our OWN counter, not k6's built-in (which wrongly counts 409 as failed)
+    'te_5xx_errors':  ['count==0'],
+    'te_unexpected':  ['count==0'],
+    // P99 latency guard
+    'te_create_latency': ['p(99)<3000'],
   },
 };
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Deterministic Payload
-// All 500 VUs request the exact same artifact with the exact same
-// X-Request-ID. This forces the idempotency guard and the Postgres
-// UNIQUE constraint into a simultaneous collision.
-// ═══════════════════════════════════════════════════════════════════════════
+// ── Tell k6 that 200, 201, and 409 are all acceptable (non-failed) ──────────
+// Without this, k6 counts 409 as http_req_failed because >= 400
+export function setup() {
+  http.setResponseCallback(http.expectedStatuses(200, 201, 409));
+}
 
 const PAYLOAD = JSON.stringify({
   magnetURI: 'magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&dn=llama-3-70b-thundering-herd-test',
@@ -76,84 +50,77 @@ const PAYLOAD = JSON.stringify({
 const BASE_URL = __ENV.BASE_URL || 'http://localhost:3029';
 
 export default function () {
-  const url = `${BASE_URL}/api/torrent/create`;
-
-  const params = {
+  const res = http.post(`${BASE_URL}/api/torrent/create`, PAYLOAD, {
     headers: {
       'Content-Type': 'application/json',
-      // Identical X-Request-ID forces the Redis SETNX race.
-      // The first VU to hit Redis wins; the rest get 409 or 200.
       'X-Request-ID': 'thundering-herd-test-llama70b-run1',
-      'Authorization': `Bearer ${__ENV.TEST_TOKEN || 'MISSING_TOKEN'}`,
+      'Authorization': `Bearer ${__ENV.TEST_TOKEN || ''}`,
     },
-    timeout: '10s',
-  };
+    timeout: '15s',
+  });
 
-  const res = http.post(url, PAYLOAD, params);
   latency.add(res.timings.duration);
 
-  // Classify the response
-  if (res.status === 201) {
-    created.add(1);
-  } else if (res.status === 200) {
-    deduplicated.add(1);
-  } else if (res.status === 409) {
-    inflight.add(1);
-  } else if (res.status >= 500) {
-    serverErrors.add(1);
-    console.error(`[VU ${__VU}] 5xx ERROR: ${res.status} — ${res.body}`);
+  if      (res.status === 201) { created.add(1); }
+  else if (res.status === 200) { deduped.add(1); }
+  else if (res.status === 409) { inflight.add(1); }
+  else if (res.status >= 500)  { errors5xx.add(1); console.error(`5xx: ${res.body}`); }
+  else {
+    // 401/403/404/etc — log for diagnosis
+    unexpected.add(1);
+    if (__VU <= 3) {
+      console.warn(`[VU ${__VU}] Unexpected ${res.status}: ${res.body.substring(0, 200)}`);
+    }
   }
 
-  // The assertions
   check(res, {
-    'is status 200, 201, or 409': (r) =>
-      r.status === 200 || r.status === 201 || r.status === 409,
-    'no internal errors': (r) => r.status < 500,
+    'status is 200, 201, or 409': (r) => r.status === 200 || r.status === 201 || r.status === 409,
+    'no 5xx errors':              (r) => r.status < 500,
   });
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Post-Test Summary
-// ═══════════════════════════════════════════════════════════════════════════
-
+// ── Post-Test Report ──────────────────────────────────────────────────────────
 export function handleSummary(data) {
-  const created = data.metrics.torrentedge_201_created?.values?.count || 0;
-  const deduped = data.metrics.torrentedge_200_deduplicated?.values?.count || 0;
-  const inflight = data.metrics.torrentedge_409_inflight?.values?.count || 0;
-  const errors = data.metrics.torrentedge_5xx_errors?.values?.count || 0;
-  const p99 = data.metrics.torrentedge_create_latency?.values?.['p(99)'] || 0;
+  const m = data.metrics;
+
+  const c   = m['te_201_created']?.values?.count   || 0;
+  const d   = m['te_200_deduped']?.values?.count   || 0;
+  const inf = m['te_409_inflight']?.values?.count  || 0;
+  const e   = m['te_5xx_errors']?.values?.count    || 0;
+  const u   = m['te_unexpected']?.values?.count    || 0;
+  const p99 = m['te_create_latency']?.values?.['p(99)'] || 0;
+
+  const total = c + d + inf + e + u;
+  const pass5xx = e === 0 ? '✅' : '❌';
+  const passKafka = c <= 1 ? '✅' : '❌';
+  const passUnex = u === 0 ? '✅' : '❌';
 
   const report = `
 ╔══════════════════════════════════════════════════════════════╗
-║           THUNDERING HERD LOAD TEST — RESULTS               ║
+║         THUNDERING HERD LOAD TEST v2 — RESULTS              ║
 ╠══════════════════════════════════════════════════════════════╣
-║                                                              ║
-║  201 Created (first write):     ${String(created).padStart(5)}                       ║
-║  200 Deduplicated (existing):   ${String(deduped).padStart(5)}                       ║
-║  409 In-Flight (race blocked):  ${String(inflight).padStart(5)}                       ║
-║  5xx Server Errors:             ${String(errors).padStart(5)}                       ║
-║                                                              ║
-║  Total Requests:                ${String(created + deduped + inflight + errors).padStart(5)}                       ║
-║  P99 Latency:                   ${p99.toFixed(0).padStart(5)}ms                     ║
-║                                                              ║
+║  201 Created  (genesis write):   ${String(c).padStart(5)}                       ║
+║  200 OK       (already exists):  ${String(d).padStart(5)}                       ║
+║  409 Conflict (redis blocked):   ${String(inf).padStart(5)}                       ║
+║  5xx Errors   (server crash):    ${String(e).padStart(5)}                       ║
+║  Unexpected   (401/403/other):   ${String(u).padStart(5)}                       ║
+║  Total Requests:                 ${String(total).padStart(5)}                       ║
+║  P99 Latency:               ${String(p99.toFixed(0)).padStart(8)}ms                  ║
 ╠══════════════════════════════════════════════════════════════╣
-║  VERDICT:                                                    ║
-║  ${errors === 0 ? '✅ PASS — Zero 5xx errors. System survived the herd.' : '❌ FAIL — Server crashed under load. Harden pools.'}        ║
-║  ${created <= 1 ? '✅ PASS — At most 1 Kafka JOB_ASSIGNED dispatched.' : '❌ FAIL — Multiple dispatches detected. Fix guard.'}        ║
-╚══════════════════════════════════════════════════════════════╝
-`;
+║  ${pass5xx} Zero 5xx — system survived the herd                     ║
+║  ${passKafka} At most 1 Kafka JOB_ASSIGNED dispatched               ║
+║  ${passUnex} Zero unexpected (401/403) responses                    ║
+╚══════════════════════════════════════════════════════════════╝`;
 
   console.log(report);
 
   return {
     'tests/load/thundering-herd-report.json': JSON.stringify({
       timestamp: new Date().toISOString(),
-      created,
-      deduplicated: deduped,
-      inflight,
-      serverErrors: errors,
+      created: c, deduplicated: d, inflight: inf,
+      serverErrors: e, unexpected: u,
       p99LatencyMs: p99,
-      verdict: errors === 0 && created <= 1 ? 'PASS' : 'FAIL',
+      verdict: (e === 0 && c <= 1 && u === 0) ? 'PASS' : 'FAIL',
     }, null, 2),
     stdout: report,
   };

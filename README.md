@@ -27,7 +27,7 @@ This project exists to provide a service-oriented torrent runtime that can be in
   - Kafka producer path for downstream analytics/event pipelines.
 - **Restart resilience**: engine state persisted on interval and flushed on graceful shutdown.
 
-![alt text](image-3.png)
+![alt text](image-1.png)
 
 ## 5) Architecture overview
 

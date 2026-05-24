@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/server/server.js",
     "dev": "nodemon src/server/server.js",
-    "test": "jest --passWithNoTests --testTimeout=30000",
+    "test": "jest --passWithNoTests --testTimeout=15000 --forceExit",
     "test:watch": "jest --watch",
     "test:unit": "jest --testPathPattern=tests/(?!.*integration).*\\.test\\.js$",
     "test:integration": "jest --testPathPattern=tests/.*integration.*\\.test\\.js$",

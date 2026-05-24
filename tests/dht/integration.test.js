@@ -162,7 +162,7 @@ describe('DHT Integration Tests', () => {
         expect(node).toHaveProperty('port');
         expect(Buffer.isBuffer(node.id)).toBe(true);
       });
-    }, 20000);
+    }, 15000);
 
     test('should converge to closest nodes', async () => {
       // Create network of 5 nodes
@@ -210,7 +210,7 @@ describe('DHT Integration Tests', () => {
       for (let i = 1; i < distances.length; i++) {
         expect(Buffer.compare(distances[i - 1], distances[i])).toBeLessThanOrEqual(0);
       }
-    }, 20000);
+    }, 15000);
   });
 
   describe('get_peers flow', () => {
@@ -251,7 +251,7 @@ describe('DHT Integration Tests', () => {
       
       const foundNodeA = result.peers.some(peer => peer.port === 6881);
       expect(foundNodeA).toBe(true);
-    }, 20000);
+    }, 15000);
 
     test('should return nodes when no peers available', async () => {
       const nodeA = new DHTNode({ port: basePort++, bootstrapNodes: [] });
@@ -348,7 +348,7 @@ describe('DHT Integration Tests', () => {
       expect(result.peers.length).toBeGreaterThan(0);
       const foundNodeB = result.peers.some(peer => peer.port === 8888);
       expect(foundNodeB).toBe(true);
-    }, 20000);
+    }, 15000);
   });
 
   describe('Peer discovery callbacks', () => {
@@ -389,7 +389,7 @@ describe('DHT Integration Tests', () => {
       expect(receivedInfoHash).toBeTruthy();
       expect(receivedPeers).toBeTruthy();
       expect(Array.isArray(receivedPeers)).toBe(true);
-    }, 20000);
+    }, 15000);
 
     test('should emit peer event when peer is announced', async () => {
       const nodeA = new DHTNode({ port: basePort++, bootstrapNodes: [] });
@@ -505,7 +505,7 @@ describe('DHT Integration Tests', () => {
       const result = await nodeD.findNode(targetId);
 
       expect(result.length).toBeGreaterThan(0);
-    }, 20000);
+    }, 15000);
   });
 
   describe('Concurrent operations', () => {
@@ -554,7 +554,7 @@ describe('DHT Integration Tests', () => {
         expect(result).toHaveProperty('peers');
         expect(result).toHaveProperty('nodes');
       });
-    }, 20000);
+    }, 15000);
 
     test('should handle concurrent find_node operations', async () => {
       const nodeA = new DHTNode({ port: basePort++, bootstrapNodes: [] });
@@ -689,6 +689,6 @@ describe('DHT Integration Tests', () => {
 
       // First node should know about most others
       expect(firstNode.nodesCount).toBeGreaterThanOrEqual(3);
-    }, 20000);
+    }, 15000);
   });
 });

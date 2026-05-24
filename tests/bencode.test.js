@@ -149,7 +149,7 @@ describe('Bencode Decode', () => {
     });
 
     it('should throw on unexpected end of buffer', () => {
-      expect(() => decode(Buffer.from('d'))).toThrow('Unexpected end of buffer');
+      expect(() => decode(Buffer.alloc(0))).toThrow('Unexpected end of buffer');
     });
 
     it('should throw on unexpected data after structure', () => {

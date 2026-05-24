@@ -146,6 +146,12 @@ class Torrent extends EventEmitter {
     this._seeds = 0;
     this._leeches = 0;
 
+    // Default error handler to prevent ERR_UNHANDLED_ERROR crashes.
+    // Users can still attach their own 'error' listeners which will also fire.
+    this.on('error', (err) => {
+      console.error(`[Torrent] Unhandled error: ${err.message || err}`);
+    });
+
     this._initPromise = this._initialize();
   }
 
@@ -327,6 +333,11 @@ class Torrent extends EventEmitter {
    * @private
    */
   async _executeRecoveryAction(errorEvent) {
+    // Do not execute recovery actions if we are stopped
+    if (this._state === 'stopped' || this._state === 'idle') {
+      return;
+    }
+
     switch (errorEvent.action) {
       case 'retry':
         if (errorEvent.category === ERROR_CATEGORY.TRACKER) {
@@ -681,6 +692,11 @@ class Torrent extends EventEmitter {
       if (this._metadataDownloader) {
         this._metadataDownloader.stop();
         this._metadataDownloader = null;
+      }
+
+      // Cancel pending tracker retries
+      if (this._retryManager) {
+        this._retryManager.cancelAll();
       }
 
       // Stop download manager

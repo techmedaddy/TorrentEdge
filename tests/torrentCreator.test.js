@@ -416,26 +416,29 @@ describe('createTorrentWithMagnet()', () => {
 
 describe('_internal.hashPieces()', () => {
 
-  it('returns a Buffer', () => {
-    expect(Buffer.isBuffer(hashPieces(SMALL_FILE, 256 * 1024))).toBe(true);
+  it('returns an object with piecesBuffer and chunkHashes', () => {
+    const result = hashPieces(SMALL_FILE, 256 * 1024);
+    expect(Buffer.isBuffer(result.piecesBuffer)).toBe(true);
+    expect(Array.isArray(result.chunkHashes)).toBe(true);
   });
 
   it('length = pieceCount × 20 bytes', () => {
     const pieceSize  = 256 * 1024;
     const pieceCount = Math.ceil(SMALL_FILE.length / pieceSize);
     const result     = hashPieces(SMALL_FILE, pieceSize);
-    expect(result.length).toBe(pieceCount * 20);
+    expect(result.piecesBuffer.length).toBe(pieceCount * 20);
+    expect(result.chunkHashes.length).toBe(pieceCount);
   });
 
   it('single-piece file → 20 bytes', () => {
     const result = hashPieces(SMALL_FILE, 256 * 1024); // file < pieceSize → 1 piece
-    expect(result.length).toBe(20);
+    expect(result.piecesBuffer.length).toBe(20);
   });
 
   it('two-piece file → 40 bytes', () => {
     const twoChunks = Buffer.alloc(300 * 1024, 'x'); // 300KB > 256KB → 2 pieces
     const result    = hashPieces(twoChunks, 256 * 1024);
-    expect(result.length).toBe(40);
+    expect(result.piecesBuffer.length).toBe(40);
   });
 
   it('first 20 bytes = SHA1 of first piece', () => {
@@ -445,7 +448,7 @@ describe('_internal.hashPieces()', () => {
 
     const firstPiece    = file.slice(0, pieceSize);
     const expectedHash  = crypto.createHash('sha1').update(firstPiece).digest();
-    expect(result.slice(0, 20).equals(expectedHash)).toBe(true);
+    expect(result.piecesBuffer.slice(0, 20).equals(expectedHash)).toBe(true);
   });
 
   it('second 20 bytes = SHA1 of second piece', () => {
@@ -455,13 +458,13 @@ describe('_internal.hashPieces()', () => {
 
     const secondPiece  = file.slice(pieceSize); // remainder
     const expectedHash = crypto.createHash('sha1').update(secondPiece).digest();
-    expect(result.slice(20, 40).equals(expectedHash)).toBe(true);
+    expect(result.piecesBuffer.slice(20, 40).equals(expectedHash)).toBe(true);
   });
 
   it('is deterministic — same input → same hashes', () => {
     const r1 = hashPieces(SMALL_FILE, 256 * 1024);
     const r2 = hashPieces(SMALL_FILE, 256 * 1024);
-    expect(r1.equals(r2)).toBe(true);
+    expect(r1.piecesBuffer.equals(r2.piecesBuffer)).toBe(true);
   });
 
   it('different content → different hashes', () => {
@@ -469,7 +472,7 @@ describe('_internal.hashPieces()', () => {
     const fileB = Buffer.from('BBBB'.repeat(100));
     const r1    = hashPieces(fileA, 256 * 1024);
     const r2    = hashPieces(fileB, 256 * 1024);
-    expect(r1.equals(r2)).toBe(false);
+    expect(r1.piecesBuffer.equals(r2.piecesBuffer)).toBe(false);
   });
 });
 

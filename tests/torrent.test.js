@@ -2,15 +2,31 @@ const fs = require('fs').promises;
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { Torrent } = require('../src/server/torrentEngine/torrent');
+const { Torrent: OriginalTorrent } = require('../src/server/torrentEngine/torrent');
 const { TorrentEngine } = require('../src/server/torrentEngine/engine');
+
+const testTorrents = [];
+class Torrent extends OriginalTorrent {
+  constructor(options) {
+    super(options);
+    testTorrents.push(this);
+  }
+}
 const { parseTorrent } = require('../src/server/torrentEngine/torrentParser');
 const bencode = require('../src/server/torrentEngine/bencode');
 
 // Mock tracker module
-jest.mock('../src/server/torrentEngine/tracker', () => ({
-  announce: jest.fn()
-}));
+jest.mock('../src/server/torrentEngine/tracker', () => {
+  const mockAnnounce = jest.fn();
+  return {
+    announce: mockAnnounce,
+    TrackerManager: class TrackerManager {
+      constructor() {
+        this.announce = mockAnnounce;
+      }
+    }
+  };
+});
 
 const { announce } = require('../src/server/torrentEngine/tracker');
 
@@ -82,6 +98,12 @@ describe('Torrent', () => {
   });
 
   afterEach(async () => {
+    // Stop all standalone torrents created during the test
+    for (const t of testTorrents) {
+      try { await t.stop(); } catch (e) {}
+    }
+    testTorrents.length = 0; // Clear the array
+
     try {
       await fs.rm(tmpDir, { recursive: true, force: true });
     } catch (error) {
@@ -475,7 +497,7 @@ describe('TorrentEngine', () => {
   });
 
   afterEach(async () => {
-    await engine.stopAll();
+    await engine.shutdown();
     
     try {
       await fs.rm(tmpDir, { recursive: true, force: true });
@@ -637,7 +659,7 @@ describe('TorrentEngine', () => {
       const torrent = engine.getAllTorrents()[0];
       expect(torrent.state).toBe('downloading');
 
-      await engine.stopAll();
+      await engine.shutdown();
     });
 
     it('should stop all torrents', async () => {
@@ -646,7 +668,7 @@ describe('TorrentEngine', () => {
         autoStart: true
       });
 
-      await engine.stopAll();
+      await engine.shutdown();
 
       const torrent = engine.getAllTorrents()[0];
       expect(torrent.state).toBe('idle');
@@ -673,7 +695,7 @@ describe('TorrentEngine', () => {
       const stats = engine.getGlobalStats();
       expect(stats.activeTorrents).toBeLessThanOrEqual(1);
 
-      await engine.stopAll();
+      await engine.shutdown();
     });
   });
 
@@ -746,7 +768,7 @@ describe('TorrentEngine', () => {
       expect(engine2.torrents.size).toBe(1);
       expect(engine2.getAllTorrents()[0].name).toBe('test-file.txt');
 
-      await engine2.stopAll();
+      await engine2.shutdown();
     });
   });
 });

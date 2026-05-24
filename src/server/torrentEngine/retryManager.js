@@ -11,6 +11,9 @@ class RetryManager extends EventEmitter {
     this.baseDelay = options.baseDelay || 1000;
     this.maxDelay = options.maxDelay || 30000;
     this.backoffMultiplier = options.backoffMultiplier || 2;
+    
+    this._activeTimers = new Map(); // Map of timer -> reject function
+    this._isCancelled = false;
   }
   
   /**
@@ -28,6 +31,10 @@ class RetryManager extends EventEmitter {
     let lastError;
     
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      if (this._isCancelled) {
+        throw new Error('Retry cancelled');
+      }
+      
       try {
         // Try operation
         const result = await operation();
@@ -102,7 +109,29 @@ class RetryManager extends EventEmitter {
    * @private
    */
   _sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this._activeTimers.delete(timer);
+        if (this._isCancelled) {
+          reject(new Error('Retry cancelled'));
+        } else {
+          resolve();
+        }
+      }, ms);
+      this._activeTimers.set(timer, reject);
+    });
+  }
+  
+  /**
+   * Cancels all pending retries
+   */
+  cancelAll() {
+    this._isCancelled = true;
+    for (const [timer, reject] of this._activeTimers.entries()) {
+      clearTimeout(timer);
+      reject(new Error('Retry cancelled'));
+    }
+    this._activeTimers.clear();
   }
   
   /**

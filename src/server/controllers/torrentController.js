@@ -216,6 +216,7 @@ exports.createTorrent = async (req, res) => {
           torrentPath: torrentPath,
           torrentBuffer: torrentBuffer ? torrentBuffer.toString('base64') : null,
           magnetUri: magnetURI || null,
+          sourceUri: req.body.sourceUri || null,
           autoStart: autoStart,
           downloadPath: process.env.DOWNLOAD_PATH || './downloads',
         },
@@ -278,9 +279,37 @@ exports.createTorrent = async (req, res) => {
       throw error;
     }
 
+    // Ensure we have an infoHash even in distributed mode
+    let finalInfoHash = null;
+    let finalName = null;
+    let finalSize = 0;
+    let finalState = magnetURI ? 'fetching_metadata' : 'pending';
+
+    if (engineTorrent) {
+      finalInfoHash = engineTorrent.infoHash.toLowerCase();
+      finalName = engineTorrent.name;
+      finalSize = engineTorrent.size || 0;
+      finalState = engineTorrent.state || finalState;
+    } else if (magnetURI) {
+      try {
+        const { parseMagnet } = require('../torrentEngine/magnet');
+        const magnetInfo = parseMagnet(magnetURI);
+        finalInfoHash = magnetInfo.infoHash.toLowerCase();
+        finalName = magnetInfo.displayName || `Magnet-${finalInfoHash.substring(0, 8)}`;
+      } catch (e) {}
+    } else {
+      // For distributed .torrent files (fallback)
+      finalInfoHash = `temp-${Date.now()}`;
+      finalName = `Upload-${Date.now()}`;
+    }
+
+    if (!finalInfoHash) {
+      return res.status(500).json({ message: "Server error: Unable to determine infoHash in distributed mode." });
+    }
+
     // Check if torrent already exists in DB (e.g. added via .torrent file with same hash)
     const existingTorrent = await Transfer.findOne({ 
-      where: { info_hash: engineTorrent.infoHash.toLowerCase() },
+      where: { info_hash: finalInfoHash },
       include: [{ model: User, as: 'leechers', attributes: ['id'] }]
     });
     if (existingTorrent) {
@@ -297,31 +326,25 @@ exports.createTorrent = async (req, res) => {
 
     // Get initial stats (may fail for magnet links without metadata yet)
     let stats = null;
-    try {
-      stats = engineTorrent.getStats();
-    } catch (err) {
-      console.log('[TorrentController] Stats not available yet (magnet link fetching metadata)');
-    }
-
-    // For magnet links, we might not have full metadata yet
-    let displayName = null;
-    if (magnetURI) {
+    if (engineTorrent) {
       try {
-        displayName = require('../torrentEngine/magnet').parseMagnet(magnetURI).displayName;
-      } catch (e) {}
+        stats = engineTorrent.getStats();
+      } catch (err) {
+        console.log('[TorrentController] Stats not available yet (magnet link fetching metadata)');
+      }
     }
-    const name = engineTorrent.name || displayName || `Magnet-${engineTorrent.infoHash.substring(0, 8)}`;
 
     // Save to DB
     const torrent = await Transfer.create({
-      name: name,
-      info_hash: engineTorrent.infoHash.toLowerCase(),
+      name: finalName || `Torrent-${finalInfoHash.substring(0, 8)}`,
+      info_hash: finalInfoHash,
       magnet_uri: magnetURI || null,
-      size_bytes: engineTorrent.size || 0,
+      size_bytes: finalSize,
       uploaded_by: req.user.userId || req.user.id,
-      status: engineTorrent.state || (magnetURI ? 'fetching_metadata' : 'pending'),
+      status: finalState,
       progress: stats?.percentage || 0,
-      source_path: torrentPath || null
+      source_path: torrentPath || null,
+      s3_source_uri: req.body.sourceUri || null
     });
 
     console.log(`[TorrentController] Created torrent: ${torrent.name} (${torrent.info_hash})`);

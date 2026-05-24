@@ -203,25 +203,42 @@ class S3ColdStartStreamer {
     return new Promise((resolve, reject) => {
       if (this._aborted) return reject(new Error('Aborted'));
 
-      const client = this.sourceUri.startsWith('https') ? https : http;
-      const headers = {};
+      let redirectCount = 0;
+      const maxRedirects = 5;
 
-      // Only add Range header if we're resuming (offset > 0)
-      if (offset > 0) {
-        headers['Range'] = `bytes=${offset}-`;
-      }
+      const doRequest = (requestUrl) => {
+        if (this._aborted) return reject(new Error('Aborted'));
 
-      const req = client.get(this.sourceUri, { headers }, (res) => {
-        // 416 = Range Not Satisfiable = we already have all the data
-        if (res.statusCode === 416) {
-          return resolve({ finalOffset: offset, finalPieceIndex: pieceIndex });
+        const client = requestUrl.startsWith('https') ? https : http;
+        const headers = {};
+
+        // Only add Range header if we're resuming (offset > 0)
+        if (offset > 0) {
+          headers['Range'] = `bytes=${offset}-`;
         }
 
-        // Accept 200 (full body) and 206 (partial content)
-        if (res.statusCode !== 200 && res.statusCode !== 206) {
-          res.resume(); // Drain the response to free the socket
-          return reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage}`));
-        }
+        const req = client.get(requestUrl, { headers }, (res) => {
+          // Handle Redirects
+          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            res.resume(); // drain response to free socket
+            redirectCount++;
+            if (redirectCount > maxRedirects) {
+              return reject(new Error('Too many redirects'));
+            }
+            const redirectUrl = new URL(res.headers.location, requestUrl).href;
+            return doRequest(redirectUrl);
+          }
+
+          // 416 = Range Not Satisfiable = we already have all the data
+          if (res.statusCode === 416) {
+            return resolve({ finalOffset: offset, finalPieceIndex: pieceIndex });
+          }
+
+          // Accept 200 (full body) and 206 (partial content)
+          if (res.statusCode !== 200 && res.statusCode !== 206) {
+            res.resume(); // Drain the response to free the socket
+            return reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage}`));
+          }
 
         let currentOffset = offset;
         let currentPiece = pieceIndex;
@@ -287,12 +304,15 @@ class S3ColdStartStreamer {
         res.pipe(processor);
       });
 
-      req.on('error', reject);
+        req.on('error', reject);
 
-      // Timeout: if the server hangs for 30s, kill the socket and retry
-      req.setTimeout(30000, () => {
-        req.destroy(new Error('HTTP request timed out after 30s'));
-      });
+        // Timeout: if the server hangs for 30s, kill the socket and retry
+        req.setTimeout(30000, () => {
+          req.destroy(new Error('HTTP request timed out after 30s'));
+        });
+      };
+
+      doRequest(this.sourceUri);
     });
   }
 

@@ -236,14 +236,52 @@ class WorkerConsumer extends EventEmitter {
           // Fire-and-forget: the streamer runs in the background while
           // the torrent engine simultaneously accepts peer connections.
           // This allows lateral seeding to begin before the S3 pull finishes.
+          
+          // CRITICAL: Clear the metadata timeout. As the Genesis node, we do not 
+          // rely on peers for metadata. Because torrent.start() is called asynchronously 
+          // by the QueueManager, we must poll briefly to intercept and clear the timeout.
+          const clearS3Timeout = setInterval(() => {
+            if (torrent._metadataTimeout) {
+              clearTimeout(torrent._metadataTimeout);
+              torrent._metadataTimeout = null;
+              clearInterval(clearS3Timeout);
+            }
+          }, 100);
+          setTimeout(() => clearInterval(clearS3Timeout), 5000); // Safety catch
+
           streamer.start()
             .then((result) => {
               if (result.piecesWritten > 0) {
                 console.log(`[Worker:${this._nodeId}] S3 Cold Start finished: ${result.piecesWritten} pieces, ${(result.bytesStreamed / 1048576).toFixed(1)}MB`);
               }
+              // Once downloaded from S3, forcefully transition to seeding so CLI unblocks
+              if (torrent._state !== 'seeding') {
+                if (typeof torrent._transitionToSeeding === 'function') {
+                  torrent._transitionToSeeding();
+                } else {
+                  torrent._state = 'seeding';
+                  torrent.progress = 1;
+                }
+              }
+              
+              // Emit completion event to update the Control Plane DB
+              this.emit('lifecycle', buildDirective(
+                DIRECTIVE_TYPES.TRANSFER_COMPLETED,
+                { infoHash: torrent.infoHash, name: torrent.name, size: result.bytesStreamed },
+                { nodeId: this._nodeId }
+              ));
             })
             .catch((err) => {
               console.error(`[Worker:${this._nodeId}] S3 Cold Start failed (non-fatal): ${err.message}`);
+              // Ensure CLI polling loop breaks on stream failure
+              torrent._state = 'error';
+              torrent.emit('error', new Error(`S3 Stream Failed: ${err.message}`));
+              
+              this.emit('lifecycle', buildDirective(
+                DIRECTIVE_TYPES.TRANSFER_FAILED,
+                { infoHash: torrent.infoHash, name: torrent.name, error: err.message },
+                { nodeId: this._nodeId }
+              ));
             });
         } else {
           console.log(`[Worker:${this._nodeId}] ${activePeers} active peers found. Skipping S3 Cold Start.`);

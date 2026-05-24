@@ -61,6 +61,7 @@ class DHTNode extends EventEmitter {
     
     // State
     this.isReady = false;
+    this._stopped = false;
     
     // Constants
     this._queryTimeout = 5000; // 5 seconds
@@ -137,6 +138,8 @@ class DHTNode extends EventEmitter {
    * Stop the DHT node
    */
   async stop() {
+    if (this._stopped) return;
+    this._stopped = true;
     console.log('[DHT] Stopping node...');
     
     // Stop maintenance
@@ -165,6 +168,7 @@ class DHTNode extends EventEmitter {
    * Bootstrap the DHT by contacting bootstrap nodes
    */
   async bootstrap() {
+    if (this._stopped) return;
     console.log(`[DHT] Bootstrapping with ${this.bootstrapNodes.length} nodes...`);
     
     // Ping bootstrap nodes in parallel
@@ -531,6 +535,7 @@ class DHTNode extends EventEmitter {
     let noProgressCount = 0;
     
     while (iteration < this._maxLookupIterations) {
+      if (this._stopped) break;
       iteration++;
       
       // Get up to alpha unqueried nodes closest to target
@@ -927,6 +932,10 @@ class DHTNode extends EventEmitter {
     const tid = query.t.toString('hex');
     
     return new Promise((resolve, reject) => {
+      if (this._stopped || !this._socket) {
+        return reject(new Error('DHT node stopped'));
+      }
+      
       // Set up timeout
       const timer = setTimeout(() => {
         this._pendingQueries.delete(tid);
@@ -958,6 +967,7 @@ class DHTNode extends EventEmitter {
    * @private
    */
   _sendResponse(response, host, port) {
+    if (this._stopped || !this._socket) return;
     const buffer = bencode.encode(response);
     this._socket.send(buffer, port, host, (err) => {
       if (err) {

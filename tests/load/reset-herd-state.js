@@ -47,12 +47,11 @@ async function reset() {
     await sequelize.authenticate();
 
     const [results] = await sequelize.query(
-      `DELETE FROM transfers WHERE info_hash = '${TEST_INFO_HASH}' RETURNING id, name`
+      `DELETE FROM transfers RETURNING id, name`
     );
 
     if (results.length > 0) {
-      console.log(`[Reset] PostgreSQL: Deleted ${results.length} transfer(s):`);
-      results.forEach(r => console.log(`  - ${r.id} (${r.name})`));
+      console.log(`[Reset] PostgreSQL: Wiped ${results.length} transfer(s).`);
     } else {
       console.log('[Reset] PostgreSQL: No matching transfers found.');
     }

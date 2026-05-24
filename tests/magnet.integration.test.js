@@ -459,7 +459,7 @@ describe('Magnet Link Integration Tests', () => {
       expect(torrent.name).toBe('test-torrent.txt');
       
       // Start download (will fetch metadata first)
-      const startPromise = torrent.start();
+      const startPromise = torrent.start().catch(() => {});
       
       // Wait for metadata to be fetched (with timeout)
       await Promise.race([
@@ -467,7 +467,7 @@ describe('Magnet Link Integration Tests', () => {
           torrent.on('metadata:complete', resolve);
         }),
         new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Metadata download timeout')), 30000)
+          setTimeout(() => reject(new Error('Metadata download timeout')), 10000)
         )
       ]);
       
@@ -482,7 +482,7 @@ describe('Magnet Link Integration Tests', () => {
       
       // Stop torrent
       await torrent.stop();
-    }, 35000);
+    }, 15000);
     
     test('should show metadata progress in stats', async () => {
       mockPeerServer = new MockPeerServer(MOCK_PEER_PORT, testData.metadata);
@@ -503,7 +503,7 @@ describe('Magnet Link Integration Tests', () => {
       await new Promise((resolve) => torrent.on('ready', resolve));
       
       // Start and check stats during metadata fetch
-      const startPromise = torrent.start();
+      const startPromise = torrent.start().catch(() => {});
       
       await new Promise((resolve) => setTimeout(resolve, 2000));
       
@@ -516,7 +516,7 @@ describe('Magnet Link Integration Tests', () => {
       }
       
       await torrent.stop();
-    }, 30000);
+    }, 15000);
   });
   
   describe('Metadata Verification', () => {
@@ -590,13 +590,13 @@ describe('Magnet Link Integration Tests', () => {
       
       await new Promise((resolve) => torrent.on('ready', resolve));
       
-      const startPromise = torrent.start();
+      const startPromise = torrent.start().catch(() => {});
       
       // Wait for metadata
       await Promise.race([
         new Promise((resolve) => torrent.on('metadata:complete', resolve)),
         new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Metadata download timeout')), 30000)
+          setTimeout(() => reject(new Error('Metadata download timeout')), 10000)
         )
       ]);
       
@@ -609,7 +609,7 @@ describe('Magnet Link Integration Tests', () => {
       expect(torrent.size).toBe(testData.content.length);
       
       await torrent.stop();
-    }, 35000);
+    }, 15000);
   });
   
   describe('Tracker + DHT Combined', () => {
@@ -677,7 +677,7 @@ describe('Magnet Link Integration Tests', () => {
         await Promise.race([
           torrent.start(),
           new Promise((_, reject) => 
-            setTimeout(() => reject(new Error('No peers timeout')), 35000)
+            setTimeout(() => reject(new Error('No peers timeout')), 5000)
           )
         ]);
       } catch (err) {
@@ -688,7 +688,7 @@ describe('Magnet Link Integration Tests', () => {
       expect(errorOccurred).toBe(true);
       
       await torrent.stop();
-    }, 40000);
+    }, 10000);
   });
   
   describe('Real Magnet Format Parsing', () => {
@@ -805,13 +805,13 @@ describe('Magnet Link Integration Tests', () => {
       
       await new Promise((resolve) => torrent.on('ready', resolve));
       
-      const startPromise = torrent.start();
+      const startPromise = torrent.start().catch(() => {});
       
       // Wait for metadata complete
       await Promise.race([
         new Promise((resolve) => torrent.on('metadata:complete', resolve)),
         new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Timeout')), 30000)
+          setTimeout(() => reject(new Error('Timeout')), 10000)
         )
       ]);
       
@@ -826,6 +826,6 @@ describe('Magnet Link Integration Tests', () => {
       expect(finalStates.some(s => states.includes(s))).toBe(true);
       
       await torrent.stop();
-    }, 35000);
+    }, 15000);
   });
 });

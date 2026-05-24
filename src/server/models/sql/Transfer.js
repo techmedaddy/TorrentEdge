@@ -51,6 +51,11 @@ const Transfer = sequelize.define('Transfer', {
   created_from_upload: {
     type: DataTypes.BOOLEAN,
     defaultValue: false
+  },
+  s3_source_uri: {
+    type: DataTypes.TEXT,
+    allowNull: true,
+    comment: 'Pre-Signed URL or HTTP(S) URI for S3 Cold Start Bridge (Phase 4.3)'
   }
 }, {
   tableName: 'transfers'

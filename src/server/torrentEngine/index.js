@@ -166,6 +166,9 @@ module.exports = {
   // ===== Phase 4.2: Deduplication =====
   CASStore,
   DeduplicationService,
+
+  // ===== Phase 4.3: S3 Cold Start Bridge =====
+  S3ColdStartStreamer: require('./s3Streamer'),
   
   // ===== Default Instance =====
   defaultEngine

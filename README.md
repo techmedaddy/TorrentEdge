@@ -1,598 +1,315 @@
-# TorrentEdge – Node.js BitTorrent backend with event-streamed telemetry
+# TorrentEdge
 
-## 2) One-line summary
+**Cloud-Native, Peer-Assisted Artifact Distribution for Infrastructure Teams**
 
-A backend-first BitTorrent system that coordinates peer/tracker protocol work, torrent lifecycle control, and real-time operational visibility.
-
-## 3) Problem statement
-
-Most torrent clients optimize for desktop UX, not backend control surfaces.
-
-This project exists to provide a service-oriented torrent runtime that can be integrated into applications requiring:
-- authenticated multi-user torrent management,
-- deterministic lifecycle control (`start`, `pause`, `resume`, `remove`),
-- resumable state across process restarts,
-- and machine-consumable live telemetry.
-
-
-
-## 4) Engineering highlights
-
-- **Distributed peer discovery paths**: tracker announce + DHT integration for decentralized peer intake.
-- **Concurrent workload orchestration**: `QueueManager` enforces bounded active torrents while keeping unbounded queue depth.
-- **Protocol lifecycle handling**: magnet links enter a partial-metadata path before full download orchestration.
-- **I/O-aware scheduling**: piece selection/retry and write verification are separated from API request handling.
-- **Dual event surfaces**:
-  - Socket.IO for low-latency UI/state updates.
-  - Kafka producer path for downstream analytics/event pipelines.
-- **Restart resilience**: engine state persisted on interval and flushed on graceful shutdown.
-
-## 5) Architecture overview
-
-```text
-Clients (REST + Socket.IO)
-        |
-        v
-Express API Layer (auth, validation, controllers)
-        |
-        v
-TorrentEngine (orchestrator)
-  |        |         |         |         |
-  v        v         v         v         v
-Queue   Torrent   State     DHT      Kafka
-Mgmt    runtime   Manager   Node     Producer
-           |
-           v
-  Peer/Tracker/Piece/File subsystems
-           |
-           v
-     Filesystem + Network
-```
-
-Core server entrypoints and modules:
-- [src/server/server.js](src/server/server.js)
-- [src/server/torrentEngine/engine.js](src/server/torrentEngine/engine.js)
-- [src/server/torrentEngine/torrent.js](src/server/torrentEngine/torrent.js)
-- [src/server/socket.js](src/server/socket.js)
-
-## 6) Execution / data flow
-
-1. Client calls authenticated API on [src/server/routes/torrentRoutes.js](src/server/routes/torrentRoutes.js) to create from `.torrent`, magnet URI, or uploaded file.
-2. Controller persists metadata in MongoDB and hands torrent source to `defaultEngine`.
-3. `TorrentEngine` creates/queues torrent runtime; admission is controlled by `maxConcurrent`.
-4. Torrent runtime initializes trackers, DHT peer intake (if enabled), peer connections, and file writer.
-5. For magnet input, runtime enters metadata-fetch state before piece scheduling.
-6. Piece blocks are requested asynchronously, verified, and committed to disk.
-7. Runtime emits progress/peer/piece/lifecycle events:
-   - Socket.IO room-scoped updates for UI.
-   - Kafka events when Kafka is enabled.
-8. State snapshots are periodically persisted; shutdown path flushes pending state and closes dependencies.
-
-
-
-## 7) Key design decisions
-
-### Engine as single in-process control plane
-- **Why**: keeps lifecycle and scheduling semantics centralized.
-- **Tradeoff**: simpler consistency, but bounded by single-process memory/CPU.
-
-### Queue-constrained activation
-- **Why**: prevent unbounded active torrent fan-out from exhausting connections and disk I/O.
-- **Tradeoff**: queued torrents wait for activation; throughput per torrent is prioritized over immediate parallelism.
-
-### Local state files + MongoDB metadata
-- **Why**: torrent runtime state is latency-sensitive; document metadata is query-oriented.
-- **Tradeoff**: two persistence domains require reconciliation logic.
-
-### Socket.IO + Kafka split
-- **Why**: UI updates and durable event streaming have different latency and retention needs.
-- **Tradeoff**: duplicate event publication paths increase operational surface area.
-
-### Graceful shutdown-first lifecycle
-- **Why**: torrent workloads are long-lived; abrupt exits corrupt runtime continuity.
-- **Tradeoff**: shutdown path is more complex (server close, engine flush, producer close, DB close).
-
-## 8) Reliability and failure handling
-
-- **Retry behavior**
-  - Tracker and transient network operations retry with backoff paths in engine/runtime components.
-  - Kafka producer uses built-in retry configuration and buffered progress batching.
-
-- **Partial state handling**
-  - Magnet torrents can exist in `fetching_metadata` before full torrent metadata is known.
-  - Piece verification differentiates valid vs invalid on-disk data during resume/check stages.
-
-- **Failure scenarios covered**
-  - Missing/invalid metadata.
-  - Peer disconnect/churn.
-  - Tracker failure and fallback behavior.
-  - Filesystem write/verification issues.
-  - Process termination with in-flight torrents.
-
-- **Recovery behavior**
-  - `StateManager` performs periodic saves and atomic write pattern (`temp -> rename`) with backup rotation.
-  - Engine auto-resume reloads persisted torrents and restores queue/paused intent.
-  - Startup flow attempts to restore seeding sessions for created-from-upload torrents when source assets exist.
-
-## 9) Observability / debugging
-
-- **Structured logs** via Winston JSON transports to `logs/error.log` and `logs/combined.log`.
-- **HTTP request logs** via Morgan stream integration.
-- **Live runtime introspection**:
-  - `GET /api/statistics`
-  - `GET /api/statistics/engine`
-  - `GET /api/statistics/speed-history`
-  - `GET /api/statistics/dht`
-- **Socket event surface** for per-torrent and global rooms (`subscribe:torrent`, `subscribe:all`).
-- **Event stream diagnostics** through Kafka topic output when enabled.
-
-
-## 10) Demo
-
-- API demo (placeholder): add curl walkthrough for create/start/pause/resume/remove.
-- Real-time demo (placeholder): add short screen capture showing Socket.IO progress + speed history.
-- Failure demo (placeholder): add runbook clip showing restart/resume behavior after process kill.
-
-![alt text](image.png)
-
-## 11) How to run
-
-### Local
-
-```bash
-npm install
-cp .env.example .env
-npm run dev
-```
-
-Backend default: `http://localhost:3029`
-
-### Docker Compose
-
-```bash
-docker-compose up -d
-```
-
-This brings up backend + MongoDB + Kafka + Zookeeper + Nginx using [docker-compose.yml](docker-compose.yml).
-
-### Tests
-
-```bash
-npm test
-```
-
-![alt text](image-1.png)
-
-## 12) Project structure (brief)
-
-- [src/server](src/server): Express server, auth, REST routes, controllers.
-- [src/server/torrentEngine](src/server/torrentEngine): BitTorrent engine and protocol/runtime components.
-- [src/server/torrentEngine/dht](src/server/torrentEngine/dht): DHT node and routing table logic.
-- [src/server/models](src/server/models): MongoDB persistence schemas.
-- [src/server/routes](src/server/routes): API surfaces for torrents, stats, settings, health.
-- [src/server/socket.js](src/server/socket.js): Socket.IO initialization and event fan-out.
-- [tests](tests): unit/integration coverage across parser, magnet, peer, tracker, DHT, and manager modules.
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): expanded architecture reference.
-
-## 13) What this demonstrates
-
-- Designing a stateful network service around eventually consistent external systems (trackers, peers, DHT).
-- Building async orchestration with explicit queueing, bounded concurrency, and lifecycle transitions.
-- Implementing resumable workloads with persistence and recovery semantics.
-- Separating operational telemetry paths (interactive vs stream processing).
-- Operating a Node.js service with graceful shutdown and structured diagnostics.
-- Combining protocol-level logic with API-level product constraints (auth, multi-user ownership, control plane endpoints).
-      DM[downloadManager.js]
-      UM[uploadManager.js]
-      PM[peerManager.js]
-      PC[peerConnection.js]
-      TM[tracker.js]
-      PiM[pieceManager.js]
-      FW[fileWriter.js]
-      SM[stateManager.js]
-      TH[throttler.js]
-      RM[retryManager.js]
-    end
-
-    E --> T
-    E --> QM
-    E --> DM
-    E --> UM
-    E --> PM
-    E --> TM
-    E --> SM
-
-    DM --> PiM
-    DM --> FW
-    DM --> TH
-    DM --> RM
-
-    PM --> PC
-    PM --> TH
-    PC --> TM
-```
-
-## 🔄 Dataflow Diagram
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant A as API (Express)
-    participant E as Torrent Engine
-    participant T as Trackers
-    participant P as Peers
-    participant F as File Writer
-    participant M as MongoDB
-    participant K as Kafka
-    participant S as Socket.IO
-
-    C->>A: POST /api/torrent/create (file/magnet)
-    A->>E: addTorrent()
-    E->>T: announce / scrape
-    T-->>E: peer list
-    E->>P: handshake + bitfield exchange
-    loop Until complete
-      E->>P: request piece blocks
-      P-->>E: piece blocks
-      E->>F: verify + write piece
-      E->>M: persist progress/state
-      E->>K: publish metrics/events
-      E->>S: emit progress update
-      S-->>C: live status
-    end
-    E-->>A: completed / seeding
-    A-->>C: final status
-```
-
-
-
-## 🚀 Quick Start
-
-### Prerequisites
-- **Node.js** 18+ and npm
-- **MongoDB** 4.4+ (for persistence)
-- **Redis** 6+ (optional, for caching)
-- **Apache Kafka** 2.8+ (optional, for analytics)
-
-### Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/yourusername/torrentedge.git
-cd torrentedge
-
-# Install dependencies
-npm install
-
-# Configure environment
-cp .env.example .env
-# Edit .env with your configuration
-
-# Start the server
-npm run dev
-```
-
-### Docker Setup
-
-```bash
-# Start all services (MongoDB, Redis, Kafka, TorrentEdge)
-docker-compose up -d
-
-# View logs
-docker-compose logs -f backend
-
-# Stop services
-docker-compose down
-```
-
-The application will be available at:
-- **API**: http://localhost:3029
-- **WebSocket**: ws://localhost:3029
-
-Observability endpoints are available when using Docker Compose:
-- **Prometheus**: http://localhost:9090
-- **Grafana**: http://localhost:3033 (`admin` / `admin`)
-- **Tempo**: http://localhost:3200
-- **Metrics**: http://localhost:3029/metrics
-
-See [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) for metric names and OpenTelemetry configuration.
-
-## 📡 API Reference
-
-### Add Torrent from File
-
-```bash
-curl -X POST http://localhost:3029/api/torrent/create \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -F "torrent=@ubuntu.torrent"
-```
-
-### Add Magnet Link
-
-```bash
-curl -X POST http://localhost:3029/api/torrent/create \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "magnetURI": "magnet:?xt=urn:btih:HASH&dn=Name&tr=tracker_url"
-  }'
-```
-
-
-### Get All Torrents
-
-```bash
-curl http://localhost:3029/api/torrent \
-  -H "Authorization: Bearer YOUR_TOKEN"
-```
-
-### Get Torrent Status
-
-```bash
-curl http://localhost:3029/api/torrent/:infoHash \
-  -H "Authorization: Bearer YOUR_TOKEN"
-```
-
-### Pause/Resume Torrent
-
-```bash
-# Pause
-curl -X POST http://localhost:3029/api/torrent/:infoHash/pause \
-  -H "Authorization: Bearer YOUR_TOKEN"
-
-# Resume
-curl -X POST http://localhost:3029/api/torrent/:infoHash/resume \
-  -H "Authorization: Bearer YOUR_TOKEN"
-```
-
-### Remove Torrent
-
-```bash
-curl -X DELETE http://localhost:3029/api/torrent/:infoHash \
-  -H "Authorization: Bearer YOUR_TOKEN"
-```
-
-### Update Torrent Metadata
-
-```bash
-curl -X PUT http://localhost:3029/api/torrent/:mongoId \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"status": "paused"}'
-```
-
-### Get Statistics
-
-```bash
-curl http://localhost:3029/api/statistics \
-  -H "Authorization: Bearer YOUR_TOKEN"
-```
-
-## 🔌 WebSocket Events
-
-### Client → Server
-
-```javascript
-const socket = io('http://localhost:3029');
-
-// Authenticate
-socket.emit('authenticate', { token: 'YOUR_TOKEN' });
-
-// Subscribe to torrent updates
-socket.emit('subscribe:torrent', { infoHash: 'HASH' });
-```
-
-### Server → Client
-
-```javascript
-// Torrent added
-socket.on('torrent:added', (data) => {
-  console.log('New torrent:', data.infoHash);
-});
-
-// Progress update
-socket.on('torrent:progress', (data) => {
-  console.log(`${data.name}: ${data.percentage.toFixed(2)}%`);
-  console.log(`Speed: ${formatBytes(data.downloadSpeed)}/s`);
-  console.log(`Peers: ${data.peers.connected}/${data.peers.total}`);
-});
-
-// Piece completed
-socket.on('torrent:piece', (data) => {
-  console.log(`Piece ${data.index} completed`);
-});
-
-// Download complete
-socket.on('torrent:complete', (data) => {
-  console.log(`Download complete: ${data.name}`);
-});
-
-// Seeding started
-socket.on('torrent:seeding', (data) => {
-  console.log(`Seeding: ${data.name}`);
-  console.log(`Ratio: ${data.ratio.toFixed(2)}`);
-});
-
-// Error occurred
-socket.on('torrent:error', (data) => {
-  console.error(`Error: ${data.message}`);
-});
-
-// Queue updated
-socket.on('queue:updated', (data) => {
-  console.log(`Active: ${data.stats.activeCount}`);
-  console.log(`Queued: ${data.stats.queuedCount}`);
-});
-```
-<img width="1600" height="772" alt="image" src="https://github.com/user-attachments/assets/27be6a13-04b4-4585-a7c6-738744f04760" />
-
-## ⚙️ Configuration
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `PORT` | Server port | `3000` |
-| `MONGODB_URI` | MongoDB connection string | `mongodb://localhost:27017/torrentedge` |
-| `REDIS_HOST` | Redis host | `localhost` |
-| `REDIS_PORT` | Redis port | `6379` |
-| `KAFKA_BROKERS` | Kafka broker list | `localhost:9092` |
-| `JWT_SECRET` | JWT signing secret | `your-secret-key` |
-| `DOWNLOAD_PATH` | Default download directory | `./downloads` |
-| `MAX_CONCURRENT_TORRENTS` | Max active downloads | `3` |
-| `MAX_PEER_CONNECTIONS` | Max peers per torrent | `50` |
-| `UPLOAD_LIMIT` | Global upload limit (bytes/s) | `0` (unlimited) |
-| `DOWNLOAD_LIMIT` | Global download limit (bytes/s) | `0` (unlimited) |
-
-### Torrent Engine Options
-
-```javascript
-const engine = new TorrentEngine({
-  downloadPath: './downloads',
-  port: 6881,
-  maxConcurrent: 3,
-  maxConnections: 50,
-  uploadLimit: 1024 * 1024,      // 1 MB/s
-  downloadLimit: 5 * 1024 * 1024, // 5 MB/s
-  seedRatioLimit: 2.0,            // Stop seeding at 2.0 ratio
-  seedTimeLimit: 0,               // Seed forever (minutes)
-  autoResume: true,               // Resume on restart
-  verifyOnResume: false           // Skip verification on resume
-});
-```
-
-## 🧪 Testing
-
-```bash
-# Run all tests
-npm test
-
-# Run unit tests
-npm run test:unit
-
-# Run integration tests
-npm run test:integration
-
-# Run with coverage
-npm run test:coverage
-```
-
-![alt text](image-1.png)
-
-## 📊 Performance
-
-- ✅ Handles **100+ concurrent torrents**
-- ✅ Supports **1000+ peer connections**
-- ✅ Tested with torrents up to **50GB+**
-- ✅ Memory efficient: **~50MB base + ~10MB per active torrent**
-- ✅ CPU efficient: **~5% on average, ~20% during verification**
-
-### Benchmarks
-
-| Operation | Performance |
-|-----------|-------------|
-| Piece verification | ~150 MB/s |
-| File writes | ~200 MB/s |
-| Peer handshakes | ~100/s |
-| Socket.IO events | ~10k/s |
-| Kafka messages | ~50k/s |
-
-## 🛠️ Tech Stack
-
-### Core
-- **Runtime**: Node.js 18+
-- **Protocol**: BitTorrent (BEP 3, 9, 10)
-- **Network**: TCP/IP, UDP
-- **Cryptography**: SHA1, crypto-js
-
-### Backend
-- **Framework**: Express.js
-- **Real-time**: Socket.IO
-- **Database**: MongoDB + Mongoose
-- **Cache**: Redis
-- **Message Queue**: Apache Kafka + KafkaJS
-
-### DevOps
-- **Containerization**: Docker
-- **Orchestration**: Docker Compose
-- **Reverse Proxy**: Nginx
-
-## 📁 Project Structure
-
-```
-TorrentEdge/
-├── src/
-│   ├── server/
-│   │   ├── torrentEngine/          # Core BitTorrent implementation
-│   │   │   ├── torrent.js          # Torrent state machine
-│   │   │   ├── engine.js           # Main engine orchestrator
-│   │   │   ├── queueManager.js     # Multi-torrent queue
-│   │   │   ├── stateManager.js     # Persistence layer
-│   │   │   ├── peerManager.js      # Peer connection pool
-│   │   │   ├── peerConnection.js   # Individual peer protocol
-│   │   │   ├── downloadManager.js  # Download coordination
-│   │   │   ├── uploadManager.js    # Seeding and uploads
-│   │   │   ├── fileWriter.js       # Disk I/O
-│   │   │   ├── pieceManager.js     # Piece verification
-│   │   │   ├── throttler.js        # Bandwidth limiting
-│   │   │   ├── retryManager.js     # Error handling
-│   │   │   └── tracker.js          # Tracker protocol
-│   │   ├── controllers/            # API controllers
-│   │   ├── models/                 # MongoDB models
-│   │   ├── routes/                 # Express routes
-│   │   ├── middleware/             # Auth, validation
-│   │   ├── kafka/                  # Kafka producers/consumers
-│   │   └── server.js               # Main entry point
-│   └── api/                        # API controllers
-├── tests/                          # Test suites
-├── nginx/                          # Nginx configuration
-├── docker-compose.yml              # Docker setup
-├── package.json
-└── README.md
-```
-
-## 🔍 Key Algorithms
-
-### Piece Selection
-1. **Rarest First**: Download rarest pieces first to improve swarm health
-2. **Random First**: First 4 pieces selected randomly for quick startup
-3. **Endgame Mode**: Request last pieces from multiple peers (at 95% completion)
-
-### Choking Algorithm (Tit-for-Tat)
-- Unchoke top 4 uploaders every 10 seconds
-- Optimistic unchoke rotates every 30 seconds
-- Rewards peers who upload to us
-- Prevents freeloading
-
-### Token Bucket Throttling
-- Bucket fills at configured rate (bytes/second)
-- Each transfer consumes tokens
-- Burst support up to 1 second worth of tokens
-- Separate buckets for upload/download
-
-### Error Handling
-- **Retry Manager**: Exponential backoff with jitter
-- **Peer Banning**: Strike system (3 strikes → temporary ban)
-- **Tracker Failover**: Multi-tracker with health states
-- **Automatic Recovery**: Reconnection with backoff
-
-## 🤝 Contributing
-
-Contributions are welcome! Please follow these steps:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-
-
-
+A chunk-based, VPC-aware P2P delivery system that eliminates the "Thundering Herd" network bottleneck when distributing large binary artifacts (model checkpoints, container images, dataset shards) across compute fleets. Built for MLOps and Platform Engineering teams operating at the scale where centralized object storage becomes the failure domain.
 
 ---
 
+## The Problem
 
+When a training run completes and a new 70GB Llama-3 checkpoint is pushed to S3, the rollout begins. Fifty GPU nodes simultaneously issue `aws s3 cp` to pull the artifact. The result is predictable:
 
-For detailed architecture documentation, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+- **Top-of-Rack switch saturation.** The NAT Gateway or VPC endpoint becomes a single point of contention. Nodes that start pulling 2 seconds late may wait 40 minutes longer than the first.
+- **Egress cost amplification.** 50 nodes × 70GB = 3.5TB of S3 egress per deployment. At $0.09/GB, that is **$315 per rollout** — and teams deploying multiple times per day burn thousands monthly on redundant byte transfers.
+- **Non-deterministic completion.** There is no orchestration layer. Nodes complete at different times based on network jitter, and the fleet cannot begin inference until the slowest node finishes.
 
+TorrentEdge eliminates this by downloading the artifact from S3 **once**, then laterally distributing it across the internal VPC using chunk-verified P2P protocols. The first node to pull a piece immediately begins seeding it to its neighbors over East-West traffic, which is free and unrestricted.
+
+---
+
+## Architecture
+
+TorrentEdge follows a strict Control Plane / Data Plane separation. The orchestration layer never touches raw bytes; it only manages metadata, leases, and job state. The execution layer never makes scheduling decisions; it only processes directives.
+
+```
+                    ┌──────────────────────────────────────────────────┐
+                    │              CONTROL PLANE                       │
+                    │                                                  │
+  MLOps Pipeline ──▶│  REST API (Express.js)                          │
+  (CI/CD, Airflow)  │    │                                            │
+                    │    ├── POST /api/torrent/create                  │
+                    │    ├── GET  /api/torrent/:id/stats               │
+                    │    └── GET  /api/health                          │
+                    │    │                                             │
+                    │    ▼                                             │
+                    │  Dispatcher ──▶ Kafka (torrent.jobs.dispatch)    │
+                    │                                                  │
+                    │  LeaseSweeper (Zombie Recovery Cron)             │
+                    │    └── Polls PostgreSQL + Redis every 30s        │
+                    └──────────────┬───────────────────────────────────┘
+                                   │
+                    ┌──────────────▼───────────────────────────────────┐
+                    │              DATA PLANE (Worker Nodes)           │
+                    │                                                  │
+                    │  WorkerConsumer                                  │
+                    │    ├── Kafka Consumer (torrent.jobs.dispatch)    │
+                    │    ├── LeaseManager (Redis SETNX + Fencing)      │
+                    │    ├── S3 Cold Start Bridge (HTTP Range Stream)  │
+                    │    ├── BitTorrent Engine (Piece Protocol)        │
+                    │    ├── CAS Store (SHA-256 Deduplication)         │
+                    │    └── Peer Registry (VPC-aware discovery)       │
+                    │                                                  │
+                    └──────────────────────────────────────────────────┘
+
+  Persistence Layer:
+    PostgreSQL ──── ACID metadata, transfer state, chunk verification
+    Redis ───────── Distributed leases, fencing tokens, peer TTLs
+    Kafka ───────── Asynchronous job dispatch, lifecycle events, telemetry
+```
+
+### Core Subsystems
+
+| Subsystem | Responsibility | Key Guarantee |
+|-----------|---------------|---------------|
+| **Dispatcher** | Publishes `JOB_ASSIGNED` directives to Kafka. Falls back to in-process execution when Kafka is unavailable. | Exactly-once dispatch via `X-Request-ID` idempotency. |
+| **LeaseManager** | Redis-backed distributed lock with monotonic fencing tokens. Workers must validate their token before every CAS write. | Prevents split-brain disk corruption on shared volumes. |
+| **LeaseSweeper** | Control Plane cron that detects zombie transfers (active DB status, expired Redis lease) and re-queues them. | Autonomous recovery from OOMKilled or preempted workers. |
+| **S3 Cold Start Bridge** | When a transfer has 0 seeders, the first worker acquires a genesis lease, streams the artifact from a Pre-Signed URL, and seeds it to the VPC — all without the AWS SDK on the data plane. | Peak heap usage capped at ~1MB regardless of artifact size. |
+| **CAS Store** | Content-Addressable Storage. Chunks are stored by SHA-256 hash in a sharded directory structure. Identical chunks across transfers are deduplicated. | Eliminates redundant disk I/O for overlapping artifacts. |
+| **PeerRegistry** | Redis-backed registry of active workers per `infoHash`. Enables VPC-aware peer discovery so nodes preferentially pull from local neighbors. | East-West traffic prioritization over North-South egress. |
+
+---
+
+## Deployment Topology
+
+### Evaluation Mode (Single Node)
+
+Boot the full stack locally with a single command. This runs the Control Plane, a single embedded Worker, PostgreSQL, Redis, Kafka, and the observability pipeline.
+
+```bash
+git clone https://github.com/yourusername/TorrentEdge.git
+cd TorrentEdge
+cp .env.example .env
+docker compose up -d
+```
+
+The API is available at `http://localhost:3029`. Grafana dashboards are at `http://localhost:3033` (credentials: `admin` / `admin`).
+
+### Production Mode (AWS Free Tier — 1GB t3.micro)
+
+For resource-constrained deployments, a dedicated `docker-compose.aws-micro.yml` is provided. It runs Kafka in KRaft mode (eliminating Zookeeper), hard-limits the JVM to 256MB (`-Xmx256m`), and caps Node.js V8 heap at 256MB (`--max-old-space-size=256`). PostgreSQL and Redis are offloaded to managed AWS services (RDS, ElastiCache).
+
+```bash
+docker compose -f docker-compose.aws-micro.yml up -d
+```
+
+See [docs/aws_free_tier_playbook.md](docs/aws_free_tier_playbook.md) for the full operational runbook, including swap file provisioning and memory budgets.
+
+### Kubernetes (Helm)
+
+A versioned Helm chart is provided in `charts/torrentedge/`. It includes Liveness and Readiness probes mapped to `/api/health`, PersistentVolumeClaims for the download directory, and configurable replica counts for horizontal worker scaling.
+
+```bash
+helm install torrentedge ./charts/torrentedge \
+  --set replicaCount.backend=3 \
+  --set kafka.brokers=kafka.svc.cluster.local:9092
+```
+
+---
+
+## API Usage
+
+### Dispatch a Transfer
+
+```bash
+curl -X POST http://localhost:3029/api/torrent/create \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Request-ID: deploy-llama3-$(date +%s)" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "magnetURI": "magnet:?xt=urn:btih:INFOHASH&dn=llama3-70b-checkpoint.safetensors"
+  }'
+```
+
+The `X-Request-ID` header enables idempotent request handling. If the same request is retried due to a network timeout, the Control Plane returns the cached `200 OK` response without generating duplicate Kafka events or database records.
+
+### Upload and Seed a Local Artifact
+
+```bash
+curl -X POST http://localhost:3029/api/torrent/create \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Request-ID: seed-model-v2.1" \
+  -F "file=@./checkpoints/model-v2.1.safetensors"
+```
+
+### Query Transfer Status
+
+```bash
+curl http://localhost:3029/api/torrent/$TRANSFER_ID/stats \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{
+  "infoHash": "a1b2c3d4e5...",
+  "status": "downloading",
+  "progress": 67.4,
+  "downloadSpeed": 52428800,
+  "peers": { "connected": 12, "total": 48 },
+  "pieces": { "completed": 174, "total": 258 }
+}
+```
+
+### Health Check
+
+```bash
+curl http://localhost:3029/api/health
+```
+
+Returns dependency status for PostgreSQL, Redis, and Kafka. Kubernetes Liveness and Readiness probes are mapped to this endpoint.
+
+---
+
+## Observability
+
+TorrentEdge exports telemetry through three channels:
+
+### Prometheus Metrics
+
+Scraped from `GET /metrics`. Key gauges and counters:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `torrentedge_cas_hit_rate` | Gauge | CAS deduplication hit ratio (0–1). |
+| `torrentedge_dedup_bytes_total` | Counter | Total bytes saved by chunk deduplication. |
+| `torrentedge_http_request_duration_seconds` | Histogram | API latency distribution with route labels. |
+| `torrentedge_kafka_messages_total` | Counter | Kafka produce/consume throughput by topic. |
+| `torrentedge_lease_acquisitions_total` | Counter | Distributed lock acquisition attempts by result. |
+| `torrentedge_queue_depth` | Gauge | Transfer queue depth by state. |
+| `torrentedge_worker_heartbeats_total` | Counter | Worker liveness heartbeat events. |
+
+A pre-built Grafana dashboard is provisioned automatically in Docker Compose at `observability/grafana/dashboards/torrentedge-overview.json`.
+
+### OpenTelemetry Distributed Tracing
+
+Traces are exported via OTLP/HTTP to a configurable collector. Every Kafka message carries W3C Trace Context headers, enabling end-to-end trace correlation from API request → Kafka dispatch → Worker execution → CAS write.
+
+```bash
+# Enable tracing
+OTEL_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4318
+```
+
+Traces are viewable in Grafana Tempo at `http://localhost:3200`.
+
+### Real-Time WebSocket Telemetry
+
+Socket.IO provides low-latency push updates for operational dashboards:
+
+```javascript
+const socket = io('http://localhost:3029');
+socket.emit('authenticate', { token: 'YOUR_TOKEN' });
+socket.emit('subscribe:torrent', { infoHash: 'HASH' });
+
+socket.on('torrent:progress', (data) => {
+  // { percentage, downloadSpeed, peers, pieces }
+});
+```
+
+---
+
+## Configuration
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PORT` | API server port | `3029` |
+| `POSTGRES_HOST` | PostgreSQL host | `localhost` |
+| `POSTGRES_PORT` | PostgreSQL port | `5432` |
+| `POSTGRES_DB` | Database name | `torrentedge` |
+| `REDIS_HOST` | Redis host | `localhost` |
+| `KAFKA_ENABLED` | Enable Kafka event bus | `false` |
+| `KAFKA_BROKERS` | Kafka broker addresses | `localhost:9092` |
+| `DOWNLOAD_PATH` | Artifact storage directory | `./downloads` |
+| `MAX_ACTIVE_TORRENTS` | Concurrent transfer limit | `5` |
+| `MAX_CONCURRENT` | Worker concurrency limit | `3` |
+| `OTEL_ENABLED` | Enable OpenTelemetry tracing | `false` |
+| `WORKER_NODE_ID` | Unique identifier for this worker | `local-<PID>` |
+
+---
+
+## Project Structure
+
+```
+TorrentEdge/
+├── src/server/
+│   ├── server.js                    # Process entrypoint, middleware, graceful shutdown
+│   ├── controllers/
+│   │   └── torrentController.js     # Transfer lifecycle, file serving, merge logic
+│   ├── models/sql/
+│   │   ├── Transfer.js              # Core transfer metadata (PostgreSQL)
+│   │   ├── Chunk.js                 # Piece verification state
+│   │   ├── User.js                  # Authentication & ownership
+│   │   └── index.js                 # Sequelize associations
+│   ├── routes/
+│   │   ├── torrentRoutes.js         # Transfer CRUD endpoints
+│   │   ├── healthRoutes.js          # Liveness / Readiness probes
+│   │   └── statisticsRoutes.js      # Operational metrics API
+│   ├── torrentEngine/
+│   │   ├── engine.js                # BitTorrent engine orchestrator
+│   │   ├── dispatcher.js            # Control Plane → Kafka job publisher
+│   │   ├── workerConsumer.js        # Data Plane Kafka consumer + directive executor
+│   │   ├── leaseManager.js          # Redis distributed locks + fencing tokens
+│   │   ├── leaseSweeper.js          # Zombie transfer recovery cron
+│   │   ├── s3Streamer.js            # S3 Cold Start Bridge (HTTP Range streaming)
+│   │   ├── casStore.js              # Content-Addressable Storage (SHA-256)
+│   │   ├── peerRegistry.js          # VPC-aware peer discovery (Redis)
+│   │   ├── queueManager.js          # Bounded concurrency admission control
+│   │   ├── pieceManager.js          # Piece verification & bitfield tracking
+│   │   └── fileWriter.js            # Atomic disk I/O (temp → rename)
+│   ├── observability/
+│   │   ├── metrics.js               # Prometheus metric definitions
+│   │   └── tracing.js               # OpenTelemetry SDK initialization
+│   └── middleware/
+│       └── requestId.js             # X-Request-ID correlation
+├── charts/torrentedge/              # Helm chart (K8s deployment)
+├── observability/                   # Grafana dashboards, Prometheus, Tempo, OTel Collector
+├── nginx/                           # Reverse proxy configuration
+├── docs/
+│   ├── aws_free_tier_playbook.md    # 1GB EC2 deployment runbook
+│   ├── constitution.txt             # Engineering principles
+│   └── execution.txt                # 12-week execution roadmap
+├── docker-compose.yml               # Full local stack
+├── docker-compose.prod.yml          # Production layout (Nginx + backend + frontend)
+├── docker-compose.aws-micro.yml     # Memory-starved free tier layout
+└── TROUBLESHOOTING.md               # Known bugs & resolution log
+```
+
+---
+
+## Design Decisions
+
+### Why PostgreSQL, Not a Document Store
+
+Transfer metadata is inherently relational: Users own Transfers, Transfers have Leechers (junction table), Transfers are subdivided into Chunks. The system relies on row-level locking (`SELECT ... FOR UPDATE SKIP LOCKED`) for concurrent job dequeuing across horizontally scaled workers. A document store cannot provide these ACID guarantees without application-level compensation logic.
+
+### Why Pre-Signed URLs, Not IAM Roles on Workers
+
+The S3 Cold Start Bridge does not use the AWS SDK on the data plane. The Control Plane generates a time-limited Pre-Signed URL and passes it through the Kafka directive. Workers stream from a standard HTTP GET endpoint. This ensures the data plane is zero-trust, storage-agnostic, and immediately portable to GCS or Azure Blob without code changes.
+
+### Why Fencing Tokens, Not Simple Locks
+
+A `SETNX` lock alone is insufficient for distributed storage. If Worker A's lease expires while it is still writing a chunk (due to a slow disk), Worker B acquires the lock and begins writing the same chunk. Both workers now corrupt the file. TorrentEdge uses monotonic fencing tokens: every lease acquisition increments a counter, and the CAS store rejects writes from stale tokens.
+
+### Why Fire-and-Forget Cold Start
+
+The S3 streamer runs as a background task after `JOB_ASSIGNED` completes. The BitTorrent engine starts accepting peer connections immediately — it does not wait for the full S3 download to finish. As each piece is committed to the CAS, it becomes instantly available for lateral seeding. This means nodes 2–50 can begin pulling pieces from node 1 while node 1 is still streaming from S3.
+
+---
+
+## Failure Handling
+
+| Failure Scenario | Detection | Recovery |
+|-----------------|-----------|----------|
+| Worker OOMKilled mid-transfer | Redis lease expires (30s TTL) | LeaseSweeper detects zombie, re-queues via Kafka |
+| Network drop during S3 stream | HTTP socket error | Exponential backoff + Range header resume at last verified piece |
+| Genesis lease stolen during stream | `renewLease()` returns null | Immediate `_abort()` — destroys HTTP socket to prevent split-brain |
+| Kafka broker crash | KafkaJS `consumer.crash` event | Worker calls `process.exit(1)`, K8s restarts the pod |
+| Stale worker writes after lease loss | Fencing token mismatch | CAS store rejects the write operation |
+| Container restart wipes engine memory | Empty file list from API | Multi-tier fallback: `.torrent` file → PostgreSQL synthesis |
+
+---
+
+## License
+
+MIT

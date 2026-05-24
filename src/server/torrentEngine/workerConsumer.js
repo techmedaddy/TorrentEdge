@@ -25,6 +25,7 @@ const LeaseManager = require('./leaseManager');
 const InternalPeerDiscovery = require('./internalPeerDiscovery');
 const PeerRegistry = require('./peerRegistry');
 const DeduplicationService = require('./deduplicationService');
+const S3ColdStartStreamer = require('./s3Streamer');
 let metrics, tracing;
 try { metrics = require('../observability/metrics'); } catch { metrics = { recordWorkerDirective: () => {}, recordWorkerHeartbeat: () => {} }; }
 try { tracing = require('../observability/tracing'); } catch { tracing = { withSpan: (n, a, fn) => fn({ setStatus: () => {}, recordException: () => {}, setAttribute: () => {} }) }; }
@@ -215,6 +216,41 @@ class WorkerConsumer extends EventEmitter {
       }
     } catch (dedupErr) {
       console.warn(`[Worker:${this._nodeId}] Dedup pre-populate failed (non-fatal): ${dedupErr.message}`);
+    }
+
+    // Phase 4.3: S3 Cold Start Bridge
+    // If the directive carries a sourceUri (Pre-Signed URL) and the torrent
+    // has zero connected peers, this worker autonomously becomes the Genesis Seeder.
+    if (payload.sourceUri) {
+      try {
+        const activePeers = torrent.peerManager ? torrent.peerManager.getConnectedCount() : 0;
+        if (activePeers === 0) {
+          console.log(`[Worker:${this._nodeId}] Zero seeders detected for ${torrent.infoHash.substring(0, 8)}. Initiating S3 Cold Start Bridge.`);
+          const streamer = new S3ColdStartStreamer({
+            torrent,
+            sourceUri: payload.sourceUri,
+            nodeId: this._nodeId,
+            downloadPath: opts.downloadPath || process.env.DOWNLOAD_PATH || './downloads',
+          });
+
+          // Fire-and-forget: the streamer runs in the background while
+          // the torrent engine simultaneously accepts peer connections.
+          // This allows lateral seeding to begin before the S3 pull finishes.
+          streamer.start()
+            .then((result) => {
+              if (result.piecesWritten > 0) {
+                console.log(`[Worker:${this._nodeId}] S3 Cold Start finished: ${result.piecesWritten} pieces, ${(result.bytesStreamed / 1048576).toFixed(1)}MB`);
+              }
+            })
+            .catch((err) => {
+              console.error(`[Worker:${this._nodeId}] S3 Cold Start failed (non-fatal): ${err.message}`);
+            });
+        } else {
+          console.log(`[Worker:${this._nodeId}] ${activePeers} active peers found. Skipping S3 Cold Start.`);
+        }
+      } catch (coldStartErr) {
+        console.warn(`[Worker:${this._nodeId}] S3 Cold Start setup failed (non-fatal): ${coldStartErr.message}`);
+      }
     }
 
     this.emit('lifecycle', buildDirective(

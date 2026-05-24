@@ -64,8 +64,9 @@ router.get('/search', torrentController.searchTorrents);
 router.get('/', torrentController.getAllTorrents);
 
 // Create/upload .torrent file or magnet link (existing)
-router.post('/create', uploadTorrent.single('torrent'), torrentController.createTorrent);
-router.post('/upload', uploadTorrent.single('torrent'), torrentController.createTorrent);
+// Phase 2.3: idempotencyGuard prevents duplicate Kafka dispatches under thundering herd
+router.post('/create', idempotencyGuard(), uploadTorrent.single('torrent'), torrentController.createTorrent);
+router.post('/upload', idempotencyGuard(), uploadTorrent.single('torrent'), torrentController.createTorrent);
 
 // Phase 1.3: Idempotency guard on file-creation (heavy, non-idempotent by default)
 router.post('/create-from-file', idempotencyGuard(), (req, res, next) => {

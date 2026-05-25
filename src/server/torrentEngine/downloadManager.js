@@ -64,8 +64,31 @@ class DownloadManager extends EventEmitter {
     }
   }
 
+  _getPeerConnection(peerEvent) {
+    return peerEvent && peerEvent.connection ? peerEvent.connection : peerEvent;
+  }
+
+  _getMessageId(message) {
+    if (message.id !== undefined) {
+      return message.id;
+    }
+
+    const typeToId = {
+      choke: MESSAGE_TYPES.CHOKE,
+      unchoke: MESSAGE_TYPES.UNCHOKE,
+      interested: MESSAGE_TYPES.INTERESTED,
+      not_interested: MESSAGE_TYPES.NOT_INTERESTED,
+      have: MESSAGE_TYPES.HAVE,
+      bitfield: MESSAGE_TYPES.BITFIELD,
+      piece: MESSAGE_TYPES.PIECE
+    };
+
+    return typeToId[message.type];
+  }
+
   _setupPeerListeners() {
-    this.peerManager.on('peer:connected', (peer) => {
+    this.peerManager.on('peer:connected', (peerEvent) => {
+      const peer = this._getPeerConnection(peerEvent);
       console.log(`[DownloadManager] Peer connected: ${peer.ip}:${peer.port}`);
       
       // Send our bitfield to the peer
@@ -95,9 +118,9 @@ class DownloadManager extends EventEmitter {
 
     this.peerManager.on('peer:message', ({ connection: peer, message }) => {
       try {
-        switch (message.id) {
+        switch (this._getMessageId(message)) {
           case MESSAGE_TYPES.BITFIELD:
-            this.handleBitfieldMessage(peer, message.payload);
+            this.handleBitfieldMessage(peer, message.payload || message.bitfield);
             break;
 
           case MESSAGE_TYPES.HAVE:
@@ -121,7 +144,7 @@ class DownloadManager extends EventEmitter {
             break;
 
           case MESSAGE_TYPES.PIECE:
-            this.handlePieceMessage(peer, message.index, message.begin, message.block);
+            this.handlePieceMessage(peer, message.index, message.begin, message.block || message.data);
             break;
 
           case MESSAGE_TYPES.INTERESTED:
@@ -143,7 +166,8 @@ class DownloadManager extends EventEmitter {
       }
     });
 
-    this.peerManager.on('peer:disconnected', (peer) => {
+    this.peerManager.on('peer:disconnected', (peerEvent) => {
+      const peer = this._getPeerConnection(peerEvent);
       console.log(`[DownloadManager] Peer disconnected: ${peer.ip}:${peer.port}`);
       this.cancelPeerRequests(peer);
     });

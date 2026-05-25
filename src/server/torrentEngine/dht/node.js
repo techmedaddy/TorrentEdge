@@ -198,15 +198,23 @@ class DHTNode extends EventEmitter {
       console.log('[DHT] Initial find_node failed:', err.message);
     }
     
-    // Check if we have enough nodes
-    if (this.nodesCount >= this._k) {
+    // A small private DHT may only have one or two bootstrap nodes. Treat any
+    // successful bootstrap as ready, while larger tables will continue filling
+    // through maintenance and iterative lookups.
+    if (this.nodesCount > 0) {
       this.isReady = true;
       console.log(`[DHT] Node ready with ${this.nodesCount} nodes in routing table`);
       
+      const readyInfo = {
+        nodeId: this.nodeId,
+        port: this.port,
+        nodes: this.nodesCount
+      };
+
       if (this._onReadyCallback) {
-        this._onReadyCallback();
+        this._onReadyCallback(readyInfo);
       }
-      this.emit('ready');
+      this.emit('ready', readyInfo);
     } else {
       console.log(`[DHT] Bootstrap incomplete: only ${this.nodesCount} nodes in routing table`);
       this.emit('warning', `Only ${this.nodesCount} nodes in routing table`);
@@ -239,6 +247,12 @@ class DHTNode extends EventEmitter {
     this._maintenanceIntervals.peerCleanup = setInterval(() => {
       this._cleanupExpiredPeers();
     }, 5 * 60 * 1000);
+
+    for (const interval of Object.values(this._maintenanceIntervals)) {
+      if (interval?.unref) {
+        interval.unref();
+      }
+    }
   }
   
   /**
@@ -673,16 +687,19 @@ class DHTNode extends EventEmitter {
     try {
       const message = bencode.decode(buffer);
       
+      // bencode decodes strings as Buffers, so convert to string for comparison
+      const type = message.y ? message.y.toString() : null;
+      
       // Handle responses to our queries
-      if (message.y === 'r' && message.t) {
+      if (type === 'r' && message.t) {
         this._handleResponse(message, rinfo);
       }
       // Handle incoming queries
-      else if (message.y === 'q' && message.q) {
+      else if (type === 'q' && message.q) {
         this._handleQuery(message, rinfo);
       }
       // Handle errors
-      else if (message.y === 'e') {
+      else if (type === 'e') {
         this._handleError(message, rinfo);
       }
     } catch (err) {
@@ -941,6 +958,9 @@ class DHTNode extends EventEmitter {
         this._pendingQueries.delete(tid);
         reject(new Error(`Query timeout: ${query.q}`));
       }, this._queryTimeout);
+      if (timer.unref) {
+        timer.unref();
+      }
       
       // Store pending query
       this._pendingQueries.set(tid, {

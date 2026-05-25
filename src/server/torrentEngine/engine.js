@@ -184,6 +184,9 @@ class TorrentEngine extends EventEmitter {
       // Emit live speed update via Socket.IO
       emitSpeedUpdate(sample);
     }, 1000);
+    if (this._speedHistoryInterval.unref) {
+      this._speedHistoryInterval.unref();
+    }
     
     console.log('[TorrentEngine] Speed history tracking started (1s interval, 60 samples)');
   }

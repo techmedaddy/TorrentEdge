@@ -322,7 +322,7 @@ describe('Torrent', () => {
 
       await torrent.stop();
 
-      expect(torrent.state).toBe('idle');
+      expect(torrent.state).toBe('stopped');
       
       // Verify 'stopped' event was sent to tracker
       expect(announce).toHaveBeenCalledWith(
@@ -335,7 +335,7 @@ describe('Torrent', () => {
     it('should clear intervals on stop', async () => {
       const torrent = new Torrent({
         torrentPath: testTorrent.torrentPath,
-        downloadPath: tmpDir
+        downloadPath: path.join(tmpDir, 'downloads')
       });
 
       await new Promise((resolve) => torrent.once('ready', resolve));
@@ -367,7 +367,7 @@ describe('Torrent', () => {
     it('should calculate progress correctly', async () => {
       const torrent = new Torrent({
         torrentPath: testTorrent.torrentPath,
-        downloadPath: tmpDir
+        downloadPath: path.join(tmpDir, 'progress-downloads')
       });
 
       await new Promise((resolve) => torrent.once('ready', resolve));
@@ -481,7 +481,8 @@ describe('TorrentEngine', () => {
     engine = new TorrentEngine({
       downloadPath: path.join(tmpDir, 'downloads'),
       maxActiveTorrents: 5,
-      port: 6883
+      port: 6883,
+      dht: { enabled: false }
     });
 
     // Reset mocks
@@ -671,7 +672,7 @@ describe('TorrentEngine', () => {
       await engine.shutdown();
 
       const torrent = engine.getAllTorrents()[0];
-      expect(torrent.state).toBe('idle');
+      expect(torrent.state).toBe('stopped');
     });
 
     it('should respect maxActiveTorrents limit', async () => {

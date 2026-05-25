@@ -48,6 +48,10 @@ class RetryManager extends EventEmitter {
         
       } catch (error) {
         lastError = error;
+
+        if (this._isCancelled) {
+          throw new Error('Retry cancelled');
+        }
         
         // Check if we should retry
         const shouldRetry = attempt < maxRetries && retryOn(error);
@@ -118,6 +122,9 @@ class RetryManager extends EventEmitter {
           resolve();
         }
       }, ms);
+      if (timer.unref) {
+        timer.unref();
+      }
       this._activeTimers.set(timer, reject);
     });
   }
@@ -132,6 +139,10 @@ class RetryManager extends EventEmitter {
       reject(new Error('Retry cancelled'));
     }
     this._activeTimers.clear();
+  }
+
+  reset() {
+    this._isCancelled = false;
   }
   
   /**

@@ -515,6 +515,7 @@ class TrackerManager {
       const result = await this.retryManager.retry(
         () => announce(announceOptions),
         {
+          maxRetries: options.event === 'stopped' ? 0 : undefined,
           retryOn: (error) => this._shouldRetry(error),
           onRetry: (attempt, error) => {
             console.log(`[TrackerManager] Retrying ${tracker.url} (attempt ${attempt}): ${error.message}`);
@@ -694,4 +695,3 @@ module.exports = {
   TrackerManager,
   TRACKER_STATE
 };
-

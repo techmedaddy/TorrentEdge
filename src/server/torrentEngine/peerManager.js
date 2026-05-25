@@ -38,7 +38,9 @@ class PeerManager extends EventEmitter {
     
     // Reconnection tracking: peerKey -> { attempts, lastAttempt, backoff }
     this.reconnectionQueue = new Map();
+    this.reconnectionTimers = new Map();
     this.maxReconnectionAttempts = 5;
+    this._destroyed = false;
     
     // Setup ban manager events
     this.banManager.on('peer:banned', ({ peerId, reason }) => {
@@ -53,7 +55,12 @@ class PeerManager extends EventEmitter {
    */
   addPeers(peers) {
     for (const peer of peers) {
-      const peerKey = `${peer.ip}:${peer.port}`;
+      const normalizedPeer = this._normalizePeer(peer);
+      if (!normalizedPeer) {
+        continue;
+      }
+
+      const peerKey = `${normalizedPeer.ip}:${normalizedPeer.port}`;
       
       if (this.activeConnections.has(peerKey)) {
         continue;
@@ -61,9 +68,39 @@ class PeerManager extends EventEmitter {
 
       const existsInPool = this.peerPool.some(p => `${p.ip}:${p.port}` === peerKey);
       if (!existsInPool) {
-        this.peerPool.push(peer);
+        this.peerPool.push(normalizedPeer);
       }
     }
+  }
+
+  /**
+   * Normalizes peer shapes from trackers, magnets, and DHT adapters.
+   * @private
+   * @param {string|{ip?: string, host?: string, port?: number|string}} peer
+   * @returns {{ip: string, port: number}|null}
+   */
+  _normalizePeer(peer) {
+    if (typeof peer === 'string') {
+      const match = peer.match(/^(.+):(\d+)$/);
+      if (!match) return null;
+      return {
+        ip: match[1],
+        port: parseInt(match[2], 10)
+      };
+    }
+
+    if (!peer || typeof peer !== 'object') {
+      return null;
+    }
+
+    const ip = peer.ip || peer.host;
+    const port = parseInt(peer.port, 10);
+
+    if (!ip || Number.isNaN(port) || port <= 0 || port > 65535) {
+      return null;
+    }
+
+    return { ip, port };
   }
 
   /**
@@ -90,7 +127,15 @@ class PeerManager extends EventEmitter {
 
         // Rate limiting: delay between connection attempts
         if (connected < count && this.peerPool.length > 0) {
-          await new Promise(resolve => setTimeout(resolve, 100));
+          await new Promise(resolve => {
+            const timer = setTimeout(resolve, 100);
+            if (timer.unref) {
+              timer.unref();
+            }
+          });
+          if (this._destroyed) {
+            break;
+          }
         }
       }
 
@@ -106,6 +151,15 @@ class PeerManager extends EventEmitter {
    * @returns {Promise<void>}
    */
   async connectToPeer(peer) {
+    if (this._destroyed) {
+      return;
+    }
+
+    peer = this._normalizePeer(peer);
+    if (!peer) {
+      return;
+    }
+
     const peerKey = `${peer.ip}:${peer.port}`;
 
     // Check if already connected
@@ -144,6 +198,15 @@ class PeerManager extends EventEmitter {
       this.ipConnections.set(peer.ip, ipCount + 1);
       
       await connection.connect();
+
+      if (this._destroyed) {
+        connection.disconnect();
+        const currentCount = this.ipConnections.get(peer.ip) || 0;
+        if (currentCount > 0) {
+          this.ipConnections.set(peer.ip, currentCount - 1);
+        }
+        return;
+      }
       
       // Initialize peer health tracking
       this._initializePeerHealth(peerKey);
@@ -167,6 +230,11 @@ class PeerManager extends EventEmitter {
    * Handles peer handshake completion
    */
   handleHandshake(peerKey, connection, info) {
+    if (this._destroyed) {
+      connection.disconnect();
+      return;
+    }
+
     this.activeConnections.set(peerKey, connection);
     this.emit('peer:connected', { peerKey, connection, info });
 
@@ -178,6 +246,10 @@ class PeerManager extends EventEmitter {
    * Handles incoming messages from peer
    */
   handleMessage(peerKey, connection, message) {
+    if (this._destroyed) {
+      return;
+    }
+
     if (message.type === 'bitfield') {
       this.updatePieceAvailability(connection, message.bitfield);
     } else if (message.type === 'have') {
@@ -196,6 +268,10 @@ class PeerManager extends EventEmitter {
    * Handles peer errors
    */
   handleError(peerKey, connection, error) {
+    if (this._destroyed) {
+      return;
+    }
+
     this.emit('peer:error', { peerKey, connection, error });
   }
 
@@ -203,6 +279,11 @@ class PeerManager extends EventEmitter {
    * Handles peer connection close
    */
   handleClose(peerKey, connection) {
+    if (this._destroyed) {
+      this.activeConnections.delete(peerKey);
+      return;
+    }
+
     if (this.activeConnections.has(peerKey)) {
       this.removePeerPieceAvailability(connection);
       this.activeConnections.delete(peerKey);
@@ -441,6 +522,15 @@ class PeerManager extends EventEmitter {
    * @private
    */
   _queueReconnection(peer, error) {
+    if (this._destroyed) {
+      return;
+    }
+
+    peer = this._normalizePeer(peer);
+    if (!peer) {
+      return;
+    }
+
     const peerKey = `${peer.ip}:${peer.port}`;
     
     // Check if peer is banned
@@ -473,8 +563,19 @@ class PeerManager extends EventEmitter {
     const delay = Math.min(reconnection.backoff * Math.pow(2, reconnection.attempts - 1), 300000); // Max 5 min
     
     console.log(`[PeerManager] Queuing reconnection to ${peerKey} in ${delay}ms (attempt ${reconnection.attempts})`);
+
+    const existingTimer = this.reconnectionTimers.get(peerKey);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
     
-    setTimeout(async () => {
+    const timer = setTimeout(async () => {
+      this.reconnectionTimers.delete(peerKey);
+
+      if (this._destroyed) {
+        return;
+      }
+
       reconnection.lastAttempt = Date.now();
       
       try {
@@ -485,6 +586,12 @@ class PeerManager extends EventEmitter {
         // Will be queued again by connectToPeer if appropriate
       }
     }, delay);
+
+    if (timer.unref) {
+      timer.unref();
+    }
+
+    this.reconnectionTimers.set(peerKey, timer);
   }
   
   /**
@@ -543,9 +650,16 @@ class PeerManager extends EventEmitter {
    * Cleans up resources
    */
   destroy() {
+    this._destroyed = true;
     this.disconnectAll();
+
+    for (const timer of this.reconnectionTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.reconnectionTimers.clear();
     
     if (this.retryManager) {
+      this.retryManager.cancelAll();
       this.retryManager.removeAllListeners();
     }
     

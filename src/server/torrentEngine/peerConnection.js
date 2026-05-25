@@ -21,7 +21,8 @@ const MESSAGE_TYPES = {
   REQUEST: 6,
   PIECE: 7,
   CANCEL: 8,
-  PORT: 9
+  PORT: 9,
+  EXTENDED: 20
 };
 
 /**
@@ -55,6 +56,7 @@ class PeerConnection extends EventEmitter {
     super();
 
     this.ip = options.ip;
+    this.host = options.ip;
     this.port = options.port;
     this.infoHash = options.infoHash;
     this.peerId = options.peerId;
@@ -63,6 +65,7 @@ class PeerConnection extends EventEmitter {
     this.onMessage = options.onMessage || (() => {});
     this.onError = options.onError || (() => {});
     this.onClose = options.onClose || (() => {});
+    this.handshakeTimeoutMs = options.handshakeTimeoutMs || 30000;
 
     // Error handling managers (optional, passed from PeerManager)
     this.timeoutManager = options.timeoutManager || null;
@@ -78,6 +81,7 @@ class PeerConnection extends EventEmitter {
     this.protocolErrors = 0;
     this.timeoutErrors = 0;
     this.lastError = null;
+    this._closedIntentionally = false;
 
     this.handshakeTimeout = null;
     this.handshakeBuffer = Buffer.alloc(0);
@@ -89,6 +93,7 @@ class PeerConnection extends EventEmitter {
     this.peerChoking = true;
     this.peerInterested = false;
     this.peerBitfield = null;
+    this.peerSupportsExtensions = false;
 
     if (!Buffer.isBuffer(this.infoHash) || this.infoHash.length !== 20) {
       throw new Error('infoHash must be a 20-byte Buffer');
@@ -97,6 +102,11 @@ class PeerConnection extends EventEmitter {
     if (!Buffer.isBuffer(this.peerId) || this.peerId.length !== 20) {
       throw new Error('peerId must be a 20-byte Buffer');
     }
+
+    // PeerManager receives structured errors via onError. This listener keeps
+    // EventEmitter's special `error` event from crashing callers that do not
+    // attach their own listener to each individual connection.
+    this.on('error', () => {});
   }
 
   /**
@@ -109,12 +119,13 @@ class PeerConnection extends EventEmitter {
         return reject(new Error('Already connected'));
       }
 
+      this._closedIntentionally = false;
       this.socket = new net.Socket();
 
       this.handshakeTimeout = setTimeout(() => {
         this.handleError(new Error('Handshake timeout'));
         reject(new Error('Handshake timeout'));
-      }, 30000);
+      }, this.handshakeTimeoutMs);
 
       this.socket.on('connect', () => {
         this.isConnected = true;
@@ -127,6 +138,10 @@ class PeerConnection extends EventEmitter {
       });
 
       this.socket.on('error', (error) => {
+        if (this._closedIntentionally) {
+          return;
+        }
+
         this.handleError(error);
         if (!this.isConnected) {
           reject(error);
@@ -150,7 +165,11 @@ class PeerConnection extends EventEmitter {
 
     handshake.writeUInt8(19, offset); offset += 1;
     handshake.write('BitTorrent protocol', offset, 19, 'utf8'); offset += 19;
-    handshake.fill(0, offset, offset + 8); offset += 8;
+    handshake.fill(0, offset, offset + 8);
+    // BEP 10 extension protocol support. This is harmless for classic peers
+    // and required for BEP 9 magnet metadata exchange.
+    handshake[offset + 5] |= 0x10;
+    offset += 8;
     this.infoHash.copy(handshake, offset); offset += 20;
     this.peerId.copy(handshake, offset);
 
@@ -271,6 +290,16 @@ class PeerConnection extends EventEmitter {
         }
         break;
 
+      case MESSAGE_TYPES.EXTENDED:
+        if (payload.length >= 1) {
+          this.onMessage({
+            type: 'extended',
+            extId: payload.readUInt8(0),
+            payload: payload.slice(1)
+          });
+        }
+        break;
+
       default:
         break;
     }
@@ -297,7 +326,8 @@ class PeerConnection extends EventEmitter {
       return this.handleError(new Error(`Invalid protocol string: ${pstr}`));
     }
 
-    // Skip reserved bytes
+    const reserved = handshake.slice(offset, offset + 8);
+    this.peerSupportsExtensions = (reserved[5] & 0x10) !== 0;
     offset += 8;
 
     // Validate info_hash
@@ -330,13 +360,15 @@ class PeerConnection extends EventEmitter {
     this.onHandshake({
       peerId: this.remotePeerId,
       ip: this.ip,
-      port: this.port
+      port: this.port,
+      supportsExtensions: this.peerSupportsExtensions
     });
 
     this.emit('handshake', {
       peerId: this.remotePeerId,
       ip: this.ip,
-      port: this.port
+      port: this.port,
+      supportsExtensions: this.peerSupportsExtensions
     });
   }
 
@@ -360,6 +392,19 @@ class PeerConnection extends EventEmitter {
     }
 
     this.socket.write(message);
+  }
+
+  /**
+   * Writes a raw wire-protocol packet to the peer.
+   * Used by extension protocol helpers that already frame messages.
+   * @param {Buffer} packet
+   */
+  write(packet) {
+    if (!this.socket || !this.isConnected || !this.isHandshakeComplete) {
+      throw new Error('Cannot write packet: not connected or handshake not complete');
+    }
+
+    this.socket.write(packet);
   }
 
   /**
@@ -471,6 +516,8 @@ class PeerConnection extends EventEmitter {
    * Closes the connection gracefully
    */
   disconnect() {
+    this._closedIntentionally = true;
+
     if (this.handshakeTimeout) {
       clearTimeout(this.handshakeTimeout);
       this.handshakeTimeout = null;

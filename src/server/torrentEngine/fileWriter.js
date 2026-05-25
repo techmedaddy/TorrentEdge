@@ -639,6 +639,8 @@ class FileWriter extends EventEmitter {
    * Closes any open file handles
    */
   async close() {
+    await this.closeAllFds();
+
     const handles = Array.from(this.fileHandles.values());
     this.fileHandles.clear();
 

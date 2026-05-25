@@ -5,6 +5,7 @@ const { Torrent } = require('../src/server/torrentEngine/torrent');
 const { parseMagnet, createMagnet } = require('../src/server/torrentEngine/magnet');
 const bencode = require('../src/server/torrentEngine/bencode');
 const { DHTNode } = require('../src/server/torrentEngine/dht/node');
+const { findBencodeEnd } = require('../src/server/torrentEngine/extensionProtocol');
 
 // Constants
 const MOCK_PEER_PORT = 7000;
@@ -235,26 +236,12 @@ class MockPeerServer {
       
       socket.write(Buffer.concat([length, message]));
       console.log('[MockPeer] Sent extension handshake with ut_metadata support');
-    } else if (extMsgId === 1) {
-      // This is likely a request (client uses id 1 for ut_metadata)
+    } else if (extMsgId === 1 || extMsgId === 2) {
+      // Metadata request. The peer advertises id 2 for ut_metadata; older
+      // clients may still send their local id 1, so the mock accepts both.
       // Parse the bencoded dictionary
       try {
-        // Find dict end
-        let dictEnd = 0;
-        let depth = 0;
-        
-        for (let i = 0; i < extPayload.length; i++) {
-          if (extPayload[i] === 0x64) { // 'd'
-            depth++;
-          } else if (extPayload[i] === 0x65) { // 'e'
-            depth--;
-            if (depth === 0) {
-              dictEnd = i + 1;
-              break;
-            }
-          }
-        }
-        
+        const dictEnd = findBencodeEnd(extPayload);
         const dict = bencode.decode(extPayload.slice(0, dictEnd));
         
         console.log(`[MockPeer] ut_metadata request: ${JSON.stringify(dict)}`);
@@ -305,7 +292,8 @@ class MockPeerServer {
     
     // If sendWrongHash is true, corrupt the data
     if (this.sendWrongHash) {
-      pieceData = Buffer.concat([pieceData, Buffer.from([0xFF])]);
+      pieceData = Buffer.from(pieceData);
+      pieceData[0] ^= 0xFF;
       console.log('[MockPeer] Sending corrupted metadata (wrong hash)');
     }
     
@@ -480,6 +468,8 @@ describe('Magnet Link Integration Tests', () => {
       expect(torrent.size).toBe(testData.content.length);
       expect(torrent.infoHash).toBe(testData.infoHashHex);
       
+      await startPromise;
+      
       // Stop torrent
       await torrent.stop();
     }, 15000);
@@ -515,6 +505,7 @@ describe('Magnet Link Integration Tests', () => {
         expect(stats.metadataProgress).toBeLessThanOrEqual(1);
       }
       
+      await startPromise;
       await torrent.stop();
     }, 15000);
   });
@@ -608,6 +599,7 @@ describe('Magnet Link Integration Tests', () => {
       expect(torrent.name).toBe('test-torrent.txt');
       expect(torrent.size).toBe(testData.content.length);
       
+      await startPromise;
       await torrent.stop();
     }, 15000);
   });
@@ -624,7 +616,7 @@ describe('Magnet Link Integration Tests', () => {
       const magnetURI = createMagnet({
         infoHash: testData.infoHashHex,
         name: 'test-torrent.txt',
-        trackers: ['http://tracker.example.com:8080/announce']
+        trackers: ['http://127.0.0.1:1/announce']
         // No direct peers, will use DHT
       });
       
@@ -638,9 +630,9 @@ describe('Magnet Link Integration Tests', () => {
       await new Promise((resolve) => torrent.on('ready', resolve));
       
       // Verify magnet has tracker
-      expect(torrent._metadata.announce).toBe('http://tracker.example.com:8080/announce');
+      expect(torrent._metadata.announce).toBe('http://127.0.0.1:1/announce');
       
-      torrent.start().catch(() => {}); // Tracker will fail, but DHT should work
+      const startPromise = torrent.start().catch(() => {}); // Tracker will fail, but DHT should work
       
       // Wait a bit for DHT to be queried
       await new Promise((resolve) => setTimeout(resolve, 2000));
@@ -649,6 +641,7 @@ describe('Magnet Link Integration Tests', () => {
       expect(mockDHT.queries.length).toBeGreaterThan(0);
       
       await torrent.stop();
+      await startPromise;
     }, 15000);
   });
   
@@ -708,8 +701,8 @@ describe('Magnet Link Integration Tests', () => {
       expect(parsed.trackers[0]).toBe('http://tracker.example.com:8080/announce');
       expect(parsed.trackers[1]).toBe('udp://tracker2.example.com:6969/announce');
       expect(parsed.peers).toHaveLength(2);
-      expect(parsed.peers[0]).toBe('192.168.1.100:6881');
-      expect(parsed.peers[1]).toBe('10.0.0.50:6882');
+      expect(parsed.peers[0]).toEqual({ ip: '192.168.1.100', port: 6881 });
+      expect(parsed.peers[1]).toEqual({ ip: '10.0.0.50', port: 6882 });
     });
     
     test('should parse magnet with base32 info hash', () => {
@@ -764,8 +757,8 @@ describe('Magnet Link Integration Tests', () => {
         peers: ['192.168.1.1:6881']
       });
       
-      expect(magnet).toContain('magnet:?xt=urn:btih:ABCD1234567890ABCDEF1234567890ABCDEF1234');
-      expect(magnet).toContain('dn=Test+Torrent');
+      expect(magnet).toContain('magnet:?xt=urn:btih:abcd1234567890abcdef1234567890abcdef1234');
+      expect(magnet).toContain('dn=Test%20Torrent');
       expect(magnet).toContain('tr=http%3A%2F%2Ftracker.com%3A8080%2Fannounce');
       expect(magnet).toContain('x.pe=192.168.1.1%3A6881');
     });
@@ -789,6 +782,12 @@ describe('Magnet Link Integration Tests', () => {
         downloadPath: './test-downloads',
         port: 6887
       });
+
+      torrent.on('fetching_metadata', () => {
+        if (states[states.length - 1] !== 'fetching_metadata') {
+          states.push('fetching_metadata');
+        }
+      });
       
       // Track all state changes
       const originalState = torrent.state;
@@ -796,6 +795,10 @@ describe('Magnet Link Integration Tests', () => {
       
       // Monitor state property
       const stateCheckInterval = setInterval(() => {
+        if (!torrent) {
+          return;
+        }
+
         const currentState = torrent.state;
         if (states[states.length - 1] !== currentState) {
           states.push(currentState);
@@ -803,29 +806,36 @@ describe('Magnet Link Integration Tests', () => {
         }
       }, 100);
       
-      await new Promise((resolve) => torrent.on('ready', resolve));
-      
-      const startPromise = torrent.start().catch(() => {});
-      
-      // Wait for metadata complete
-      await Promise.race([
-        new Promise((resolve) => torrent.on('metadata:complete', resolve)),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Timeout')), 10000)
-        )
-      ]);
-      
-      clearInterval(stateCheckInterval);
-      
-      // Verify state sequence
-      expect(states).toContain('idle');
-      expect(states).toContain('fetching_metadata');
-      
-      // Should eventually reach checking or downloading
-      const finalStates = ['checking', 'downloading', 'error'];
-      expect(finalStates.some(s => states.includes(s))).toBe(true);
-      
-      await torrent.stop();
+      try {
+        await new Promise((resolve) => torrent.on('ready', resolve));
+        
+        const startPromise = torrent.start().catch(() => {});
+        
+        // Wait for metadata complete
+        await Promise.race([
+          new Promise((resolve) => torrent.on('metadata:complete', resolve)),
+          new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Timeout')), 10000)
+          )
+        ]);
+        
+        await startPromise;
+        if (states[states.length - 1] !== torrent.state) {
+          states.push(torrent.state);
+        }
+        
+        // Verify state sequence
+        expect(states).toContain('idle');
+        expect(states).toContain('fetching_metadata');
+        
+        // Should eventually reach checking or downloading
+        const finalStates = ['checking', 'downloading', 'error'];
+        expect(finalStates.some(s => states.includes(s))).toBe(true);
+        
+        await torrent.stop();
+      } finally {
+        clearInterval(stateCheckInterval);
+      }
     }, 15000);
   });
 });

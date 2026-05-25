@@ -210,11 +210,11 @@ describe('RoutingTable', () => {
     test('should add k nodes to same bucket', () => {
       const k = table.k;
       const baseId = Buffer.from(ourNodeId);
-      baseId[19] ^= 0x01; // All nodes will be in bucket 0
+      baseId[0] ^= 0x80; // All nodes will be in the same high-distance bucket
 
       for (let i = 0; i < k; i++) {
         const nodeId = Buffer.from(baseId);
-        nodeId[18] = i; // Make each ID unique
+        nodeId[19] = i; // Make each ID unique
         const result = table.addNode(createNode(nodeId));
         expect(result).toBe(true);
       }
@@ -225,18 +225,18 @@ describe('RoutingTable', () => {
     test('should return false when adding k+1 nodes to same bucket (bucket full)', () => {
       const k = table.k;
       const baseId = Buffer.from(ourNodeId);
-      baseId[19] ^= 0x01; // All nodes will be in bucket 0
+      baseId[0] ^= 0x80; // All nodes will be in the same high-distance bucket
 
       // Add k nodes
       for (let i = 0; i < k; i++) {
         const nodeId = Buffer.from(baseId);
-        nodeId[18] = i;
+        nodeId[19] = i;
         table.addNode(createNode(nodeId));
       }
 
       // Try to add k+1 node
       const extraNodeId = Buffer.from(baseId);
-      extraNodeId[18] = k;
+      extraNodeId[19] = k;
       const result = table.addNode(createNode(extraNodeId));
 
       expect(result).toBe(false);
@@ -572,7 +572,11 @@ describe('RoutingTable', () => {
     test('should return correct statistics', () => {
       // Add various nodes
       for (let i = 0; i < 15; i++) {
-        table.addNode(createNode(generateNodeId()));
+        const nodeId = Buffer.from(ourNodeId);
+        const byteIndex = Math.floor(i / 8);
+        const bitIndex = 7 - (i % 8);
+        nodeId[byteIndex] ^= (1 << bitIndex);
+        table.addNode(createNode(nodeId));
       }
 
       const stats = table.getStats();
@@ -597,12 +601,12 @@ describe('RoutingTable', () => {
     test('should track full buckets', () => {
       const k = table.k;
       const baseId = Buffer.from(ourNodeId);
-      baseId[19] ^= 0x01;
+      baseId[0] ^= 0x80;
 
       // Fill one bucket
       for (let i = 0; i < k; i++) {
         const nodeId = Buffer.from(baseId);
-        nodeId[18] = i;
+        nodeId[19] = i;
         table.addNode(createNode(nodeId));
       }
 
@@ -614,7 +618,13 @@ describe('RoutingTable', () => {
 
   describe('Edge Cases', () => {
     test('should handle rapid additions and removals', () => {
-      const nodeIds = Array.from({ length: 20 }, () => generateNodeId());
+      const nodeIds = Array.from({ length: 20 }, (_, index) => {
+        const nodeId = Buffer.from(ourNodeId);
+        const byteIndex = Math.floor(index / 8);
+        const bitIndex = 7 - (index % 8);
+        nodeId[byteIndex] ^= (1 << bitIndex);
+        return nodeId;
+      });
 
       // Add all
       nodeIds.forEach(id => table.addNode(createNode(id)));

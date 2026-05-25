@@ -136,7 +136,7 @@ describe('Bencode Decode', () => {
     });
 
     it('should decode deeply nested structure', () => {
-      const input = 'd1:ad1:bd1:cd1:di1eeeeee';
+      const input = 'd1:ad1:bd1:cd1:di1eeeee';
       const result = decode(Buffer.from(input));
       
       expect(result.a.b.c.d).toBe(1);

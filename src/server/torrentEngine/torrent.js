@@ -110,6 +110,8 @@ class Torrent extends EventEmitter {
     this._needsMetadata = false;
     this._magnetPeers = [];
     this._metadataTimeout = null;
+    this._noPeersTimeout = null;
+    this._isStopping = false;
 
     this._announceInterval = null;
     this._statsInterval = null;
@@ -334,7 +336,7 @@ class Torrent extends EventEmitter {
    */
   async _executeRecoveryAction(errorEvent) {
     // Do not execute recovery actions if we are stopped
-    if (this._state === 'stopped' || this._state === 'idle') {
+    if (this._state === 'stopped' || this._state === 'idle' || this._state === 'stopping' || this._isStopping) {
       return;
     }
 
@@ -380,6 +382,10 @@ class Torrent extends EventEmitter {
         this.emit('fetching_metadata');
         
         await this._downloadMetadata();
+
+        if (this._isStopping || this._state === 'stopped' || this._state === 'stopping') {
+          return;
+        }
         
         // Now we have full metadata, continue normal start
         this._needsMetadata = false;
@@ -424,14 +430,16 @@ class Torrent extends EventEmitter {
 
       this._peerManager.on('peer:connected', (peer) => {
         this._connectedPeers++;
-        console.log(`[Torrent] Peer connected: ${peer.ip}:${peer.port} (${this._connectedPeers} total)`);
-        this.emit('peer:connect', { ip: peer.ip, port: peer.port });
+        const connection = peer.connection || peer;
+        console.log(`[Torrent] Peer connected: ${connection.ip}:${connection.port} (${this._connectedPeers} total)`);
+        this.emit('peer:connect', { ip: connection.ip, port: connection.port });
       });
 
       this._peerManager.on('peer:disconnected', (peer) => {
-        this._connectedPeers--;
-        console.log(`[Torrent] Peer disconnected: ${peer.ip}:${peer.port} (${this._connectedPeers} total)`);
-        this.emit('peer:disconnect', { ip: peer.ip, port: peer.port });
+        this._connectedPeers = Math.max(0, this._connectedPeers - 1);
+        const connection = peer.connection || peer;
+        console.log(`[Torrent] Peer disconnected: ${connection.ip}:${connection.port} (${this._connectedPeers} total)`);
+        this.emit('peer:disconnect', { ip: connection.ip, port: connection.port });
       });
 
       this._peerManager.on('error', (error) => {
@@ -461,6 +469,10 @@ class Torrent extends EventEmitter {
       // Announce to tracker(s) and get peers
       console.log('[Torrent] Announcing to tracker');
       await this._announceToTracker('started');
+
+      if (this._isStopping || this._state === 'stopped' || this._state === 'stopping') {
+        return;
+      }
 
       // Start download manager
       console.log('[Torrent] Starting download manager');
@@ -654,6 +666,8 @@ class Torrent extends EventEmitter {
 
     try {
       console.log('[Torrent] Stopping');
+      this._isStopping = true;
+      this._state = 'stopping';
       
       // Stop seeding-specific timers
       if (this._chokingInterval) {
@@ -687,16 +701,26 @@ class Torrent extends EventEmitter {
         clearTimeout(this._metadataTimeout);
         this._metadataTimeout = null;
       }
-      
-      // Stop metadata downloader
-      if (this._metadataDownloader) {
-        this._metadataDownloader.stop();
-        this._metadataDownloader = null;
+
+      if (this._noPeersTimeout) {
+        clearTimeout(this._noPeersTimeout);
+        this._noPeersTimeout = null;
       }
+      
+      this._cleanupMetadataSession();
 
       // Cancel pending tracker retries
       if (this._retryManager) {
         this._retryManager.cancelAll();
+        this._retryManager = new RetryManager({ maxRetries: 3, baseDelay: 2000 });
+      }
+      if (this._trackerManager?.retryManager) {
+        this._trackerManager.retryManager.cancelAll();
+        this._trackerManager.retryManager = new RetryManager({
+          maxRetries: 2,
+          baseDelay: 2000,
+          maxDelay: 30000
+        });
       }
 
       // Stop download manager
@@ -729,10 +753,12 @@ class Torrent extends EventEmitter {
       }
 
       this._state = 'stopped';
+      this._isStopping = false;
       console.log('[Torrent] Stopped');
       this.emit('stopped');
 
     } catch (error) {
+      this._isStopping = false;
       console.error(`[Torrent] Stop error: ${error.message}`);
       this.emit('error', { message: error.message });
     }
@@ -742,6 +768,23 @@ class Torrent extends EventEmitter {
     console.log('[Torrent] Destroying');
     await this.stop();
     this.removeAllListeners();
+  }
+
+  _cleanupMetadataSession() {
+    const wasMetadataSession = Boolean(this._metadataDownloader) ||
+      this._state === 'fetching_metadata' ||
+      this._needsMetadata;
+
+    if (this._metadataDownloader) {
+      this._metadataDownloader.stop();
+      this._metadataDownloader = null;
+    }
+
+    if (wasMetadataSession && this._peerManager) {
+      this._peerManager.destroy();
+      this._peerManager = null;
+      this._connectedPeers = 0;
+    }
   }
 
   _setupDownloadManagerEvents() {
@@ -1026,6 +1069,10 @@ class Torrent extends EventEmitter {
     if (!this._metadata || !this._trackerManager) {
       return;
     }
+
+    if (Array.isArray(this._trackerManager.trackers) && this._trackerManager.trackers.length === 0) {
+      return;
+    }
     
     try {
       const downloaded = this._downloadManager ? this._downloadManager.downloadedBytes : 0;
@@ -1033,6 +1080,7 @@ class Torrent extends EventEmitter {
       const remaining = this._metadata.length ? (this._metadata.length - downloaded) : 0;
       
       const params = {
+        announceUrl: this._metadata.announce,
         infoHash: this._metadata.infoHashBuffer,
         peerId: this._peerId,
         port: this._port,
@@ -1050,6 +1098,7 @@ class Torrent extends EventEmitter {
       const result = await this._retryManager.retry(
         () => this._trackerManager.announce(params),
         {
+          maxRetries: event === 'stopped' ? 0 : undefined,
           retryOn: (error) => !error.message.includes('404'),
           onRetry: (attempt, error) => {
             console.log(`[Torrent] Retrying tracker announce (attempt ${attempt}): ${error.message}`);
@@ -1070,6 +1119,13 @@ class Torrent extends EventEmitter {
       console.log(`[Torrent] Successfully announced to tracker (event: ${event || 'none'})`);
       
     } catch (error) {
+      if (
+        error.message === 'Retry cancelled' &&
+        (this._isStopping || this._state === 'stopped' || this._state === 'stopping')
+      ) {
+        return;
+      }
+
       console.error('[Torrent] Tracker announce error:', error.message);
       this._handleError(error, ERROR_CATEGORY.TRACKER, 'Tracker announce failed', false);
     }
@@ -1124,6 +1180,9 @@ class Torrent extends EventEmitter {
           }
           reject(new Error('Metadata download timeout after 5 minutes'));
         }, 5 * 60 * 1000);
+        if (this._metadataTimeout.unref) {
+          this._metadataTimeout.unref();
+        }
         
         // Initialize PeerManager for metadata fetching
         this._peerManager = new PeerManager({
@@ -1136,12 +1195,30 @@ class Torrent extends EventEmitter {
         // Track peer connections for metadata
         this._peerManager.on('peer:connected', (peer) => {
           this._connectedPeers++;
-          console.log(`[Torrent] Metadata peer connected: ${peer.ip}:${peer.port}`);
+          const connection = peer.connection || peer;
+          console.log(`[Torrent] Metadata peer connected: ${connection.ip}:${connection.port}`);
+
+          if (this._metadataDownloader && connection.peerSupportsExtensions) {
+            this._metadataDownloader.sendExtensionHandshake(connection);
+          }
         });
         
         this._peerManager.on('peer:disconnected', (peer) => {
-          this._connectedPeers--;
-          console.log(`[Torrent] Metadata peer disconnected: ${peer.ip}:${peer.port}`);
+          this._connectedPeers = Math.max(0, this._connectedPeers - 1);
+          const connection = peer.connection || peer;
+          console.log(`[Torrent] Metadata peer disconnected: ${connection.ip}:${connection.port}`);
+        });
+
+        this._peerManager.on('peer:message', ({ connection, message }) => {
+          if (!this._metadataDownloader || !message || message.type !== 'extended') {
+            return;
+          }
+
+          this._metadataDownloader.handleExtendedMessage(
+            connection,
+            message.extId,
+            message.payload
+          );
         });
         
         // Create MetadataDownloader
@@ -1167,24 +1244,36 @@ class Torrent extends EventEmitter {
         this._metadataDownloader.on('error', (error) => {
           console.error(`[Torrent] Metadata download error: ${error.message}`);
           clearTimeout(this._metadataTimeout);
+          this._cleanupMetadataSession();
           reject(error);
+        });
+
+        this._metadataDownloader.on('requestPiece', (pieceIndex) => {
+          if (!this._peerManager || !this._metadataDownloader) {
+            return;
+          }
+
+          for (const peer of this._peerManager.getConnectedPeers()) {
+            this._metadataDownloader.requestPiece(peer, pieceIndex);
+          }
         });
         
         // Add direct peers from magnet link
         if (this._magnetPeers && this._magnetPeers.length > 0) {
           console.log(`[Torrent] Adding ${this._magnetPeers.length} direct peers from magnet`);
           this._peerManager.addPeers(this._magnetPeers);
+          await this._peerManager.connectToPeers(this._magnetPeers.length);
         }
         
         // Announce to trackers to get more peers
         if (this._metadata.announce) {
-          try {
-            console.log('[Torrent] Announcing to tracker for peers...');
-            await this._announceToTracker('started');
-          } catch (error) {
-            console.warn(`[Torrent] Tracker announce failed: ${error.message}`);
-            // Continue anyway, we might have DHT or direct peers
-          }
+          console.log('[Torrent] Announcing to tracker for peers...');
+          this._announceToTracker('started').catch((error) => {
+            if (!this._isStopping && this._state !== 'stopped' && this._state !== 'stopping') {
+              console.warn(`[Torrent] Tracker announce failed: ${error.message}`);
+            }
+            // Continue anyway, we might have DHT or direct peers.
+          });
         }
         
         // Use DHT to find peers
@@ -1195,17 +1284,31 @@ class Torrent extends EventEmitter {
             
             // Listen for peers from DHT
             this._dht.on('peer', (data) => {
+              if (!this._peerManager || this._isStopping || this._state === 'stopped' || this._state === 'stopping') {
+                return;
+              }
+
               if (data.infoHash === infoHashHex) {
                 console.log(`[Torrent] DHT found peer: ${data.peer.host}:${data.peer.port}`);
                 this._peerManager.addPeers([data.peer]);
+                this._peerManager.connectToPeers(1).catch((error) => {
+                  console.warn(`[Torrent] DHT peer connect failed: ${error.message}`);
+                });
               }
             });
             
             // Start DHT lookup
             await this._dht.getPeers(this._metadata.infoHashBuffer, (peers) => {
+              if (!this._peerManager || this._isStopping || this._state === 'stopped' || this._state === 'stopping') {
+                return;
+              }
+
               if (peers && peers.length > 0) {
                 console.log(`[Torrent] DHT returned ${peers.length} peers`);
                 this._peerManager.addPeers(peers);
+                this._peerManager.connectToPeers(peers.length).catch((error) => {
+                  console.warn(`[Torrent] DHT peer connect failed: ${error.message}`);
+                });
               }
             });
           } catch (error) {
@@ -1215,23 +1318,35 @@ class Torrent extends EventEmitter {
         }
         
         // Start metadata downloader
+        if (!this._metadataDownloader || !this._peerManager || this._isStopping || this._state === 'stopped' || this._state === 'stopping') {
+          return reject(new Error('Metadata download cancelled'));
+        }
+
         this._metadataDownloader.start();
         
         // If no peers after 30 seconds, error out
-        setTimeout(() => {
+        this._noPeersTimeout = setTimeout(() => {
+          this._noPeersTimeout = null;
+
+          if (this._isStopping || this._state === 'stopped' || this._state === 'stopping') {
+            return;
+          }
+
           if (this._connectedPeers === 0) {
             console.error('[Torrent] No peers connected after 30 seconds');
             clearTimeout(this._metadataTimeout);
-            if (this._metadataDownloader) {
-              this._metadataDownloader.stop();
-            }
+            this._cleanupMetadataSession();
             reject(new Error('No peers available for metadata download'));
           }
         }, 30000);
+        if (this._noPeersTimeout.unref) {
+          this._noPeersTimeout.unref();
+        }
         
       } catch (error) {
         console.error(`[Torrent] Metadata download setup error: ${error.message}`);
         clearTimeout(this._metadataTimeout);
+        this._cleanupMetadataSession();
         reject(error);
       }
     });
@@ -1247,24 +1362,55 @@ class Torrent extends EventEmitter {
         this._metadataTimeout = null;
       }
       
-      // Parse the info dictionary to update metadata
-      const { parseTorrent } = require('./torrentParser');
-      
-      // Create a minimal torrent structure with the info dict
-      const bencode = require('./bencode');
-      const fullTorrent = bencode.encode({
-        info: infoDict
-      });
-      
-      // Parse it to get proper metadata structure
-      const fullMetadata = parseTorrent(fullTorrent);
-      
-      // Update our metadata with the full info
-      this._metadata.name = fullMetadata.name;
-      this._metadata.pieceLength = fullMetadata.pieceLength;
-      this._metadata.pieces = fullMetadata.pieces;
-      this._metadata.length = fullMetadata.length;
-      this._metadata.files = fullMetadata.files;
+      const name = Buffer.isBuffer(infoDict.name)
+        ? infoDict.name.toString('utf8')
+        : infoDict.name;
+      const pieceLength = infoDict['piece length'];
+      const piecesBuffer = Buffer.isBuffer(infoDict.pieces)
+        ? infoDict.pieces
+        : Buffer.from(infoDict.pieces || []);
+
+      if (!name) {
+        throw new Error('Missing required field: info.name');
+      }
+      if (typeof pieceLength !== 'number') {
+        throw new Error('Missing or invalid info.piece length: expected number');
+      }
+      if (piecesBuffer.length === 0 || piecesBuffer.length % 20 !== 0) {
+        throw new Error(`Invalid pieces length: must be multiple of 20, got ${piecesBuffer.length}`);
+      }
+
+      const pieces = [];
+      for (let i = 0; i < piecesBuffer.length; i += 20) {
+        pieces.push(piecesBuffer.slice(i, i + 20));
+      }
+
+      let length = 0;
+      let files = null;
+      if (Array.isArray(infoDict.files)) {
+        files = infoDict.files.map((file) => {
+          const filePath = Array.isArray(file.path)
+            ? file.path.map((part) => Buffer.isBuffer(part) ? part.toString('utf8') : String(part)).join('/')
+            : name;
+          return {
+            path: filePath,
+            length: file.length,
+          };
+        });
+        length = files.reduce((sum, file) => sum + file.length, 0);
+      } else if (typeof infoDict.length === 'number') {
+        length = infoDict.length;
+      } else {
+        throw new Error('Missing or invalid info.length: expected number');
+      }
+
+      // Update our metadata with the full info. Preserve announce data from
+      // the original magnet link; BEP-9 metadata only contains the info dict.
+      this._metadata.name = name;
+      this._metadata.pieceLength = pieceLength;
+      this._metadata.pieces = pieces;
+      this._metadata.length = length;
+      this._metadata.files = files;
       
       console.log(`[Torrent] Metadata verified and parsed successfully`);
       console.log(`[Torrent] Name: ${this._metadata.name}`);
@@ -1276,6 +1422,8 @@ class Torrent extends EventEmitter {
         size: this._metadata.length,
         pieceCount: this._metadata.pieces.length
       });
+
+      this._cleanupMetadataSession();
       
       resolve();
       

@@ -139,6 +139,8 @@ class StateManager extends EventEmitter {
       this._state.savedAt = Date.now();
       
       const stateJson = JSON.stringify(this._state, null, 2);
+
+      await fs.mkdir(this.stateDir, { recursive: true });
       
       // Write to temp file first (atomic write)
       await fs.writeFile(this._tempFile, stateJson, 'utf8');

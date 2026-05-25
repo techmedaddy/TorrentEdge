@@ -6,12 +6,18 @@ describe('PeerConnection', () => {
   let serverPort;
   let infoHash;
   let peerId;
+  let sockets;
 
   beforeEach((done) => {
     infoHash = Buffer.alloc(20, 0xAA);
     peerId = Buffer.alloc(20, 0xBB);
+    sockets = new Set();
 
     mockServer = net.createServer();
+    mockServer.on('connection', (socket) => {
+      sockets.add(socket);
+      socket.on('close', () => sockets.delete(socket));
+    });
     mockServer.listen(0, () => {
       serverPort = mockServer.address().port;
       done();
@@ -19,6 +25,10 @@ describe('PeerConnection', () => {
   });
 
   afterEach((done) => {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+
     if (mockServer) {
       mockServer.close(() => done());
     } else {
@@ -163,8 +173,6 @@ describe('PeerConnection', () => {
     });
 
     it('should timeout if no handshake received', (done) => {
-      jest.useFakeTimers();
-
       mockServer.once('connection', () => {
         // Accept connection but never send handshake
       });
@@ -174,16 +182,15 @@ describe('PeerConnection', () => {
         port: serverPort,
         infoHash,
         peerId,
+        handshakeTimeoutMs: 10,
         onError: (error) => {
           expect(error.message).toContain('timeout');
-          jest.useRealTimers();
+          conn.disconnect();
           done();
         }
       });
 
-      conn.connect();
-
-      jest.advanceTimersByTime(30000);
+      conn.connect().catch(() => {});
     });
   });
 
@@ -465,21 +472,23 @@ describe('PeerConnection', () => {
 
   describe('Message Sending', () => {
     it('should send interested message with correct format', (done) => {
+      let conn;
+
       mockServer.once('connection', (socket) => {
         const handshake = createHandshake(infoHash);
         socket.write(handshake);
 
-        socket.on('data', (data) => {
-          if (data.length === 68) return; // Skip our handshake
-
+        socket.on('data', createClientMessageReader((data) => {
           expect(data.length).toBe(5);
           expect(data.readUInt32BE(0)).toBe(1);
           expect(data.readUInt8(4)).toBe(MESSAGE_TYPES.INTERESTED);
+          conn.disconnect();
+          socket.destroy();
           done();
-        });
+        }));
       });
 
-      const conn = new PeerConnection({
+      conn = new PeerConnection({
         ip: '127.0.0.1',
         port: serverPort,
         infoHash,
@@ -497,25 +506,26 @@ describe('PeerConnection', () => {
       const index = 5;
       const begin = 16384;
       const length = 16384;
+      let conn;
 
       mockServer.once('connection', (socket) => {
         const handshake = createHandshake(infoHash);
         socket.write(handshake);
 
-        socket.on('data', (data) => {
-          if (data.length === 68) return;
-
+        socket.on('data', createClientMessageReader((data) => {
           expect(data.length).toBe(17);
           expect(data.readUInt32BE(0)).toBe(13);
           expect(data.readUInt8(4)).toBe(MESSAGE_TYPES.REQUEST);
           expect(data.readUInt32BE(5)).toBe(index);
           expect(data.readUInt32BE(9)).toBe(begin);
           expect(data.readUInt32BE(13)).toBe(length);
+          conn.disconnect();
+          socket.destroy();
           done();
-        });
+        }));
       });
 
-      const conn = new PeerConnection({
+      conn = new PeerConnection({
         ip: '127.0.0.1',
         port: serverPort,
         infoHash,
@@ -529,20 +539,22 @@ describe('PeerConnection', () => {
     });
 
     it('should send keep-alive with correct format', (done) => {
+      let conn;
+
       mockServer.once('connection', (socket) => {
         const handshake = createHandshake(infoHash);
         socket.write(handshake);
 
-        socket.on('data', (data) => {
-          if (data.length === 68) return;
-
+        socket.on('data', createClientMessageReader((data) => {
           expect(data.length).toBe(4);
           expect(data.readUInt32BE(0)).toBe(0);
+          conn.disconnect();
+          socket.destroy();
           done();
-        });
+        }));
       });
 
-      const conn = new PeerConnection({
+      conn = new PeerConnection({
         ip: '127.0.0.1',
         port: serverPort,
         infoHash,
@@ -576,4 +588,35 @@ function createHandshake(infoHash) {
   infoHash.copy(handshake, 28);
   Buffer.alloc(20, 0xCC).copy(handshake, 48);
   return handshake;
+}
+
+function createClientMessageReader(onMessage) {
+  let buffer = Buffer.alloc(0);
+  let sawHandshake = false;
+
+  return (data) => {
+    buffer = Buffer.concat([buffer, data]);
+
+    if (!sawHandshake) {
+      if (buffer.length < 68) {
+        return;
+      }
+
+      buffer = buffer.slice(68);
+      sawHandshake = true;
+    }
+
+    while (buffer.length >= 4) {
+      const length = buffer.readUInt32BE(0);
+      const packetLength = 4 + length;
+
+      if (buffer.length < packetLength) {
+        return;
+      }
+
+      const packet = buffer.slice(0, packetLength);
+      buffer = buffer.slice(packetLength);
+      onMessage(packet);
+    }
+  };
 }

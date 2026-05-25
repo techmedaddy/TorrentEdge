@@ -29,6 +29,64 @@ const EXTENDED_MESSAGE_ID = 20;
 const EXTENDED_HANDSHAKE_ID = 0;
 
 /**
+ * Returns the end offset of one bencoded value inside a buffer.
+ * Used to split a ut_metadata dictionary from its trailing piece bytes.
+ *
+ * @param {Buffer} buffer
+ * @param {number} offset
+ * @returns {number}
+ */
+function findBencodeEnd(buffer, offset = 0) {
+  if (!Buffer.isBuffer(buffer) || offset >= buffer.length) {
+    throw new Error('Invalid bencode buffer');
+  }
+
+  const byte = buffer[offset];
+
+  // Integer: i<digits>e
+  if (byte === 0x69) {
+    const end = buffer.indexOf(0x65, offset + 1);
+    if (end === -1) {
+      throw new Error('Unterminated bencode integer');
+    }
+    return end + 1;
+  }
+
+  // List or dictionary: l...e / d...e
+  if (byte === 0x6c || byte === 0x64) {
+    let cursor = offset + 1;
+    while (cursor < buffer.length && buffer[cursor] !== 0x65) {
+      cursor = findBencodeEnd(buffer, cursor);
+    }
+    if (cursor >= buffer.length) {
+      throw new Error('Unterminated bencode container');
+    }
+    return cursor + 1;
+  }
+
+  // Byte string: <length>:<bytes>
+  if (byte >= 0x30 && byte <= 0x39) {
+    const colon = buffer.indexOf(0x3a, offset);
+    if (colon === -1) {
+      throw new Error('Invalid bencode string');
+    }
+
+    const length = parseInt(buffer.toString('ascii', offset, colon), 10);
+    if (Number.isNaN(length) || length < 0) {
+      throw new Error('Invalid bencode string length');
+    }
+
+    const end = colon + 1 + length;
+    if (end > buffer.length) {
+      throw new Error('Truncated bencode string');
+    }
+    return end;
+  }
+
+  throw new Error(`Invalid bencode token: ${byte}`);
+}
+
+/**
  * MetadataDownloader - Downloads torrent metadata via extension protocol (BEP 9)
  * 
  * Used to fetch .torrent info from peers when only a magnet link is available.
@@ -230,25 +288,8 @@ class MetadataDownloader extends EventEmitter {
    */
   _handleUtMetadataMessage(peer, extId, payload) {
     try {
-      // Find the bencode dictionary end to separate dict from data
-      let dictEnd = 0;
-      let depth = 0;
-      let inDict = false;
-      
-      for (let i = 0; i < payload.length; i++) {
-        if (payload[i] === 0x64) { // 'd' - dict start
-          depth++;
-          inDict = true;
-        } else if (payload[i] === 0x65 && inDict) { // 'e' - dict/list end
-          depth--;
-          if (depth === 0) {
-            dictEnd = i + 1;
-            break;
-          }
-        }
-      }
-      
-      if (dictEnd === 0) {
+      const dictEnd = findBencodeEnd(payload);
+      if (dictEnd === 0 || dictEnd > payload.length) {
         console.error('[MetadataDownloader] Failed to parse ut_metadata message');
         return;
       }
@@ -508,5 +549,6 @@ module.exports = {
   UT_METADATA_MSG_TYPES,
   METADATA_PIECE_SIZE,
   supportsExtensions,
-  setExtensionBit
+  setExtensionBit,
+  findBencodeEnd
 };

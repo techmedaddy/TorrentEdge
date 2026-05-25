@@ -172,7 +172,7 @@ function decode(buffer) {
       const key = keyBuffer.toString('utf8');
       
       // Parse the value
-      if (position >= buffer.length) {
+      if (position >= buffer.length || buffer[position] === 0x65) {
         throw new Error(`Dictionary key "${key}" has no value`);
       }
       

@@ -153,7 +153,7 @@ function parseMagnet(magnetURI) {
   // Extract xt (exact topic) - required
   const xt = params.get('xt');
   if (!xt) {
-    throw new Error('Invalid magnet URI: missing xt parameter');
+    throw new Error('Invalid magnet URI: xt parameter is required');
   }
 
   // Parse info hash from xt
@@ -182,10 +182,10 @@ function parseMagnet(magnetURI) {
         throw new Error(`Invalid base32 info hash: ${error.message}`);
       }
     } else {
-      throw new Error('Invalid info hash: must be 40 hex characters or 32 base32 characters');
+      throw new Error('Invalid info hash length: must be 40 hex characters or 32 base32 characters');
     }
   } else {
-    throw new Error('Invalid xt parameter: must start with "urn:btih:"');
+    throw new Error('Invalid xt format: must start with "urn:btih:"');
   }
 
   // Extract dn (display name) - optional
@@ -269,7 +269,14 @@ function createMagnet(options) {
     throw new Error('Options must be an object');
   }
 
-  const { infoHash, displayName, trackers } = options;
+  const {
+    infoHash,
+    displayName,
+    name,
+    trackers,
+    peers,
+    webSeeds,
+  } = options;
 
   if (!infoHash) {
     throw new Error('infoHash is required');
@@ -283,8 +290,11 @@ function createMagnet(options) {
     }
     infoHashHex = infoHash.toString('hex');
   } else if (typeof infoHash === 'string') {
+    if (infoHash.length !== 40) {
+      throw new Error('Invalid infoHash length: must be 40 hex characters');
+    }
     if (!/^[a-fA-F0-9]{40}$/.test(infoHash)) {
-      throw new Error('infoHash string must be 40 hex characters');
+      throw new Error('Invalid infoHash: must contain only hex characters');
     }
     infoHashHex = infoHash.toLowerCase();
   } else {
@@ -294,9 +304,11 @@ function createMagnet(options) {
   // Build magnet URI
   let magnetURI = `magnet:?xt=urn:btih:${infoHashHex}`;
 
-  // Add display name if provided
-  if (displayName) {
-    magnetURI += `&dn=${encodeURIComponent(displayName)}`;
+  // Add display name if provided. `name` is accepted as a practical alias
+  // because torrent metadata uses `name` while magnet links call it `dn`.
+  const magnetDisplayName = displayName || name;
+  if (magnetDisplayName) {
+    magnetURI += `&dn=${encodeURIComponent(magnetDisplayName)}`;
   }
 
   // Add trackers if provided
@@ -304,6 +316,36 @@ function createMagnet(options) {
     for (const tracker of trackers) {
       if (tracker) {
         magnetURI += `&tr=${encodeURIComponent(tracker)}`;
+      }
+    }
+  }
+
+  // Add direct peers if provided. Accept either "host:port" strings or
+  // { ip|host, port } objects and serialize them as x.pe entries.
+  if (Array.isArray(peers)) {
+    for (const peer of peers) {
+      let peerAddress = null;
+
+      if (typeof peer === 'string') {
+        peerAddress = peer;
+      } else if (peer && typeof peer === 'object') {
+        const host = peer.ip || peer.host;
+        if (host && peer.port) {
+          peerAddress = `${host}:${peer.port}`;
+        }
+      }
+
+      if (peerAddress) {
+        magnetURI += `&x.pe=${encodeURIComponent(peerAddress)}`;
+      }
+    }
+  }
+
+  // Add web seeds if provided.
+  if (Array.isArray(webSeeds)) {
+    for (const webSeed of webSeeds) {
+      if (webSeed) {
+        magnetURI += `&ws=${encodeURIComponent(webSeed)}`;
       }
     }
   }

@@ -268,7 +268,7 @@ describe('Magnet Link Parser', () => {
       const parsed = parseMagnet(magnetURI);
 
       expect(parsed.infoHash).toBe(original.infoHash);
-      expect(parsed.displayName).toBeUndefined();
+      expect(parsed.displayName).toBeNull();
       expect(parsed.trackers).toEqual([]);
     });
 

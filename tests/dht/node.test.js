@@ -466,7 +466,7 @@ describe('DHTNode', () => {
   });
 
   describe('Announce Peer + Get Peers (with peers)', () => {
-    let nodeA, nodeB, nodeC;
+    let nodeA, nodeB, nodeC, nodeD;
     let infoHash;
 
     beforeEach(async () => {

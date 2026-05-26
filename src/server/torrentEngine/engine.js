@@ -1231,19 +1231,19 @@ class TorrentEngine extends EventEmitter {
     // Max active torrents
     if (settings.maxActiveTorrents && settings.maxActiveTorrents !== this.maxActiveTorrents) {
       this.maxActiveTorrents = settings.maxActiveTorrents;
-      changes.push(`maxActiveTorrents: ${settings.maxActiveTorrents}`);
+      changes.push('maxActiveTorrents');
     }
     
     // Max concurrent
     if (settings.maxConcurrent && this._queueManager) {
       this._queueManager.maxConcurrent = settings.maxConcurrent;
-      changes.push(`maxConcurrent: ${settings.maxConcurrent}`);
+      changes.push('maxConcurrent');
     }
     
     // Speed limits
     if (settings.speedLimits) {
       this.setSpeedLimits(settings.speedLimits.download, settings.speedLimits.upload);
-      changes.push(`speedLimits: DL=${settings.speedLimits.download}, UL=${settings.speedLimits.upload}`);
+      changes.push('speedLimits');
     }
     
     if (changes.length > 0) {
@@ -1272,7 +1272,7 @@ class TorrentEngine extends EventEmitter {
       this._globalThrottler.setLimits(downloadLimit, uploadLimit);
     }
     
-    console.log(`[TorrentEngine] Speed limits set: DL=${downloadLimit} B/s, UL=${uploadLimit} B/s`);
+    console.log('[TorrentEngine] Speed limits set');
   }
 
   async saveState() {

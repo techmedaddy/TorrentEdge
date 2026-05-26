@@ -81,6 +81,23 @@ docker compose up -d
 - 🩺 **Health check:** `GET http://localhost:3029/api/health` confirms the API process is live.
 - 📊 **Metrics endpoint:** `GET http://localhost:3029/metrics` exposes Prometheus-compatible service and transfer metrics.
 
+## 🧪 Code Review (SonarCloud)
+
+SonarCloud is a lightweight, hosted alternative to running SonarQube locally.
+
+### ✅ Create a Project & Token
+
+1. Create a project in SonarCloud.
+2. Generate a project token for analysis.
+
+### ✅ Run a Scan (Locally)
+
+```bash
+SONAR_TOKEN=<YOUR_TOKEN> npx sonar-scanner
+```
+
+The scan configuration lives in [sonar-project.properties](sonar-project.properties).
+
 ## 🔌 API & Pipeline Integration
 
 ```bash

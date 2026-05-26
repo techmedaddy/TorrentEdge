@@ -4,6 +4,11 @@ const { User } = require('./models/sql');
 
 dotenv.config();
 
+const seedPassword = process.env.SEED_USER_PASSWORD;
+if (!seedPassword) {
+  throw new Error('SEED_USER_PASSWORD is required to run seed.js');
+}
+
 (async () => {
   try {
     await sequelize.authenticate();
@@ -14,7 +19,7 @@ dotenv.config();
     await User.create({
       username: 'testuser',
       email: 'testuser@example.com',
-      password: 'testpassword',
+      password: seedPassword,
     });
 
     console.log('Test user created successfully.');

@@ -1,6 +1,12 @@
 const http = require('http');
 const jwt = require('jsonwebtoken');
-const token = jwt.sign({ userId: 'test-user-id', role: 'admin' }, 'torrentedge-dev-secret-change-in-production', { expiresIn: '1h' });
+
+const jwtSecret = process.env.JWT_SECRET;
+if (!jwtSecret) {
+  throw new Error('JWT_SECRET is required to generate a token for test_create.js');
+}
+
+const token = jwt.sign({ userId: 'test-user-id', role: 'admin' }, jwtSecret, { expiresIn: '1h' });
 
 const req = http.request({
   hostname: 'localhost',

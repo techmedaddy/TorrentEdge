@@ -24,10 +24,12 @@ const TEST_USER = {
   email: 'loadtest@torrentedge.internal',
   role: 'admin',
   auth_provider: 'local',
-  password: 'load-test-password-not-used',
 };
 
-const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-jwt-key-change-this';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  throw new Error('JWT_SECRET is required to generate a test token');
+}
 
 async function seedUserAndGenerateToken() {
   let sequelize = null;

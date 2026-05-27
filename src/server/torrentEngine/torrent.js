@@ -363,7 +363,7 @@ class Torrent extends EventEmitter {
         
       case 'pause':
         console.log('[Torrent] Pausing due to error');
-        await this.pause();
+        this.pause();
         break;
         
       case 'abort':
@@ -576,7 +576,7 @@ class Torrent extends EventEmitter {
     pieceManager.on('verify:progress', (data) => this.emit('verify:progress', data));
     pieceManager.on('verify:complete', (data) => this.emit('verify:complete', data));
     
-    return await pieceManager.verifyPieces(completedPieces);
+    return pieceManager.verifyPieces(completedPieces);
   }
 
   async _verifyCompletedPieces() {
@@ -602,7 +602,7 @@ class Torrent extends EventEmitter {
   async _runPieceVerification(completedPieces) {
     const verifyFn = this._downloadManager.verifyPieces?.bind(this._downloadManager);
     if (verifyFn) {
-      return Promise.resolve(verifyFn(completedPieces));
+      return verifyFn(completedPieces);
     }
     return this._verifyPiecesManually(completedPieces);
   }

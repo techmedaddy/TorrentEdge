@@ -164,132 +164,13 @@ class WorkerConsumer extends EventEmitter {
   // ═══════════════════════════════════════════════════════════════════════════
 
   async _handleJobAssigned(payload, meta) {
-    const opts = {};
-    if (payload.magnetUri)     opts.magnetURI     = payload.magnetUri;
-    if (payload.torrentBuffer) opts.torrentBuffer  = Buffer.isBuffer(payload.torrentBuffer) 
-                                                       ? payload.torrentBuffer 
-                                                       : Buffer.from(payload.torrentBuffer, 'base64');
-    if (payload.torrentPath)   opts.torrentPath    = payload.torrentPath;
-    if (payload.downloadPath)  opts.downloadPath   = payload.downloadPath;
-    opts.autoStart = payload.autoStart !== false;
-    opts.priority  = payload.priority || 'normal';
-
+    const opts = this._buildTorrentOptions(payload);
     const torrent = await this._engine.addTorrent(opts);
 
-    // Phase 2.2: Acquire lease (returns fencing token or null)
-    const fencingToken = await LeaseManager.acquireLease(torrent.infoHash, this._nodeId);
-    if (fencingToken === null) {
-      console.warn(`[Worker:${this._nodeId}] Failed to acquire lease for new job ${torrent.infoHash}. Removing...`);
-      await this._engine.removeTorrent(torrent.infoHash);
-      throw new Error(`Lease denied for ${torrent.infoHash}`);
-    }
-
-    // Phase 4.1: Register in peer registry and start internal discovery
-    try {
-      if (torrent.peerManager) {
-        await this._peerDiscovery.startDiscovery(torrent.infoHash, torrent.peerManager, {
-          completedPieces: 0,
-          totalPieces: torrent.numPieces || 0,
-        });
-      }
-    } catch (discoveryErr) {
-      console.warn(`[Worker:${this._nodeId}] Internal peer discovery failed (non-fatal): ${discoveryErr.message}`);
-    }
-
-    // Phase 4.2: Attempt to pre-populate from CAS (deduplication)
-    try {
-      if (torrent.fileWriter && torrent.pieceLength) {
-        const dedupResult = await this._dedup.prePopulate(
-          torrent.infoHash,
-          torrent.fileWriter,
-          torrent.pieceLength
-        );
-        if (dedupResult.deduped.length > 0) {
-          // Mark deduped pieces as complete in the engine
-          for (const pieceIndex of dedupResult.deduped) {
-            if (torrent.pieceManager) {
-              torrent.pieceManager.markComplete(pieceIndex);
-            }
-          }
-          console.log(`[Worker:${this._nodeId}] Dedup saved ${dedupResult.deduped.length} pieces for ${torrent.infoHash.substring(0, 8)}`);
-        }
-      }
-    } catch (dedupErr) {
-      console.warn(`[Worker:${this._nodeId}] Dedup pre-populate failed (non-fatal): ${dedupErr.message}`);
-    }
-
-    // Phase 4.3: S3 Cold Start Bridge
-    // If the directive carries a sourceUri (Pre-Signed URL) and the torrent
-    // has zero connected peers, this worker autonomously becomes the Genesis Seeder.
-    if (payload.sourceUri) {
-      try {
-        const activePeers = torrent.peerManager ? torrent.peerManager.getConnectedCount() : 0;
-        if (activePeers === 0) {
-          console.log(`[Worker:${this._nodeId}] Zero seeders detected for ${torrent.infoHash.substring(0, 8)}. Initiating S3 Cold Start Bridge.`);
-          const streamer = new S3ColdStartStreamer({
-            torrent,
-            sourceUri: payload.sourceUri,
-            nodeId: this._nodeId,
-            downloadPath: opts.downloadPath || process.env.DOWNLOAD_PATH || './downloads',
-          });
-
-          // Fire-and-forget: the streamer runs in the background while
-          // the torrent engine simultaneously accepts peer connections.
-          // This allows lateral seeding to begin before the S3 pull finishes.
-          
-          // CRITICAL: Clear the metadata timeout. As the Genesis node, we do not 
-          // rely on peers for metadata. Because torrent.start() is called asynchronously 
-          // by the QueueManager, we must poll briefly to intercept and clear the timeout.
-          const clearS3Timeout = setInterval(() => {
-            if (torrent._metadataTimeout) {
-              clearTimeout(torrent._metadataTimeout);
-              torrent._metadataTimeout = null;
-              clearInterval(clearS3Timeout);
-            }
-          }, 100);
-          setTimeout(() => clearInterval(clearS3Timeout), 5000); // Safety catch
-
-          streamer.start()
-            .then((result) => {
-              if (result.piecesWritten > 0) {
-                console.log(`[Worker:${this._nodeId}] S3 Cold Start finished: ${result.piecesWritten} pieces, ${(result.bytesStreamed / 1048576).toFixed(1)}MB`);
-              }
-              // Once downloaded from S3, forcefully transition to seeding so CLI unblocks
-              if (torrent._state !== 'seeding') {
-                if (typeof torrent._transitionToSeeding === 'function') {
-                  torrent._transitionToSeeding();
-                } else {
-                  torrent._state = 'seeding';
-                  torrent.progress = 1;
-                }
-              }
-              
-              // Emit completion event to update the Control Plane DB
-              this.emit('lifecycle', buildDirective(
-                DIRECTIVE_TYPES.TRANSFER_COMPLETED,
-                { infoHash: torrent.infoHash, name: torrent.name, size: result.bytesStreamed },
-                { nodeId: this._nodeId }
-              ));
-            })
-            .catch((err) => {
-              console.error(`[Worker:${this._nodeId}] S3 Cold Start failed (non-fatal): ${err.message}`);
-              // Ensure CLI polling loop breaks on stream failure
-              torrent._state = 'error';
-              torrent.emit('error', new Error(`S3 Stream Failed: ${err.message}`));
-              
-              this.emit('lifecycle', buildDirective(
-                DIRECTIVE_TYPES.TRANSFER_FAILED,
-                { infoHash: torrent.infoHash, name: torrent.name, error: err.message },
-                { nodeId: this._nodeId }
-              ));
-            });
-        } else {
-          console.log(`[Worker:${this._nodeId}] ${activePeers} active peers found. Skipping S3 Cold Start.`);
-        }
-      } catch (coldStartErr) {
-        console.warn(`[Worker:${this._nodeId}] S3 Cold Start setup failed (non-fatal): ${coldStartErr.message}`);
-      }
-    }
+    await this._ensureLease(torrent);
+    await this._startPeerDiscovery(torrent);
+    await this._prePopulateDedup(torrent);
+    await this._maybeStartColdStart(payload, torrent, opts.downloadPath);
 
     this.emit('lifecycle', buildDirective(
       DIRECTIVE_TYPES.TRANSFER_STARTED,
@@ -301,6 +182,148 @@ class WorkerConsumer extends EventEmitter {
       },
       { nodeId: this._nodeId, requestId: meta?.requestId }
     ));
+  }
+
+  _buildTorrentOptions(payload) {
+    const opts = {};
+    if (payload.magnetUri) opts.magnetURI = payload.magnetUri;
+    if (payload.torrentBuffer) {
+      opts.torrentBuffer = Buffer.isBuffer(payload.torrentBuffer)
+        ? payload.torrentBuffer
+        : Buffer.from(payload.torrentBuffer, 'base64');
+    }
+    if (payload.torrentPath) opts.torrentPath = payload.torrentPath;
+    if (payload.downloadPath) opts.downloadPath = payload.downloadPath;
+    opts.autoStart = payload.autoStart !== false;
+    opts.priority = payload.priority || 'normal';
+    return opts;
+  }
+
+  async _ensureLease(torrent) {
+    const fencingToken = await LeaseManager.acquireLease(torrent.infoHash, this._nodeId);
+    if (fencingToken !== null) {
+      return;
+    }
+    console.warn(`[Worker:${this._nodeId}] Failed to acquire lease for new job ${torrent.infoHash}. Removing...`);
+    await this._engine.removeTorrent(torrent.infoHash);
+    throw new Error(`Lease denied for ${torrent.infoHash}`);
+  }
+
+  async _startPeerDiscovery(torrent) {
+    try {
+      if (torrent.peerManager) {
+        await this._peerDiscovery.startDiscovery(torrent.infoHash, torrent.peerManager, {
+          completedPieces: 0,
+          totalPieces: torrent.numPieces || 0,
+        });
+      }
+    } catch (discoveryErr) {
+      console.warn(`[Worker:${this._nodeId}] Internal peer discovery failed (non-fatal): ${discoveryErr.message}`);
+    }
+  }
+
+  async _prePopulateDedup(torrent) {
+    try {
+      if (!torrent.fileWriter || !torrent.pieceLength) {
+        return;
+      }
+
+      const dedupResult = await this._dedup.prePopulate(
+        torrent.infoHash,
+        torrent.fileWriter,
+        torrent.pieceLength
+      );
+      if (dedupResult.deduped.length === 0) {
+        return;
+      }
+
+      for (const pieceIndex of dedupResult.deduped) {
+        if (torrent.pieceManager) {
+          torrent.pieceManager.markComplete(pieceIndex);
+        }
+      }
+      console.log(`[Worker:${this._nodeId}] Dedup saved ${dedupResult.deduped.length} pieces for ${torrent.infoHash.substring(0, 8)}`);
+    } catch (dedupErr) {
+      console.warn(`[Worker:${this._nodeId}] Dedup pre-populate failed (non-fatal): ${dedupErr.message}`);
+    }
+  }
+
+  async _maybeStartColdStart(payload, torrent, downloadPathOverride) {
+    if (!payload.sourceUri) {
+      return;
+    }
+
+    try {
+      const activePeers = torrent.peerManager ? torrent.peerManager.getConnectedCount() : 0;
+      if (activePeers > 0) {
+        console.log(`[Worker:${this._nodeId}] ${activePeers} active peers found. Skipping S3 Cold Start.`);
+        return;
+      }
+
+      console.log(`[Worker:${this._nodeId}] Zero seeders detected for ${torrent.infoHash.substring(0, 8)}. Initiating S3 Cold Start Bridge.`);
+      const streamer = new S3ColdStartStreamer({
+        torrent,
+        sourceUri: payload.sourceUri,
+        nodeId: this._nodeId,
+        downloadPath: downloadPathOverride || process.env.DOWNLOAD_PATH || './downloads',
+      });
+
+      this._clearMetadataTimeout(torrent);
+      this._runColdStart(streamer, torrent);
+    } catch (coldStartErr) {
+      console.warn(`[Worker:${this._nodeId}] S3 Cold Start setup failed (non-fatal): ${coldStartErr.message}`);
+    }
+  }
+
+  _clearMetadataTimeout(torrent) {
+    const clearS3Timeout = setInterval(() => {
+      if (torrent._metadataTimeout) {
+        clearTimeout(torrent._metadataTimeout);
+        torrent._metadataTimeout = null;
+        clearInterval(clearS3Timeout);
+      }
+    }, 100);
+    setTimeout(() => clearInterval(clearS3Timeout), 5000);
+  }
+
+  _runColdStart(streamer, torrent) {
+    streamer.start()
+      .then((result) => {
+        if (result.piecesWritten > 0) {
+          console.log(`[Worker:${this._nodeId}] S3 Cold Start finished: ${result.piecesWritten} pieces, ${(result.bytesStreamed / 1048576).toFixed(1)}MB`);
+        }
+        this._forceSeeding(torrent);
+        this.emit('lifecycle', buildDirective(
+          DIRECTIVE_TYPES.TRANSFER_COMPLETED,
+          { infoHash: torrent.infoHash, name: torrent.name, size: result.bytesStreamed },
+          { nodeId: this._nodeId }
+        ));
+      })
+      .catch((err) => {
+        console.error(`[Worker:${this._nodeId}] S3 Cold Start failed (non-fatal): ${err.message}`);
+        torrent._state = 'error';
+        torrent.emit('error', new Error(`S3 Stream Failed: ${err.message}`));
+
+        this.emit('lifecycle', buildDirective(
+          DIRECTIVE_TYPES.TRANSFER_FAILED,
+          { infoHash: torrent.infoHash, name: torrent.name, error: err.message },
+          { nodeId: this._nodeId }
+        ));
+      });
+  }
+
+  _forceSeeding(torrent) {
+    if (torrent._state === 'seeding') {
+      return;
+    }
+
+    if (typeof torrent._transitionToSeeding === 'function') {
+      torrent._transitionToSeeding();
+      return;
+    }
+
+    torrent._state = 'seeding';
+    torrent.progress = 1;
   }
 
   async _handleJobPaused(payload, meta) {

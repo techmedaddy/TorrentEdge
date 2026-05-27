@@ -187,6 +187,75 @@ const getEngineStats = (engineTorrent) => {
   }
 };
 
+const resolveCreateInput = async (req) => {
+  const { magnetURI } = req.body;
+
+  if (req.file) {
+    const uploadInput = await resolveUploadInput(req);
+    return { torrentBuffer: uploadInput.torrentBuffer, torrentPath: uploadInput.torrentPath };
+  }
+
+  if (magnetURI) {
+    const magnetInput = await resolveMagnetInput(magnetURI);
+    if (magnetInput.error) {
+      return { error: magnetInput.error };
+    }
+
+    return { magnetInfo: magnetInput.magnetInfo };
+  }
+
+  return { error: { status: 400, message: 'Must provide torrent file or magnet URI' } };
+};
+
+const findEngineTorrentAfterDispatch = (magnetURI) => {
+  if (magnetURI) {
+    const { parseMagnet } = require('../torrentEngine/magnet');
+    const parsed = parseMagnet(magnetURI);
+    return defaultEngine.getTorrent(parsed.infoHash);
+  }
+
+  const allTorrents = Array.from(defaultEngine.torrents.values());
+  return allTorrents[allTorrents.length - 1];
+};
+
+const attachLeecherIfNeeded = async (existingTorrent, userId) => {
+  const alreadyOwner = existingTorrent.uploaded_by === userId;
+  const alreadyLeeching = existingTorrent.leechers && existingTorrent.leechers.some(l => l.id === userId);
+  if (!alreadyOwner && !alreadyLeeching) {
+    await TransferLeecher.create({ transfer_id: existingTorrent.id, user_id: userId });
+  }
+  return { alreadyOwner, alreadyLeeching };
+};
+
+const dispatchTorrentJob = async ({ magnetURI, torrentPath, torrentBuffer, autoStart, sourceUri, requestId }) => {
+  await defaultDispatcher.dispatch(
+    DIRECTIVE_TYPES.JOB_ASSIGNED,
+    {
+      torrentPath,
+      torrentBuffer: torrentBuffer ? torrentBuffer.toString('base64') : null,
+      magnetUri: magnetURI || null,
+      sourceUri: sourceUri || null,
+      autoStart,
+      downloadPath: process.env.DOWNLOAD_PATH || './downloads',
+    },
+    { requestId }
+  );
+
+  return findEngineTorrentAfterDispatch(magnetURI);
+};
+
+const handleExistingTransfer = async (finalInfoHash, engineTorrent, req, res) => {
+  const existingTorrent = await findExistingTorrentByInfoHash(finalInfoHash);
+  if (!existingTorrent) {
+    return false;
+  }
+
+  const userId = getUserId(req);
+  const { alreadyOwner } = await attachLeecherIfNeeded(existingTorrent, userId);
+  res.status(200).json(buildMergedResponse(existingTorrent, alreadyOwner));
+  return true;
+};
+
 const findTorrentWithIncludes = async (id) => {
   const qry = {
     include: [
@@ -559,60 +628,37 @@ exports.createTorrent = async (req, res) => {
     const { magnetURI, autoStart = true } = req.body;
     let torrentBuffer = null;
     let torrentPath = null;
-    let magnetInfo = null;
 
-    // Handle file upload
-    if (req.file) {
-      const uploadInput = await resolveUploadInput(req);
-      torrentBuffer = uploadInput.torrentBuffer;
-      torrentPath = uploadInput.torrentPath;
-    } else if (magnetURI) {
-      const magnetInput = await resolveMagnetInput(magnetURI);
-      if (magnetInput.error) {
-        return res.status(magnetInput.error.status).json({ message: magnetInput.error.message });
-      }
+    const input = await resolveCreateInput(req);
+    if (input.error) {
+      return res.status(input.error.status).json({ message: input.error.message });
+    }
 
-      magnetInfo = magnetInput.magnetInfo;
-      const existingTorrent = await findExistingTorrentByInfoHash(magnetInfo.infoHash);
+    if (input.torrentBuffer) {
+      torrentBuffer = input.torrentBuffer;
+      torrentPath = input.torrentPath;
+    }
+
+    if (input.magnetInfo) {
+      const existingTorrent = await findExistingTorrentByInfoHash(input.magnetInfo.infoHash);
       if (existingTorrent && await handleExistingMagnetTorrent(existingTorrent, req, res)) {
         return;
       }
 
-      console.log(`[TorrentController] Adding magnet: ${magnetInfo.displayName || magnetInfo.infoHash}`);
-    } else {
-      return res.status(400).json({ message: 'Must provide torrent file or magnet URI' });
+      console.log(`[TorrentController] Adding magnet: ${input.magnetInfo.displayName || input.magnetInfo.infoHash}`);
     }
 
     // Add to engine via Dispatcher (Phase 2.1: decoupled from direct engine call)
     let engineTorrent;
     try {
-      // Dispatch through the Dispatcher which will route to
-      // Kafka (distributed) or local engine (embedded)
-      await defaultDispatcher.dispatch(
-        DIRECTIVE_TYPES.JOB_ASSIGNED,
-        {
-          torrentPath: torrentPath,
-          torrentBuffer: torrentBuffer ? torrentBuffer.toString('base64') : null,
-          magnetUri: magnetURI || null,
-          sourceUri: req.body.sourceUri || null,
-          autoStart: autoStart,
-          downloadPath: process.env.DOWNLOAD_PATH || './downloads',
-        },
-        { requestId: req.requestId }
-      );
-
-      // In local mode, the engine executed synchronously above.
-      // Retrieve the torrent instance from the engine for response building.
-      // For distributed mode, we would query the Transfer table instead.
-      if (magnetURI) {
-        const { parseMagnet } = require('../torrentEngine/magnet');
-        const magnetInfo = parseMagnet(magnetURI);
-        engineTorrent = defaultEngine.getTorrent(magnetInfo.infoHash);
-      } else {
-        // For .torrent file uploads, iterate to find the newly added one
-        const allTorrents = Array.from(defaultEngine.torrents.values());
-        engineTorrent = allTorrents[allTorrents.length - 1];
-      }
+      engineTorrent = await dispatchTorrentJob({
+        magnetURI,
+        torrentPath,
+        torrentBuffer,
+        autoStart,
+        sourceUri: req.body.sourceUri,
+        requestId: req.requestId
+      });
     } catch (error) {
       // Clean up saved file on any error
       if (torrentPath) {
@@ -635,15 +681,8 @@ exports.createTorrent = async (req, res) => {
     }
 
     // Check if torrent already exists in DB (e.g. added via .torrent file with same hash)
-    const existingTorrent = await findExistingTorrentByInfoHash(finalInfoHash);
-    if (existingTorrent) {
-      const userId = getUserId(req);
-      const alreadyOwner = existingTorrent.uploaded_by === userId;
-      const alreadyLeeching = existingTorrent.leechers && existingTorrent.leechers.some(l => l.id === userId);
-      if (!alreadyOwner && !alreadyLeeching) {
-        await TransferLeecher.create({ transfer_id: existingTorrent.id, user_id: userId });
-      }
-      return res.status(200).json(buildMergedResponse(existingTorrent, alreadyOwner));
+    if (await handleExistingTransfer(finalInfoHash, engineTorrent, req, res)) {
+      return;
     }
 
     // Get initial stats (may fail for magnet links without metadata yet)

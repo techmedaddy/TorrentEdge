@@ -291,6 +291,35 @@ class RoutingTable {
     
     return needingRefresh;
   }
+
+  _updateStatsForBucket(stats, bucket, state) {
+    if (bucket.nodes.length === 0) {
+      return;
+    }
+
+    stats.bucketsWithNodes++;
+
+    if (bucket.nodes.length === this.k) {
+      stats.fullBuckets++;
+    }
+
+    for (const node of bucket.nodes) {
+      if (!state.oldest || node.lastSeen < state.oldest.lastSeen) {
+        state.oldest = node;
+      }
+      if (!state.newest || node.lastSeen > state.newest.lastSeen) {
+        state.newest = node;
+      }
+    }
+  }
+
+  _buildNodeAgeInfo(node) {
+    return {
+      id: node.id.toString('hex').substring(0, 8) + '...',
+      lastSeen: new Date(node.lastSeen).toISOString(),
+      age: Date.now() - node.lastSeen
+    };
+  }
   
   /**
    * Get statistics about the routing table
@@ -306,46 +335,23 @@ class RoutingTable {
       newestNode: null
     };
     
-    let oldest = null;
-    let newest = null;
+    const state = { oldest: null, newest: null };
     
     for (const bucket of this.buckets) {
-      if (bucket.nodes.length > 0) {
-        stats.bucketsWithNodes++;
-        
-        if (bucket.nodes.length === this.k) {
-          stats.fullBuckets++;
-        }
-        
-        for (const node of bucket.nodes) {
-          if (!oldest || node.lastSeen < oldest.lastSeen) {
-            oldest = node;
-          }
-          if (!newest || node.lastSeen > newest.lastSeen) {
-            newest = node;
-          }
-        }
-      }
+      this._updateStatsForBucket(stats, bucket, state);
     }
     
     if (stats.bucketsWithNodes > 0) {
       stats.averageNodesPerBucket = stats.totalNodes / stats.bucketsWithNodes;
     }
     
-    if (oldest) {
-      stats.oldestNode = {
-        id: oldest.id.toString('hex').substring(0, 8) + '...',
-        lastSeen: new Date(oldest.lastSeen).toISOString(),
-        age: Date.now() - oldest.lastSeen
-      };
+    
+    if (state.oldest) {
+      stats.oldestNode = this._buildNodeAgeInfo(state.oldest);
     }
     
-    if (newest) {
-      stats.newestNode = {
-        id: newest.id.toString('hex').substring(0, 8) + '...',
-        lastSeen: new Date(newest.lastSeen).toISOString(),
-        age: Date.now() - newest.lastSeen
-      };
+    if (state.newest) {
+      stats.newestNode = this._buildNodeAgeInfo(state.newest);
     }
     
     return stats;

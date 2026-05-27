@@ -66,6 +66,408 @@ const mergeTorrentData = (dbTorrent, engineTorrent) => {
   };
 };
 
+const getUserId = (req) => req.user.userId || req.user.id;
+
+const buildMergedResponse = (dbTorrent, isOwner) => {
+  const engineTorrent = defaultEngine.getTorrent(dbTorrent.info_hash);
+  const merged = mergeTorrentData(dbTorrent, engineTorrent);
+  merged.isOwner = isOwner;
+  return merged;
+};
+
+const findExistingTorrentByInfoHash = async (infoHash) => Transfer.findOne({
+  where: { info_hash: infoHash.toLowerCase() },
+  include: [{ model: User, as: 'leechers', attributes: ['id'] }]
+});
+
+const resolveUploadInput = async (req) => {
+  const torrentBuffer = req.file.buffer;
+  const torrentsDir = path.join(process.env.DOWNLOAD_PATH || './downloads', '.torrentedge', 'torrents');
+  await fs.mkdir(torrentsDir, { recursive: true });
+  const torrentPath = path.join(torrentsDir, `${Date.now()}-${req.file.originalname}`);
+  await fs.writeFile(torrentPath, torrentBuffer);
+  return { torrentBuffer, torrentPath };
+};
+
+const resolveMagnetInput = async (magnetURI) => {
+  const { parseMagnet } = require('../torrentEngine/magnet');
+  try {
+    return { magnetInfo: parseMagnet(magnetURI) };
+  } catch (error) {
+    return { error: { status: 400, message: `Invalid magnet link: ${error.message}` } };
+  }
+};
+
+const handleExistingMagnetTorrent = async (existingTorrent, req, res) => {
+  const userId = getUserId(req);
+  const alreadyOwner = existingTorrent.uploaded_by === userId;
+  const alreadyLeeching = existingTorrent.leechers && existingTorrent.leechers.some(l => l.id === userId);
+
+  if (alreadyOwner || alreadyLeeching) {
+    const merged = buildMergedResponse(existingTorrent, alreadyOwner);
+    res.status(200).json({ message: 'Already in your list', torrent: merged });
+    return true;
+  }
+
+  await TransferLeecher.create({ transfer_id: existingTorrent.id, user_id: userId });
+  console.log(`[TorrentController] User ${userId} added as leecher for: ${existingTorrent.name}`);
+  const merged = buildMergedResponse(existingTorrent, false);
+  res.status(200).json(merged);
+  return true;
+};
+
+const handleDispatcherAlreadyExists = async (error, magnetURI, req, res) => {
+  if (!error.message || !error.message.toLowerCase().includes('already exists')) {
+    return false;
+  }
+
+  try {
+    const { parseMagnet } = require('../torrentEngine/magnet');
+    const magnetInfo = magnetURI ? parseMagnet(magnetURI) : null;
+    const infoHash = magnetInfo?.infoHash?.toLowerCase();
+
+    if (infoHash) {
+      const existingTorrent = await findExistingTorrentByInfoHash(infoHash);
+
+      if (existingTorrent) {
+        const isOwner = existingTorrent.uploaded_by === getUserId(req);
+        const merged = buildMergedResponse(existingTorrent, isOwner);
+        console.log(`[TorrentController] Idempotent recovery: returning existing record for ${infoHash.substring(0, 12)}`);
+        res.status(200).json({ message: 'Already exists', torrent: merged });
+        return true;
+      }
+    }
+  } catch (recoveryErr) {
+    console.warn(`[TorrentController] Recovery lookup failed: ${recoveryErr.message}`);
+  }
+
+  res.status(409).json({ message: 'Transfer already in progress on this node' });
+  return true;
+};
+
+const resolveFinalMeta = (engineTorrent, magnetURI) => {
+  let finalInfoHash = null;
+  let finalName = null;
+  let finalSize = 0;
+  let finalState = magnetURI ? 'fetching_metadata' : 'pending';
+
+  if (engineTorrent) {
+    finalInfoHash = engineTorrent.infoHash.toLowerCase();
+    finalName = engineTorrent.name;
+    finalSize = engineTorrent.size || 0;
+    finalState = engineTorrent.state || finalState;
+    return { finalInfoHash, finalName, finalSize, finalState };
+  }
+
+  if (magnetURI) {
+    try {
+      const { parseMagnet } = require('../torrentEngine/magnet');
+      const magnetInfo = parseMagnet(magnetURI);
+      finalInfoHash = magnetInfo.infoHash.toLowerCase();
+      finalName = magnetInfo.displayName || `Magnet-${finalInfoHash.substring(0, 8)}`;
+      return { finalInfoHash, finalName, finalSize, finalState };
+    } catch (e) {}
+  }
+
+  return {
+    finalInfoHash: `temp-${Date.now()}`,
+    finalName: `Upload-${Date.now()}`,
+    finalSize,
+    finalState
+  };
+};
+
+const getEngineStats = (engineTorrent) => {
+  if (!engineTorrent) return null;
+  try {
+    return engineTorrent.getStats();
+  } catch (err) {
+    console.log('[TorrentController] Stats not available yet (magnet link fetching metadata)');
+    return null;
+  }
+};
+
+const SAFE_TYPES = new Set([
+  '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+  '.txt', '.md', '.csv', '.json', '.xml',
+  '.mp3', '.mp4', '.mkv', '.avi', '.mov', '.wav', '.flac', '.ogg',
+  '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg',
+  '.zip', '.tar', '.gz', '.rar', '.7z',
+  '.js', '.ts', '.py', '.html', '.css', '.epub', '.iso',
+]);
+
+const WARN_TYPES = new Set([
+  '.exe', '.dll', '.bat', '.sh', '.cmd', '.msi', '.deb', '.rpm',
+  '.apk', '.dmg', '.pkg',
+]);
+
+const validateUploadedFile = (req) => {
+  if (!req.file) {
+    return { error: { status: 400, payload: { error: 'No file uploaded. Send a file in the "file" field.' } } };
+  }
+
+  const uploadedFilePath = req.file.path;
+  const fileSize = req.file.size;
+
+  if (!uploadedFilePath || fileSize === 0) {
+    return { error: { status: 400, payload: { error: 'Uploaded file is empty.' } } };
+  }
+
+  return {
+    uploadedFilePath,
+    fileSize,
+    mimeType: req.file.mimetype || 'application/octet-stream',
+    originalName: req.file.originalname || 'untitled',
+    ext: path.extname(req.file.originalname || '').toLowerCase()
+  };
+};
+
+const enforceMaxFileSize = async (uploadedFilePath, fileSize) => {
+  const MAX_BYTES = parseInt(process.env.MAX_SEED_FILE_SIZE, 10) || (2 * 1024 * 1024 * 1024);
+  if (fileSize <= MAX_BYTES) {
+    return { maxBytes: MAX_BYTES };
+  }
+
+  const limitMB = (MAX_BYTES / (1024 * 1024)).toFixed(0);
+  await fs.unlink(uploadedFilePath).catch(() => {});
+  return {
+    error: {
+      status: 413,
+      payload: {
+        error: `File too large. Maximum allowed size is ${limitMB} MB.`,
+        maxBytes: MAX_BYTES,
+        fileBytes: fileSize,
+      }
+    }
+  };
+};
+
+const buildFileWarnings = (ext) => {
+  const warnings = [];
+  if (WARN_TYPES.has(ext)) {
+    warnings.push(`File type "${ext}" is an executable. Make sure you intended to share this.`);
+  } else if (ext && !SAFE_TYPES.has(ext)) {
+    warnings.push(`File type "${ext}" is uncommon — proceeding anyway.`);
+  }
+
+  if (!ext) {
+    warnings.push('File has no extension — torrent will still be created, but recipients may not know the file type.');
+  }
+
+  return warnings;
+};
+
+const parseCreateFromFileOptions = (req, originalName) => {
+  const rawName = req.body.name || originalName || 'untitled';
+  const rawPrivate = req.body.private === 'true' || req.body.private === true;
+
+  let trackers;
+  if (req.body.trackers) {
+    try {
+      trackers = typeof req.body.trackers === 'string'
+        ? JSON.parse(req.body.trackers)
+        : req.body.trackers;
+      if (!Array.isArray(trackers)) {
+        return { error: { status: 400, payload: { error: 'trackers must be a JSON array of strings.' } } };
+      }
+    } catch {
+      return { error: { status: 400, payload: { error: 'Invalid trackers format. Expected JSON array e.g. ["udp://..."]' } } };
+    }
+  }
+
+  let pieceSize;
+  if (req.body.pieceSize) {
+    pieceSize = parseInt(req.body.pieceSize, 10);
+    if (isNaN(pieceSize)) {
+      return { error: { status: 400, payload: { error: 'pieceSize must be a number.' } } };
+    }
+  }
+
+  return { rawName, rawPrivate, trackers, pieceSize };
+};
+
+const buildProgressEmitter = (req, originalName, pieceCount) => {
+  if (pieceCount <= 1) return undefined;
+
+  let lastEmittedPct = -1;
+  let lastEmitTime = 0;
+  const THROTTLE_MS = 100;
+
+  return (hashed, total) => {
+    const pct = Math.floor((hashed / total) * 100);
+    const now = Date.now();
+    if (pct !== lastEmittedPct && (now - lastEmitTime) >= THROTTLE_MS) {
+      lastEmittedPct = pct;
+      lastEmitTime = now;
+      try {
+        broadcast('torrent:hash-progress', {
+          userId: req.user?._id?.toString() || req.user?.id,
+          fileName: originalName,
+          hashed,
+          total,
+          percent: pct,
+        });
+      } catch (_) { /* socket not yet ready — non-fatal */ }
+    }
+  };
+};
+
+const emitHashComplete = (req, originalName, pieceCount) => {
+  try {
+    broadcast('torrent:hash-progress', {
+      userId: req.user?._id?.toString() || req.user?.id,
+      fileName: originalName,
+      hashed: pieceCount,
+      total: pieceCount,
+      percent: 100,
+      done: true,
+    });
+  } catch (_) {}
+};
+
+const persistCreatedFiles = async (created, originalName, fileBuffer) => {
+  const baseDir = process.env.DOWNLOAD_PATH || './downloads';
+  const seedsDir = path.join(baseDir, '.torrentedge', 'seeds');
+  const torrentsDir = path.join(baseDir, '.torrentedge', 'torrents');
+
+  await fs.mkdir(seedsDir, { recursive: true });
+  await fs.mkdir(torrentsDir, { recursive: true });
+
+  const safeOrigName = path.basename(originalName).replace(/[^a-zA-Z0-9._-]/g, '_');
+  const hashPrefix = created.infoHash.slice(0, 8);
+
+  const savedSourcePath = path.join(seedsDir, `${hashPrefix}-${safeOrigName}`);
+  const savedTorrentPath = path.join(torrentsDir, `${hashPrefix}-${safeOrigName}.torrent`);
+
+  await fs.writeFile(savedSourcePath, fileBuffer);
+  await fs.writeFile(savedTorrentPath, created.torrentBuffer);
+
+  console.log(`[TorrentController] Saved source file  : ${savedSourcePath}`);
+  console.log(`[TorrentController] Saved .torrent file: ${savedTorrentPath}`);
+
+  return { savedSourcePath, savedTorrentPath };
+};
+
+const saveCreatedTorrent = async (created, savedSourcePath, req) => {
+  try {
+    const torrent = await Transfer.create({
+      name: created.name,
+      info_hash: created.infoHash.toLowerCase(),
+      magnet_uri: created.magnetURI,
+      size_bytes: created.fileSize,
+      status: 'seeding',
+      progress: 100,
+      uploaded_by: getUserId(req),
+      source_path: savedSourcePath
+    });
+
+    if (created.chunkHashes && created.chunkHashes.length > 0) {
+      await Checkpointer.initializeChunks(created.infoHash, created.chunkHashes, torrent.id);
+      await Checkpointer.markChunksVerifiedBulk(created.infoHash, created.chunkHashes);
+    }
+
+    return torrent;
+  } catch (sqlErr) {
+    console.error('[TorrentController] SQL Dual-Write failed:', sqlErr.message);
+    return null;
+  }
+};
+
+const scheduleAutoSeed = (created, savedSourcePath) => {
+  setImmediate(async () => {
+    try {
+      await defaultEngine.seedFromFile({
+        torrentBuffer: created.torrentBuffer,
+        sourcePath: savedSourcePath,
+        downloadPath: path.join(process.env.DOWNLOAD_PATH || './downloads', 'seeds'),
+        autoStart: true,
+      });
+      console.log(`[TorrentController] Engine seeding started: ${created.infoHash}`);
+
+      const engineTorrent = defaultEngine.getTorrent(created.infoHash);
+      if (engineTorrent && typeof engineTorrent._transitionToSeeding === 'function') {
+        if (engineTorrent._state !== 'seeding') {
+          await engineTorrent._transitionToSeeding();
+          console.log(`[TorrentController] Force-transitioned to seeding: ${created.infoHash}`);
+        }
+      }
+
+      await Transfer.update(
+        { status: 'seeding', progress: 100 },
+        { where: { info_hash: created.infoHash.toLowerCase() } }
+      );
+    } catch (err) {
+      console.warn(`[TorrentController] Engine seed failed (non-fatal): ${err.message}`);
+    }
+  });
+};
+
+const findTorrentByIdOrHash = async (id) => {
+  if (isValidObjectId(id)) {
+    return Transfer.findByPk(id);
+  }
+
+  return Transfer.findOne({ where: { info_hash: id.toLowerCase() } });
+};
+
+const buildFilesFromParsedTorrent = (parsed) => {
+  const rawFiles = parsed.files || [{ path: parsed.name, length: parsed.length }];
+  return rawFiles.map((f, index) => ({
+    index,
+    path: f.path,
+    name: Array.isArray(f.path) ? f.path[f.path.length - 1] : f.path,
+    length: f.length,
+    selected: true
+  }));
+};
+
+const buildFilesFromDbFallback = (dbTorrent) => ([{
+  index: 0,
+  path: dbTorrent.name,
+  name: dbTorrent.name,
+  length: dbTorrent.size_bytes || 0,
+  selected: true
+}]);
+
+const getFilesForTorrent = async (dbTorrent, engineTorrent) => {
+  if (engineTorrent) {
+    return engineTorrent.getFilesWithSelection();
+  }
+
+  if (dbTorrent.torrent_file_path) {
+    try {
+      const torrentBuffer = await fs.readFile(dbTorrent.torrent_file_path);
+      const parsed = parseTorrent(torrentBuffer);
+      return buildFilesFromParsedTorrent(parsed);
+    } catch (err) {
+      console.error('[TorrentController] Failed to parse .torrent fallback:', err);
+    }
+  }
+
+  return buildFilesFromDbFallback(dbTorrent);
+};
+
+const resolveDownloadPath = async (baseDir, selectedFile, dbTorrent) => {
+  const relativePath = Array.isArray(selectedFile.path) ? selectedFile.path.join(path.sep) : selectedFile.path;
+  const absolutePath = path.resolve(baseDir, relativePath);
+  const seedPath = path.resolve(baseDir, 'seeds', relativePath);
+  const sourcePath = dbTorrent.source_path ? path.resolve(dbTorrent.source_path) : null;
+
+  const pathsToTry = [absolutePath, seedPath];
+  if (sourcePath) pathsToTry.push(sourcePath);
+
+  for (const p of pathsToTry) {
+    try {
+      await fs.access(p);
+      return p;
+    } catch (e) {
+      // Continue to next path
+    }
+  }
+
+  return null;
+};
+
 // Get all torrents for the authenticated user
 exports.getAllTorrents = async (req, res) => {
   try {
@@ -150,56 +552,25 @@ exports.createTorrent = async (req, res) => {
     const { magnetURI, autoStart = true } = req.body;
     let torrentBuffer = null;
     let torrentPath = null;
+    let magnetInfo = null;
 
     // Handle file upload
     if (req.file) {
-      torrentBuffer = req.file.buffer;
-      
-      // Save torrent file to disk for resume support
-      const torrentsDir = path.join(process.env.DOWNLOAD_PATH || './downloads', '.torrentedge', 'torrents');
-      await fs.mkdir(torrentsDir, { recursive: true });
-      
-      torrentPath = path.join(torrentsDir, `${Date.now()}-${req.file.originalname}`);
-      await fs.writeFile(torrentPath, torrentBuffer);
+      const uploadInput = await resolveUploadInput(req);
+      torrentBuffer = uploadInput.torrentBuffer;
+      torrentPath = uploadInput.torrentPath;
     } else if (magnetURI) {
-      // Magnet URI support - validate the magnet link first
-      const { parseMagnet } = require('../torrentEngine/magnet');
-      
-      let magnetInfo;
-      try {
-        magnetInfo = parseMagnet(magnetURI);
-      } catch (error) {
-        return res.status(400).json({ message: `Invalid magnet link: ${error.message}` });
+      const magnetInput = await resolveMagnetInput(magnetURI);
+      if (magnetInput.error) {
+        return res.status(magnetInput.error.status).json({ message: magnetInput.error.message });
       }
-      
-      // 2.2 — if torrent already exists, add this user as a downloader instead of erroring
-      const existingTorrent = await Transfer.findOne({ 
-        where: { info_hash: magnetInfo.infoHash.toLowerCase() },
-        include: [{ model: User, as: 'leechers', attributes: ['id'] }]
-      });
-      if (existingTorrent) {
-        const userId = req.user.userId || req.user.id;
-        const alreadyOwner = existingTorrent.uploaded_by === userId;
-        const alreadyLeeching = existingTorrent.leechers && existingTorrent.leechers.some(l => l.id === userId);
 
-        if (alreadyOwner || alreadyLeeching) {
-          // User already has this torrent — return it with isOwner flag
-          const engineTorrent = defaultEngine.getTorrent(existingTorrent.info_hash);
-          const merged = mergeTorrentData(existingTorrent, engineTorrent);
-          merged.isOwner = alreadyOwner;
-          return res.status(200).json({ message: 'Already in your list', torrent: merged });
-        }
-
-        // New leecher — add them to downloadedBy
-        await TransferLeecher.create({ transfer_id: existingTorrent.id, user_id: userId });
-        console.log(`[TorrentController] User ${userId} added as leecher for: ${existingTorrent.name}`);
-
-        const engineTorrent = defaultEngine.getTorrent(existingTorrent.info_hash);
-        const merged = mergeTorrentData(existingTorrent, engineTorrent);
-        merged.isOwner = false;
-        return res.status(200).json(merged);
+      magnetInfo = magnetInput.magnetInfo;
+      const existingTorrent = await findExistingTorrentByInfoHash(magnetInfo.infoHash);
+      if (existingTorrent && await handleExistingMagnetTorrent(existingTorrent, req, res)) {
+        return;
       }
-      
+
       console.log(`[TorrentController] Adding magnet: ${magnetInfo.displayName || magnetInfo.infoHash}`);
     } else {
       return res.status(400).json({ message: 'Must provide torrent file or magnet URI' });
@@ -241,38 +612,8 @@ exports.createTorrent = async (req, res) => {
         await fs.unlink(torrentPath).catch(() => {});
       }
 
-      if (error.message && error.message.toLowerCase().includes('already exists')) {
-        // The engine already has this torrent in memory (e.g. from a previous run
-        // that wasn't fully cleaned up, or a race condition under load).
-        // This is NOT a client error — it is expected idempotent behavior.
-        // Recover gracefully: return the existing record with 200.
-        try {
-          const { parseMagnet } = require('../torrentEngine/magnet');
-          const magnetInfo = magnetURI ? parseMagnet(magnetURI) : null;
-          const infoHash = magnetInfo?.infoHash?.toLowerCase();
-
-          if (infoHash) {
-            const existingTorrent = await Transfer.findOne({
-              where: { info_hash: infoHash },
-              include: [{ model: User, as: 'leechers', attributes: ['id'] }]
-            });
-
-            if (existingTorrent) {
-              const userId = req.user.userId || req.user.id;
-              const isOwner = existingTorrent.uploaded_by === userId;
-              const engineTorrent = defaultEngine.getTorrent(infoHash);
-              const merged = mergeTorrentData(existingTorrent, engineTorrent);
-              merged.isOwner = isOwner;
-              console.log(`[TorrentController] Idempotent recovery: returning existing record for ${infoHash.substring(0, 12)}`);
-              return res.status(200).json({ message: 'Already exists', torrent: merged });
-            }
-          }
-        } catch (recoveryErr) {
-          console.warn(`[TorrentController] Recovery lookup failed: ${recoveryErr.message}`);
-        }
-
-        // If DB lookup also fails, return a clean 409 rather than a 400 or 500
-        return res.status(409).json({ message: 'Transfer already in progress on this node' });
+      if (await handleDispatcherAlreadyExists(error, magnetURI, req, res)) {
+        return;
       }
 
       console.error('[TorrentController] Dispatcher error:', error);
@@ -280,59 +621,26 @@ exports.createTorrent = async (req, res) => {
     }
 
     // Ensure we have an infoHash even in distributed mode
-    let finalInfoHash = null;
-    let finalName = null;
-    let finalSize = 0;
-    let finalState = magnetURI ? 'fetching_metadata' : 'pending';
-
-    if (engineTorrent) {
-      finalInfoHash = engineTorrent.infoHash.toLowerCase();
-      finalName = engineTorrent.name;
-      finalSize = engineTorrent.size || 0;
-      finalState = engineTorrent.state || finalState;
-    } else if (magnetURI) {
-      try {
-        const { parseMagnet } = require('../torrentEngine/magnet');
-        const magnetInfo = parseMagnet(magnetURI);
-        finalInfoHash = magnetInfo.infoHash.toLowerCase();
-        finalName = magnetInfo.displayName || `Magnet-${finalInfoHash.substring(0, 8)}`;
-      } catch (e) {}
-    } else {
-      // For distributed .torrent files (fallback)
-      finalInfoHash = `temp-${Date.now()}`;
-      finalName = `Upload-${Date.now()}`;
-    }
+    const { finalInfoHash, finalName, finalSize, finalState } = resolveFinalMeta(engineTorrent, magnetURI);
 
     if (!finalInfoHash) {
       return res.status(500).json({ message: "Server error: Unable to determine infoHash in distributed mode." });
     }
 
     // Check if torrent already exists in DB (e.g. added via .torrent file with same hash)
-    const existingTorrent = await Transfer.findOne({ 
-      where: { info_hash: finalInfoHash },
-      include: [{ model: User, as: 'leechers', attributes: ['id'] }]
-    });
+    const existingTorrent = await findExistingTorrentByInfoHash(finalInfoHash);
     if (existingTorrent) {
-      const userId = req.user.userId || req.user.id;
+      const userId = getUserId(req);
       const alreadyOwner = existingTorrent.uploaded_by === userId;
       const alreadyLeeching = existingTorrent.leechers && existingTorrent.leechers.some(l => l.id === userId);
       if (!alreadyOwner && !alreadyLeeching) {
         await TransferLeecher.create({ transfer_id: existingTorrent.id, user_id: userId });
       }
-      const merged = mergeTorrentData(existingTorrent, engineTorrent);
-      merged.isOwner = alreadyOwner;
-      return res.status(200).json(merged);
+      return res.status(200).json(buildMergedResponse(existingTorrent, alreadyOwner));
     }
 
     // Get initial stats (may fail for magnet links without metadata yet)
-    let stats = null;
-    if (engineTorrent) {
-      try {
-        stats = engineTorrent.getStats();
-      } catch (err) {
-        console.log('[TorrentController] Stats not available yet (magnet link fetching metadata)');
-      }
-    }
+    const stats = getEngineStats(engineTorrent);
 
     // Save to DB
     const torrent = await Transfer.create({
@@ -340,7 +648,7 @@ exports.createTorrent = async (req, res) => {
       info_hash: finalInfoHash,
       magnet_uri: magnetURI || null,
       size_bytes: finalSize,
-      uploaded_by: req.user.userId || req.user.id,
+      uploaded_by: getUserId(req),
       status: finalState,
       progress: stats?.percentage || 0,
       source_path: torrentPath || null,
@@ -853,94 +1161,32 @@ exports.createTorrentFromFile = async (req, res) => {
 
   try {
     // ── 1. Validate upload present ──────────────────────────────────────────
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded. Send a file in the "file" field.' });
+    const fileValidation = validateUploadedFile(req);
+    if (fileValidation.error) {
+      return res.status(fileValidation.error.status).json(fileValidation.error.payload);
     }
 
-    // With diskStorage, req.file.path is the temp file on disk (not in RAM)
-    const uploadedFilePath = req.file.path;
-    const fileSize = req.file.size;
-    if (!uploadedFilePath || fileSize === 0) {
-      return res.status(400).json({ error: 'Uploaded file is empty.' });
-    }
+    const { uploadedFilePath, fileSize, originalName, ext } = fileValidation;
 
     // ── 2. File too large guard (controller-level, defence-in-depth) ────────
     // Multer already enforces this at HTTP layer but we double-check here so
     // the limit is respected even if the route is called programmatically.
-    const MAX_BYTES = parseInt(process.env.MAX_SEED_FILE_SIZE, 10) || (2 * 1024 * 1024 * 1024);
-    if (fileSize > MAX_BYTES) {
-      const limitMB = (MAX_BYTES / (1024 * 1024)).toFixed(0);
-      // Clean up temp file
-      const fsCleanup = require('fs').promises;
-      await fsCleanup.unlink(uploadedFilePath).catch(() => {});
-      return res.status(413).json({
-        error:    `File too large. Maximum allowed size is ${limitMB} MB.`,
-        maxBytes: MAX_BYTES,
-        fileBytes: fileSize,
-      });
+    const sizeCheck = await enforceMaxFileSize(uploadedFilePath, fileSize);
+    if (sizeCheck.error) {
+      return res.status(sizeCheck.error.status).json(sizeCheck.error.payload);
     }
 
     // ── 3. File type check — WARN, never block ──────────────────────────────
     // Any file can be torrented. We just warn the user if the type looks odd
     // so they know what they're sharing (e.g. accidentally uploading .exe)
-    const warnings = [];
-    const mimeType       = req.file.mimetype || 'application/octet-stream';
-    const originalName   = req.file.originalname || 'untitled';
-    const ext            = path.extname(originalName).toLowerCase();
-
-    const SAFE_TYPES = new Set([
-      // Documents
-      '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-      '.txt', '.md', '.csv', '.json', '.xml',
-      // Media
-      '.mp3', '.mp4', '.mkv', '.avi', '.mov', '.wav', '.flac', '.ogg',
-      '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg',
-      // Archives
-      '.zip', '.tar', '.gz', '.rar', '.7z',
-      // Code / misc
-      '.js', '.ts', '.py', '.html', '.css', '.epub', '.iso',
-    ]);
-
-    const WARN_TYPES = new Set([
-      '.exe', '.dll', '.bat', '.sh', '.cmd', '.msi', '.deb', '.rpm',
-      '.apk', '.dmg', '.pkg',
-    ]);
-
-    if (WARN_TYPES.has(ext)) {
-      warnings.push(`File type "${ext}" is an executable. Make sure you intended to share this.`);
-    } else if (ext && !SAFE_TYPES.has(ext)) {
-      warnings.push(`File type "${ext}" is uncommon — proceeding anyway.`);
-    }
-
-    if (!ext) {
-      warnings.push('File has no extension — torrent will still be created, but recipients may not know the file type.');
-    }
+    const warnings = buildFileWarnings(ext);
 
     // ── 4. Parse options from body ──────────────────────────────────────────
-    const rawName    = req.body.name || originalName || 'untitled';
-    const rawPrivate = req.body.private === 'true' || req.body.private === true;
-
-    let trackers;
-    if (req.body.trackers) {
-      try {
-        trackers = typeof req.body.trackers === 'string'
-          ? JSON.parse(req.body.trackers)
-          : req.body.trackers;
-        if (!Array.isArray(trackers)) {
-          return res.status(400).json({ error: 'trackers must be a JSON array of strings.' });
-        }
-      } catch {
-        return res.status(400).json({ error: 'Invalid trackers format. Expected JSON array e.g. ["udp://..."]' });
-      }
+    const parsedOptions = parseCreateFromFileOptions(req, originalName);
+    if (parsedOptions.error) {
+      return res.status(parsedOptions.error.status).json(parsedOptions.error.payload);
     }
-
-    let pieceSize;
-    if (req.body.pieceSize) {
-      pieceSize = parseInt(req.body.pieceSize, 10);
-      if (isNaN(pieceSize)) {
-        return res.status(400).json({ error: 'pieceSize must be a number.' });
-      }
-    }
+    const { rawName, rawPrivate, trackers, pieceSize } = parsedOptions;
 
     // ── 5. Create .torrent from file ────────────────────────────────────────
     const { createTorrentWithMagnet } = require('../torrentEngine/torrentCreator');
@@ -949,27 +1195,7 @@ exports.createTorrentFromFile = async (req, res) => {
     // Throttle progress broadcasts — emit at most once every 100ms and
     // only when progress actually changes by ≥1% to avoid flooding the socket.
     const pieceCount = Math.ceil(fileBuffer.length / (pieceSize || 262144));
-    let   lastEmittedPct = -1;
-    let   lastEmitTime   = 0;
-    const THROTTLE_MS    = 100;
-
-    const onProgress = (hashed, total) => {
-      const pct = Math.floor((hashed / total) * 100);
-      const now = Date.now();
-      if (pct !== lastEmittedPct && (now - lastEmitTime) >= THROTTLE_MS) {
-        lastEmittedPct = pct;
-        lastEmitTime   = now;
-        try {
-          broadcast('torrent:hash-progress', {
-            userId:   req.user?._id?.toString() || req.user?.id,
-            fileName: originalName,
-            hashed,
-            total,
-            percent: pct,
-          });
-        } catch (_) { /* socket not yet ready — non-fatal */ }
-      }
-    };
+    const onProgress = buildProgressEmitter(req, originalName, pieceCount);
 
     let created;
     try {
@@ -985,16 +1211,7 @@ exports.createTorrentFromFile = async (req, res) => {
     }
 
     // Emit 100% done event
-    try {
-      broadcast('torrent:hash-progress', {
-        userId:   req.user?._id?.toString() || req.user?.id,
-        fileName: originalName,
-        hashed:   pieceCount,
-        total:    pieceCount,
-        percent:  100,
-        done:     true,
-      });
-    } catch (_) {}
+    emitHashComplete(req, originalName, pieceCount);
 
     // ── 6. Duplicate detection ──────────────────────────────────────────────
     // Check by infoHash — if same file + same name was already uploaded,
@@ -1012,48 +1229,12 @@ exports.createTorrentFromFile = async (req, res) => {
     }
 
     // ── 7. Write files to disk ──────────────────────────────────────────────
-    const baseDir     = process.env.DOWNLOAD_PATH || './downloads';
-    const seedsDir    = path.join(baseDir, '.torrentedge', 'seeds');
-    const torrentsDir = path.join(baseDir, '.torrentedge', 'torrents');
-
-    await fs.mkdir(seedsDir,    { recursive: true });
-    await fs.mkdir(torrentsDir, { recursive: true });
-
-    const safeOrigName   = path.basename(originalName).replace(/[^a-zA-Z0-9._-]/g, '_');
-    const hashPrefix     = created.infoHash.slice(0, 8);
-
-    savedSourcePath  = path.join(seedsDir,    `${hashPrefix}-${safeOrigName}`);
-    savedTorrentPath = path.join(torrentsDir, `${hashPrefix}-${safeOrigName}.torrent`);
-
-    await fs.writeFile(savedSourcePath,  fileBuffer);
-    await fs.writeFile(savedTorrentPath, created.torrentBuffer);
-
-    console.log(`[TorrentController] Saved source file  : ${savedSourcePath}`);
-    console.log(`[TorrentController] Saved .torrent file: ${savedTorrentPath}`);
+    const persistedPaths = await persistCreatedFiles(created, originalName, fileBuffer);
+    savedSourcePath = persistedPaths.savedSourcePath;
+    savedTorrentPath = persistedPaths.savedTorrentPath;
 
     // ── 8. Save to DB & Initialize CAS Chunks ───────────────────────────────
-    let torrent;
-    try {
-      torrent = await Transfer.create({
-        name: created.name,
-        info_hash: created.infoHash.toLowerCase(),
-        magnet_uri: created.magnetURI,
-        size_bytes: created.fileSize,
-        status: 'seeding',
-        progress: 100,
-        uploaded_by: req.user.userId || req.user.id,
-        source_path: savedSourcePath
-      });
-      
-      if (created.chunkHashes && created.chunkHashes.length > 0) {
-        await Checkpointer.initializeChunks(created.infoHash, created.chunkHashes, torrent.id);
-        
-        // Since we are creating from an existing local file (seeding), verify all immediately via bulk update
-        await Checkpointer.markChunksVerifiedBulk(created.infoHash, created.chunkHashes);
-      }
-    } catch (sqlErr) {
-      console.error('[TorrentController] SQL Dual-Write failed:', sqlErr.message);
-    }
+    const torrent = await saveCreatedTorrent(created, savedSourcePath, req);
 
     console.log(`[TorrentController] Created torrent from file: ${created.name} (${created.infoHash})`);
 
@@ -1061,36 +1242,7 @@ exports.createTorrentFromFile = async (req, res) => {
     // Fire-and-forget — seeding starting up shouldn't delay the HTTP response.
     // Engine errors are logged but don't fail the request (torrent is saved, user
     // already has the magnet link they need to share).
-    setImmediate(async () => {
-      try {
-        await defaultEngine.seedFromFile({
-          torrentBuffer: created.torrentBuffer,
-          sourcePath:    savedSourcePath,
-          downloadPath:  path.join(process.env.DOWNLOAD_PATH || './downloads', 'seeds'),
-          autoStart:     true,
-        });
-        console.log(`[TorrentController] Engine seeding started: ${created.infoHash}`);
-
-        // Force-transition to seeding state — seedFromFile files are already
-        // 100% complete on disk so downloadManager:complete never fires.
-        const engineTorrent = defaultEngine.getTorrent(created.infoHash);
-        if (engineTorrent && typeof engineTorrent._transitionToSeeding === 'function') {
-          if (engineTorrent._state !== 'seeding') {
-            await engineTorrent._transitionToSeeding();
-            console.log(`[TorrentController] Force-transitioned to seeding: ${created.infoHash}`);
-          }
-        }
-
-        // Also update DB status to seeding
-        await Transfer.update(
-          { status: 'seeding', progress: 100 },
-          { where: { info_hash: created.infoHash.toLowerCase() } }
-        );
-      } catch (err) {
-        // Don't crash — torrent is already saved, user has the magnet link
-        console.warn(`[TorrentController] Engine seed failed (non-fatal): ${err.message}`);
-      }
-    });
+    scheduleAutoSeed(created, savedSourcePath);
 
     // ── 10. Respond ─────────────────────────────────────────────────────────
     const response = {
@@ -1149,13 +1301,8 @@ exports.downloadTorrentFile = async (req, res) => {
   try {
     const { id } = req.params;
     const fileIndex = parseInt(req.query.fileIndex || 0, 10);
-    
-    let dbTorrent;
-    if (isValidObjectId(id)) {
-      dbTorrent = await Transfer.findByPk(id);
-    } else {
-      dbTorrent = await Transfer.findOne({ where: { info_hash: id.toLowerCase() } });
-    }
+
+    const dbTorrent = await findTorrentByIdOrHash(id);
 
     if (!dbTorrent) {
       return res.status(404).json({ message: 'Torrent not found' });
@@ -1166,39 +1313,7 @@ exports.downloadTorrentFile = async (req, res) => {
     }
 
     const engineTorrent = defaultEngine.getTorrent(dbTorrent.info_hash);
-    
-    let files = [];
-    if (engineTorrent) {
-      files = engineTorrent.getFilesWithSelection();
-    } else {
-      if (dbTorrent.torrent_file_path) {
-        try {
-          const torrentBuffer = await fs.readFile(dbTorrent.torrent_file_path);
-          const parsed = parseTorrent(torrentBuffer);
-          const rawFiles = parsed.files || [{ path: parsed.name, length: parsed.length }];
-          files = rawFiles.map((f, index) => ({
-            index,
-            path: f.path,
-            name: Array.isArray(f.path) ? f.path[f.path.length - 1] : f.path,
-            length: f.length,
-            selected: true
-          }));
-        } catch (err) {
-          console.error('[TorrentController] Failed to parse .torrent fallback:', err);
-        }
-      }
-
-      // If we still have no files, synthesize it from the database record
-      if (files.length === 0) {
-        files = [{
-          index: 0,
-          path: dbTorrent.name,
-          name: dbTorrent.name,
-          length: dbTorrent.size_bytes || 0,
-          selected: true
-        }];
-      }
-    }
+    const files = await getFilesForTorrent(dbTorrent, engineTorrent);
 
     if (files.length === 0) {
       return res.status(400).json({ message: 'Torrent not active in engine and no metadata could be reconstructed' });
@@ -1210,28 +1325,7 @@ exports.downloadTorrentFile = async (req, res) => {
 
     const selectedFile = files[fileIndex];
     const baseDir = process.env.DOWNLOAD_PATH || './downloads';
-    
-    // Construct the absolute path based on the torrent's directory structure
-    const relativePath = Array.isArray(selectedFile.path) ? selectedFile.path.join(path.sep) : selectedFile.path;
-    let absolutePath = path.resolve(baseDir, relativePath);
-    const seedPath = path.resolve(baseDir, 'seeds', relativePath);
-    const sourcePath = dbTorrent.source_path ? path.resolve(dbTorrent.source_path) : null;
-
-    let finalPath = null;
-
-    // Check where the file actually lives
-    const pathsToTry = [absolutePath, seedPath];
-    if (sourcePath) pathsToTry.push(sourcePath);
-
-    for (const p of pathsToTry) {
-      try {
-        await fs.access(p);
-        finalPath = p;
-        break;
-      } catch (e) {
-        // Continue to next path
-      }
-    }
+    const finalPath = await resolveDownloadPath(baseDir, selectedFile, dbTorrent);
 
     if (!finalPath) {
       return res.status(404).json({ message: 'File not found on disk. Ensure worker has completed the transfer.' });

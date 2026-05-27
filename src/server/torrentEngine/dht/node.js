@@ -505,6 +505,124 @@ class DHTNode extends EventEmitter {
     
     return nodes;
   }
+
+  _buildShortlist(targetId) {
+    let shortlist = this.getClosestNodes(targetId, this._alpha);
+
+    if (shortlist.length === 0) {
+      console.log('[DHT] No nodes in routing table, using bootstrap nodes');
+      shortlist = this.bootstrapNodes.map(node => ({
+        id: null,
+        host: node.host,
+        port: node.port
+      }));
+    }
+
+    return shortlist;
+  }
+
+  _seedAllNodes(targetId, shortlist, allNodes) {
+    for (const node of shortlist) {
+      if (!node.id) continue;
+      const nodeKey = `${node.host}:${node.port}`;
+      const distance = this._xorDistance(targetId, node.id);
+      allNodes.set(nodeKey, { ...node, distance });
+    }
+  }
+
+  _getNodesToQuery(allNodes, queried) {
+    return Array.from(allNodes.values())
+      .filter(node => !queried.has(`${node.host}:${node.port}`))
+      .sort((a, b) => {
+        if (!a.distance) return 1;
+        if (!b.distance) return -1;
+        return Buffer.compare(a.distance, b.distance);
+      })
+      .slice(0, this._alpha);
+  }
+
+  _buildLookupQuery(queryType, targetId) {
+    return {
+      t: this._generateTransactionId(),
+      y: 'q',
+      q: queryType,
+      a: {
+        id: this.nodeId,
+        ...(queryType === 'find_node' ? { target: targetId } : { info_hash: targetId })
+      }
+    };
+  }
+
+  _updateClosestNode(targetId, responseId, node, state) {
+    const distance = this._xorDistance(targetId, responseId);
+    if (!state.closestDistance || Buffer.compare(distance, state.closestDistance) < 0) {
+      state.closestDistance = distance;
+      state.closestResponded = { id: responseId, host: node.host, port: node.port };
+      return true;
+    }
+
+    return false;
+  }
+
+  _handlePeerResponse(response, nodeKey, node, peers, state) {
+    if (response.r.token) {
+      this._tokens.set(nodeKey, {
+        token: response.r.token,
+        receivedAt: Date.now()
+      });
+
+      if (state.closestResponded && state.closestResponded.host === node.host && state.closestResponded.port === node.port) {
+        state.closestToken = response.r.token;
+      }
+    }
+
+    if (response.r.values) {
+      const foundPeers = this._decodePeers(response.r.values);
+      for (const peer of foundPeers) {
+        const peerKey = `${peer.ip}:${peer.port}`;
+        peers.set(peerKey, peer);
+      }
+    }
+  }
+
+  _mergeFoundNodes(nodesBuffer, targetId, allNodes) {
+    const foundNodes = this._decodeNodes(nodesBuffer);
+    for (const foundNode of foundNodes) {
+      const foundKey = `${foundNode.host}:${foundNode.port}`;
+      if (!allNodes.has(foundKey)) {
+        const distance = this._xorDistance(targetId, foundNode.id);
+        allNodes.set(foundKey, { ...foundNode, distance });
+      }
+    }
+  }
+
+  _handleLookupResponse({ response, node, nodeKey, queryType, targetId, allNodes, peers, state }) {
+    let progressMade = false;
+
+    if (response.r.id) {
+      this._addNode(response.r.id, node.host, node.port);
+
+      if (!node.id) {
+        node.id = response.r.id;
+        node.distance = this._xorDistance(targetId, response.r.id);
+        allNodes.set(nodeKey, node);
+      }
+
+      if (this._updateClosestNode(targetId, response.r.id, node, state)) {
+        progressMade = true;
+      }
+    }
+
+    if (queryType === 'get_peers') {
+      this._handlePeerResponse(response, nodeKey, node, peers, state);
+    }
+
+    if (response.r.nodes) {
+      this._mergeFoundNodes(response.r.nodes, targetId, allNodes);
+    }
+
+    return progressMade;
+  }
   
   /**
    * Perform iterative Kademlia lookup
@@ -517,33 +635,19 @@ class DHTNode extends EventEmitter {
     console.log(`[DHT] Starting iterative ${queryType} lookup for ${targetId.toString('hex').substring(0, 8)}...`);
     
     // Initialize shortlist with closest nodes from routing table
-    let shortlist = this.getClosestNodes(targetId, this._alpha);
-    
-    // If no nodes in routing table, try bootstrap nodes
-    if (shortlist.length === 0) {
-      console.log('[DHT] No nodes in routing table, using bootstrap nodes');
-      shortlist = this.bootstrapNodes.map(node => ({
-        id: null, // Bootstrap nodes don't have known IDs yet
-        host: node.host,
-        port: node.port
-      }));
-    }
+    const shortlist = this._buildShortlist(targetId);
     
     const queried = new Set(); // Node keys we've already queried
     const allNodes = new Map(); // All nodes discovered: nodeKey -> {id, host, port, distance}
     const peers = new Map(); // Accumulated peers: "ip:port" -> {ip, port}
-    let closestResponded = null; // Closest node that responded
-    let closestDistance = null;
-    let closestToken = null;
+    const state = {
+      closestResponded: null,
+      closestDistance: null,
+      closestToken: null
+    };
     
     // Add initial nodes to allNodes
-    for (const node of shortlist) {
-      if (node.id) {
-        const nodeKey = `${node.host}:${node.port}`;
-        const distance = this._xorDistance(targetId, node.id);
-        allNodes.set(nodeKey, { ...node, distance });
-      }
-    }
+    this._seedAllNodes(targetId, shortlist, allNodes);
     
     let iteration = 0;
     let noProgressCount = 0;
@@ -553,17 +657,7 @@ class DHTNode extends EventEmitter {
       iteration++;
       
       // Get up to alpha unqueried nodes closest to target
-      const toQuery = Array.from(allNodes.values())
-        .filter(node => {
-          const nodeKey = `${node.host}:${node.port}`;
-          return !queried.has(nodeKey);
-        })
-        .sort((a, b) => {
-          if (!a.distance) return 1;
-          if (!b.distance) return -1;
-          return Buffer.compare(a.distance, b.distance);
-        })
-        .slice(0, this._alpha);
+      const toQuery = this._getNodesToQuery(allNodes, queried);
       
       if (toQuery.length === 0) {
         console.log(`[DHT] Iterative lookup: no more nodes to query (iteration ${iteration})`);
@@ -578,73 +672,22 @@ class DHTNode extends EventEmitter {
         queried.add(nodeKey);
         
         try {
-          const query = {
-            t: this._generateTransactionId(),
-            y: 'q',
-            q: queryType,
-            a: {
-              id: this.nodeId,
-              ...(queryType === 'find_node' ? { target: targetId } : { info_hash: targetId })
-            }
-          };
+          const query = this._buildLookupQuery(queryType, targetId);
           
           const response = await this._sendQuery(query, node.host, node.port);
-          
-          // Add responding node to routing table
-          if (response.r.id) {
-            this._addNode(response.r.id, node.host, node.port);
-            
-            // Update node in allNodes with actual ID if we didn't have it
-            if (!node.id) {
-              node.id = response.r.id;
-              node.distance = this._xorDistance(targetId, response.r.id);
-              allNodes.set(nodeKey, node);
-            }
-            
-            // Check if this is the closest responding node
-            const distance = this._xorDistance(targetId, response.r.id);
-            if (!closestDistance || Buffer.compare(distance, closestDistance) < 0) {
-              closestDistance = distance;
-              closestResponded = { id: response.r.id, host: node.host, port: node.port };
-              noProgressCount = 0; // Reset no progress counter
-            }
-          }
-          
-          // Handle get_peers response
-          if (queryType === 'get_peers') {
-            // Store token
-            if (response.r.token) {
-              this._tokens.set(nodeKey, {
-                token: response.r.token,
-                receivedAt: Date.now()
-              });
-              
-              // Update closest token
-              if (closestResponded && closestResponded.host === node.host && closestResponded.port === node.port) {
-                closestToken = response.r.token;
-              }
-            }
-            
-            // Extract peers if present
-            if (response.r.values) {
-              const foundPeers = this._decodePeers(response.r.values);
-              for (const peer of foundPeers) {
-                const peerKey = `${peer.ip}:${peer.port}`;
-                peers.set(peerKey, peer);
-              }
-            }
-          }
-          
-          // Add returned nodes to shortlist
-          if (response.r.nodes) {
-            const foundNodes = this._decodeNodes(response.r.nodes);
-            for (const foundNode of foundNodes) {
-              const foundKey = `${foundNode.host}:${foundNode.port}`;
-              if (!allNodes.has(foundKey)) {
-                const distance = this._xorDistance(targetId, foundNode.id);
-                allNodes.set(foundKey, { ...foundNode, distance });
-              }
-            }
+          const progressMade = this._handleLookupResponse({
+            response,
+            node,
+            nodeKey,
+            queryType,
+            targetId,
+            allNodes,
+            peers,
+            state
+          });
+
+          if (progressMade) {
+            noProgressCount = 0;
           }
         } catch (err) {
           // Node didn't respond or error occurred, ignore
@@ -675,7 +718,7 @@ class DHTNode extends EventEmitter {
     return {
       nodes: closestNodes,
       peers: Array.from(peers.values()),
-      token: closestToken
+      token: state.closestToken
     };
   }
   

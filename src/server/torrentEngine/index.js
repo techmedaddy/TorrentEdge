@@ -71,6 +71,10 @@ const defaultEngine = new TorrentEngine({
   }
 });
 
+defaultEngine.initializeAsyncComponents().catch(error => {
+  console.error(`[TorrentEngine] Async initialization failed: ${error.message}`);
+});
+
 // Phase 2.1: Singleton Dispatcher + embedded Worker
 const defaultDispatcher = new Dispatcher({
   engine: defaultEngine,

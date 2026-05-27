@@ -77,13 +77,6 @@ class TorrentEngine extends EventEmitter {
     console.log(`[TorrentEngine] Verify on resume: ${this._verifyOnResume}`);
     console.log(`[TorrentEngine] Port: ${this.port}`);
     
-    // Initialize Kafka if enabled
-    if (this._kafkaEnabled) {
-      this._initKafka(options.kafka).catch(error => {
-        console.error(`[TorrentEngine] Kafka initialization failed: ${error.message}`);
-      });
-    }
-    
     // Speed history tracking (circular buffer for last 60 samples)
     this._speedHistory = [];
     this._speedHistoryMaxSize = 60;
@@ -94,11 +87,26 @@ class TorrentEngine extends EventEmitter {
     this._dht = null;
     this._dhtEnabled = options.dht?.enabled !== false; // enabled by default
     this._dhtPort = options.dht?.port || this.port;
-    
+  }
+
+  /**
+   * Initialize async components (Kafka, DHT) outside constructor
+   */
+  async initializeAsyncComponents() {
+    if (this._kafkaEnabled) {
+      try {
+        await this._initKafka(this._options.kafka || {});
+      } catch (error) {
+        console.error(`[TorrentEngine] Kafka initialization failed: ${error.message}`);
+      }
+    }
+
     if (this._dhtEnabled) {
-      this._initDHT().catch(error => {
+      try {
+        await this._initDHT();
+      } catch (error) {
         console.error(`[TorrentEngine] DHT initialization failed: ${error.message}`);
-      });
+      }
     }
   }
   
@@ -217,6 +225,8 @@ class TorrentEngine extends EventEmitter {
     console.log('[TorrentEngine] Initializing engine...');
     
     try {
+      await this.initializeAsyncComponents();
+
       // Initialize state manager
       await this._stateManager.initialize();
       
@@ -258,95 +268,103 @@ class TorrentEngine extends EventEmitter {
     let failed = 0;
     
     for (const [infoHash, state] of Object.entries(savedStates)) {
-      try {
-        console.log(`[TorrentEngine] Resuming: ${state.magnetURI || state.torrentPath || infoHash}`);
-        
-        // Create torrent options
-        const torrentOptions = {
-          downloadPath: state.downloadPath || this.downloadPath,
-          port: this.port,
-          autoStart: false // Don't auto-start, let queue manager handle it
-        };
-        
-        // Use saved metadata if available (for magnet links)
-        if (state.metadata) {
-          try {
-            torrentOptions.torrentBuffer = Buffer.from(state.metadata, 'base64');
-          } catch (error) {
-            console.warn(`[TorrentEngine] Failed to restore metadata for ${infoHash}: ${error.message}`);
-          }
-        }
-        
-        // Add torrent source
-        if (state.magnetURI) {
-          torrentOptions.magnetURI = state.magnetURI;
-        } else if (state.torrentPath) {
-          torrentOptions.torrentPath = state.torrentPath;
-        } else {
-          console.warn(`[TorrentEngine] No torrent source for ${infoHash}, skipping`);
-          failed++;
-          continue;
-        }
-        
-        // Create torrent instance
-        const torrent = new Torrent(torrentOptions);
-        
-        // Wait for torrent to be ready
-        await new Promise((resolve, reject) => {
-          const timeout = setTimeout(() => {
-            reject(new Error('Torrent initialization timeout'));
-          }, 30000); // 30 second timeout
-          
-          torrent.once('ready', () => {
-            clearTimeout(timeout);
-            resolve();
-          });
-          
-          torrent.once('error', (error) => {
-            clearTimeout(timeout);
-            reject(error);
-          });
-        });
-        
-        // Verify infoHash matches
-        if (torrent.infoHash !== infoHash) {
-          console.warn(`[TorrentEngine] InfoHash mismatch for resumed torrent (expected: ${infoHash}, got: ${torrent.infoHash})`);
-          failed++;
-          continue;
-        }
-        
-        // Restore torrent state
-        await this._restoreTorrentState(torrent, state);
-        
-        // Setup event forwarding
-        this._setupTorrentEvents(torrent, infoHash);
-        
-        // Add to torrents map
-        this.torrents.set(infoHash, torrent);
-        
-        // Determine if should start or stay paused
-        const shouldStart = state.state === 'downloading' || state.state === 'seeding' || state.state === 'queued';
-        const startPaused = state.state === 'paused' || !shouldStart;
-        
-        // Add to queue manager
-        this._queueManager.add(torrent, {
-          priority: state.priority || 'normal',
-          startPaused
-        });
-        
+      const result = await this._resumeSingleTorrent(infoHash, state);
+      if (result.success) {
         resumed++;
-        console.log(`[TorrentEngine] Resumed: ${torrent.name} (${state.state})`);
-        
-      } catch (error) {
-        console.error(`[TorrentEngine] Failed to resume ${infoHash}: ${error.message}`);
+      } else {
         failed++;
-        
-        // Remove from state if resume failed
         this._stateManager.removeTorrentState(infoHash);
       }
     }
     
     console.log(`[TorrentEngine] Resume complete: ${resumed} succeeded, ${failed} failed`);
+  }
+
+  _buildTorrentOptionsFromState(state, infoHash) {
+    const torrentOptions = {
+      downloadPath: state.downloadPath || this.downloadPath,
+      port: this.port,
+      autoStart: false
+    };
+
+    if (state.metadata) {
+      try {
+        torrentOptions.torrentBuffer = Buffer.from(state.metadata, 'base64');
+      } catch (error) {
+        console.warn(`[TorrentEngine] Failed to restore metadata for ${infoHash}: ${error.message}`);
+      }
+    }
+
+    if (state.magnetURI) {
+      torrentOptions.magnetURI = state.magnetURI;
+    } else if (state.torrentPath) {
+      torrentOptions.torrentPath = state.torrentPath;
+    }
+
+    return torrentOptions;
+  }
+
+  _hasTorrentSource(state) {
+    return Boolean(state.magnetURI || state.torrentPath);
+  }
+
+  _waitForTorrentReady(torrent) {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Torrent initialization timeout'));
+      }, 30000);
+
+      torrent.once('ready', () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+
+      torrent.once('error', (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+    });
+  }
+
+  _shouldStartFromState(state) {
+    return state.state === 'downloading' || state.state === 'seeding' || state.state === 'queued';
+  }
+
+  async _resumeSingleTorrent(infoHash, state) {
+    try {
+      console.log(`[TorrentEngine] Resuming: ${state.magnetURI || state.torrentPath || infoHash}`);
+
+      if (!this._hasTorrentSource(state)) {
+        console.warn(`[TorrentEngine] No torrent source for ${infoHash}, skipping`);
+        return { success: false };
+      }
+
+      const torrentOptions = this._buildTorrentOptionsFromState(state, infoHash);
+      const torrent = new Torrent(torrentOptions);
+
+      await this._waitForTorrentReady(torrent);
+
+      if (torrent.infoHash !== infoHash) {
+        console.warn(`[TorrentEngine] InfoHash mismatch for resumed torrent (expected: ${infoHash}, got: ${torrent.infoHash})`);
+        return { success: false };
+      }
+
+      await this._restoreTorrentState(torrent, state);
+      this._setupTorrentEvents(torrent, infoHash);
+      this.torrents.set(infoHash, torrent);
+
+      const startPaused = state.state === 'paused' || !this._shouldStartFromState(state);
+      this._queueManager.add(torrent, {
+        priority: state.priority || 'normal',
+        startPaused
+      });
+
+      console.log(`[TorrentEngine] Resumed: ${torrent.name} (${state.state})`);
+      return { success: true };
+    } catch (error) {
+      console.error(`[TorrentEngine] Failed to resume ${infoHash}: ${error.message}`);
+      return { success: false };
+    }
   }
   
   /**
@@ -686,69 +704,22 @@ class TorrentEngine extends EventEmitter {
 
     // ── Step 1: Parse the torrent to get the name ─────────────────────────
     // We need the torrent name to know where FileWriter expects the file
-    const { parseTorrent } = require('./torrentParser');
-    let metadata;
-    try {
-      metadata = parseTorrent(torrentBuffer);
-    } catch (err) {
-      throw new Error(`seedFromFile: Failed to parse torrent buffer: ${err.message}`);
-    }
-
-    const torrentName = metadata.name;
-    const isMultiFile = metadata.isMultiFile || (metadata.files && metadata.files.length > 1);
+    const metadata = this._parseTorrentMetadata(torrentBuffer);
+    const { torrentName, isMultiFile } = this._resolveTorrentName(metadata);
 
     // ── Step 2: Place the source file where FileWriter expects it ─────────
     // Single-file torrent: engine looks for <downloadPath>/<torrentName>
     // We symlink (preferred) or copy to avoid duplicating large files on disk
-    let linkedPath;
-
     if (isMultiFile) {
-      // Multi-file not supported for seed-from-file yet — would need the whole dir
       throw new Error('seedFromFile: Multi-file torrents are not yet supported for seeding from a single file');
     }
 
-    linkedPath = path.resolve(downloadPath, torrentName);
-
-    // Ensure download directory exists
-    await fs.mkdir(downloadPath, { recursive: true });
-
-    // Check if target already exists (previous seed or partial download)
-    let needsLink = true;
-    try {
-      const existing = await fs.stat(linkedPath);
-      if (existing.size === metadata.length) {
-        // File already in place and correct size — skip linking
-        needsLink = false;
-        console.log(`[TorrentEngine] seedFromFile: file already in place: ${linkedPath}`);
-      } else {
-        // Wrong size — remove and re-link
-        await fs.unlink(linkedPath).catch(() => {});
-      }
-    } catch {
-      // File doesn't exist — need to link
-    }
-
-    if (needsLink) {
-      // Try symlink first (zero-copy, space-efficient)
-      // IMPORTANT: use absolute resolved paths so the symlink is valid regardless
-      // of cwd — relative symlinks resolve relative to the symlink's own directory
-      // which would produce a broken path (e.g. downloads/seeds/downloads/...)
-      try {
-        await fs.symlink(path.resolve(sourcePath), linkedPath);
-        console.log(`[TorrentEngine] seedFromFile: symlinked ${sourcePath} → ${linkedPath}`);
-      } catch (symlinkErr) {
-        // Symlink failed (e.g. cross-device, Windows) — try hardlink first (Fix #8)
-        try {
-          await fs.link(path.resolve(sourcePath), linkedPath);
-          console.log(`[TorrentEngine] seedFromFile: hardlinked ${sourcePath} → ${linkedPath}`);
-        } catch (linkErr) {
-          // Hardlink also failed (cross-filesystem) — fall back to full copy
-          console.warn(`[TorrentEngine] seedFromFile: hardlink failed (${linkErr.code}), copying file`);
-          await fs.copyFile(sourcePath, linkedPath);
-          console.log(`[TorrentEngine] seedFromFile: copied ${sourcePath} → ${linkedPath}`);
-        }
-      }
-    }
+    const linkedPath = await this._ensureSeedFile({
+      downloadPath,
+      torrentName,
+      sourcePath,
+      expectedSize: metadata.length
+    });
 
     // ── Step 3: Add torrent to engine with the .torrent buffer ────────────
     // The engine calls torrent.start() → FileWriter.verify() → finds all pieces valid
@@ -777,12 +748,7 @@ class TorrentEngine extends EventEmitter {
     // The engine's own start() already calls _announceToTracker('completed'),
     // but we also do an explicit seeder announce with correct left=0 params
     // to ensure trackers categorise us as a seeder (not a downloader).
-    const trackerUrls = metadata.announceList && metadata.announceList.length > 0
-      ? metadata.announceList.flat().filter(Boolean).map(u =>
-          Buffer.isBuffer(u) ? u.toString('utf8') : String(u))
-      : metadata.announce
-        ? [ Buffer.isBuffer(metadata.announce) ? metadata.announce.toString('utf8') : String(metadata.announce) ]
-        : [];
+    const trackerUrls = this._extractTrackerUrls(metadata);
 
     if (trackerUrls.length > 0) {
       setImmediate(() => {
@@ -801,6 +767,80 @@ class TorrentEngine extends EventEmitter {
     }
 
     return torrent;
+  }
+
+  _parseTorrentMetadata(torrentBuffer) {
+    const { parseTorrent } = require('./torrentParser');
+    try {
+      return parseTorrent(torrentBuffer);
+    } catch (err) {
+      throw new Error(`seedFromFile: Failed to parse torrent buffer: ${err.message}`);
+    }
+  }
+
+  _resolveTorrentName(metadata) {
+    const torrentName = metadata.name;
+    const isMultiFile = metadata.isMultiFile || (metadata.files && metadata.files.length > 1);
+    return { torrentName, isMultiFile };
+  }
+
+  async _ensureSeedFile({ downloadPath, torrentName, sourcePath, expectedSize }) {
+    const linkedPath = path.resolve(downloadPath, torrentName);
+    await fs.mkdir(downloadPath, { recursive: true });
+
+    const needsLink = await this._needsSeedLink(linkedPath, expectedSize);
+    if (!needsLink) {
+      return linkedPath;
+    }
+
+    await this._linkSeedFile(sourcePath, linkedPath);
+    return linkedPath;
+  }
+
+  async _needsSeedLink(linkedPath, expectedSize) {
+    try {
+      const existing = await fs.stat(linkedPath);
+      if (existing.size === expectedSize) {
+        console.log(`[TorrentEngine] seedFromFile: file already in place: ${linkedPath}`);
+        return false;
+      }
+      await fs.unlink(linkedPath).catch(() => {});
+    } catch {
+      // File doesn't exist — need to link
+    }
+
+    return true;
+  }
+
+  async _linkSeedFile(sourcePath, linkedPath) {
+    try {
+      await fs.symlink(path.resolve(sourcePath), linkedPath);
+      console.log(`[TorrentEngine] seedFromFile: symlinked ${sourcePath} → ${linkedPath}`);
+    } catch (symlinkErr) {
+      try {
+        await fs.link(path.resolve(sourcePath), linkedPath);
+        console.log(`[TorrentEngine] seedFromFile: hardlinked ${sourcePath} → ${linkedPath}`);
+      } catch (linkErr) {
+        console.warn(`[TorrentEngine] seedFromFile: hardlink failed (${linkErr.code}), copying file`);
+        await fs.copyFile(sourcePath, linkedPath);
+        console.log(`[TorrentEngine] seedFromFile: copied ${sourcePath} → ${linkedPath}`);
+      }
+    }
+  }
+
+  _extractTrackerUrls(metadata) {
+    if (metadata.announceList && metadata.announceList.length > 0) {
+      return metadata.announceList
+        .flat()
+        .filter(Boolean)
+        .map(u => Buffer.isBuffer(u) ? u.toString('utf8') : String(u));
+    }
+
+    if (metadata.announce) {
+      return [Buffer.isBuffer(metadata.announce) ? metadata.announce.toString('utf8') : String(metadata.announce)];
+    }
+
+    return [];
   }
 
   // ── Phase 3.2 ─────────────────────────────────────────────────────────────
@@ -1977,23 +2017,30 @@ class TorrentEngine extends EventEmitter {
       const payload = data.slice(offset + 1, offset + msgLen);
       offset += msgLen;
 
-      if (msgId === 6) {
-        // REQUEST: [pieceIndex 4B][begin 4B][length 4B]
-        if (payload.length < 12) continue;
-        const pieceIndex = payload.readUInt32BE(0);
-        const begin      = payload.readUInt32BE(4);
-        const length     = payload.readUInt32BE(8);
-        torrent.handlePieceRequest(peer, pieceIndex, begin, length);
-      } else if (msgId === 8) {
-        // CANCEL: same format as REQUEST
-        if (payload.length < 12) continue;
-        const pieceIndex = payload.readUInt32BE(0);
-        const begin      = payload.readUInt32BE(4);
-        const length     = payload.readUInt32BE(8);
-        torrent.handleCancelRequest(peer, pieceIndex, begin, length);
-      }
+      this._handlePeerRequestMessage(msgId, payload, peer, torrent);
       // Ignore CHOKE, UNCHOKE, INTERESTED, etc. — we're seeder-only here
     }
+  }
+
+  _handlePeerRequestMessage(msgId, payload, peer, torrent) {
+    if (msgId !== 6 && msgId !== 8) {
+      return;
+    }
+
+    if (payload.length < 12) {
+      return;
+    }
+
+    const pieceIndex = payload.readUInt32BE(0);
+    const begin = payload.readUInt32BE(4);
+    const length = payload.readUInt32BE(8);
+
+    if (msgId === 6) {
+      torrent.handlePieceRequest(peer, pieceIndex, begin, length);
+      return;
+    }
+
+    torrent.handleCancelRequest(peer, pieceIndex, begin, length);
   }
 
   /**

@@ -191,17 +191,45 @@ function getOldestQueueLagSeconds(engine) {
   }, 0);
 }
 
-function observeEngineMetrics(engine, worker) {
-  let stats = null;
+function getEngineStatsSafe(engine) {
   try {
     if (engine && typeof engine.getStats === 'function') {
-      stats = engine.getStats();
-    } else if (engine && typeof engine.getGlobalStats === 'function') {
-      stats = engine.getGlobalStats();
+      return engine.getStats();
+    }
+
+    if (engine && typeof engine.getGlobalStats === 'function') {
+      return engine.getGlobalStats();
     }
   } catch (err) {
-    stats = null;
+    return null;
   }
+
+  return null;
+}
+
+function getWorkerStatsSafe(worker) {
+  try {
+    return worker && typeof worker.getStats === 'function' ? worker.getStats() : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+function observeQueueDepth(stats) {
+  const queue = stats && stats.queue ? stats.queue : {};
+  queueDepth.set({ state: 'active' }, Number(queue.active) || Number(stats && stats.activeTorrents) || 0);
+  queueDepth.set({ state: 'queued' }, Number(queue.queued) || 0);
+  queueDepth.set({ state: 'paused' }, Number(queue.paused) || 0);
+  queueDepth.set({ state: 'completed' }, Number(queue.completed) || 0);
+}
+
+function observeWorkerStatus(workerStats) {
+  const nodeId = (workerStats && workerStats.nodeId) || NODE_ID;
+  activeWorkers.set({ node_id: nodeId }, workerStats && workerStats.isRunning ? 1 : 0);
+}
+
+function observeEngineMetrics(engine, worker) {
+  const stats = getEngineStatsSafe(engine);
 
   const downloadSpeed = stats ? stats.totalDownloadSpeed : 0;
   const uploadSpeed = stats ? stats.totalUploadSpeed : 0;
@@ -210,21 +238,10 @@ function observeEngineMetrics(engine, worker) {
   transferThroughputMbps.set({ direction: 'upload' }, bytesPerSecondToMbps(uploadSpeed));
   queueLagSeconds.set(getOldestQueueLagSeconds(engine));
 
-  const queue = stats && stats.queue ? stats.queue : {};
-  queueDepth.set({ state: 'active' }, Number(queue.active) || Number(stats && stats.activeTorrents) || 0);
-  queueDepth.set({ state: 'queued' }, Number(queue.queued) || 0);
-  queueDepth.set({ state: 'paused' }, Number(queue.paused) || 0);
-  queueDepth.set({ state: 'completed' }, Number(queue.completed) || 0);
+  observeQueueDepth(stats);
 
-  let workerStats = null;
-  try {
-    workerStats = worker && typeof worker.getStats === 'function' ? worker.getStats() : null;
-  } catch (err) {
-    workerStats = null;
-  }
-
-  const nodeId = (workerStats && workerStats.nodeId) || NODE_ID;
-  activeWorkers.set({ node_id: nodeId }, workerStats && workerStats.isRunning ? 1 : 0);
+  const workerStats = getWorkerStatsSafe(worker);
+  observeWorkerStatus(workerStats);
 }
 
 function createMetricsHandler(options = {}) {

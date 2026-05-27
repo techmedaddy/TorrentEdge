@@ -43,47 +43,56 @@ function findBencodeEnd(buffer, offset = 0) {
 
   const byte = buffer[offset];
 
-  // Integer: i<digits>e
   if (byte === 0x69) {
-    const end = buffer.indexOf(0x65, offset + 1);
-    if (end === -1) {
-      throw new Error('Unterminated bencode integer');
-    }
-    return end + 1;
+    return findBencodeIntegerEnd(buffer, offset);
   }
 
-  // List or dictionary: l...e / d...e
   if (byte === 0x6c || byte === 0x64) {
-    let cursor = offset + 1;
-    while (cursor < buffer.length && buffer[cursor] !== 0x65) {
-      cursor = findBencodeEnd(buffer, cursor);
-    }
-    if (cursor >= buffer.length) {
-      throw new Error('Unterminated bencode container');
-    }
-    return cursor + 1;
+    return findBencodeContainerEnd(buffer, offset);
   }
 
-  // Byte string: <length>:<bytes>
   if (byte >= 0x30 && byte <= 0x39) {
-    const colon = buffer.indexOf(0x3a, offset);
-    if (colon === -1) {
-      throw new Error('Invalid bencode string');
-    }
-
-    const length = parseInt(buffer.toString('ascii', offset, colon), 10);
-    if (Number.isNaN(length) || length < 0) {
-      throw new Error('Invalid bencode string length');
-    }
-
-    const end = colon + 1 + length;
-    if (end > buffer.length) {
-      throw new Error('Truncated bencode string');
-    }
-    return end;
+    return findBencodeStringEnd(buffer, offset);
   }
 
   throw new Error(`Invalid bencode token: ${byte}`);
+}
+
+function findBencodeIntegerEnd(buffer, offset) {
+  const end = buffer.indexOf(0x65, offset + 1);
+  if (end === -1) {
+    throw new Error('Unterminated bencode integer');
+  }
+  return end + 1;
+}
+
+function findBencodeContainerEnd(buffer, offset) {
+  let cursor = offset + 1;
+  while (cursor < buffer.length && buffer[cursor] !== 0x65) {
+    cursor = findBencodeEnd(buffer, cursor);
+  }
+  if (cursor >= buffer.length) {
+    throw new Error('Unterminated bencode container');
+  }
+  return cursor + 1;
+}
+
+function findBencodeStringEnd(buffer, offset) {
+  const colon = buffer.indexOf(0x3a, offset);
+  if (colon === -1) {
+    throw new Error('Invalid bencode string');
+  }
+
+  const length = parseInt(buffer.toString('ascii', offset, colon), 10);
+  if (Number.isNaN(length) || length < 0) {
+    throw new Error('Invalid bencode string length');
+  }
+
+  const end = colon + 1 + length;
+  if (end > buffer.length) {
+    throw new Error('Truncated bencode string');
+  }
+  return end;
 }
 
 /**

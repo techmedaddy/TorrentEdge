@@ -110,6 +110,85 @@ function encodeBase32(buffer) {
   return result;
 }
 
+function parseInfoHashFromXt(xt) {
+  if (!xt.startsWith('urn:btih:')) {
+    throw new Error('Invalid xt format: must start with "urn:btih:"');
+  }
+
+  const hashPart = xt.slice(9);
+
+  if (hashPart.length === 40) {
+    if (!/^[a-fA-F0-9]{40}$/.test(hashPart)) {
+      throw new Error('Invalid info hash: must be 40 hex characters');
+    }
+    const infoHash = hashPart.toLowerCase();
+    return { infoHash, infoHashBuffer: Buffer.from(infoHash, 'hex') };
+  }
+
+  if (hashPart.length === 32) {
+    try {
+      const infoHashBuffer = decodeBase32(hashPart);
+      if (infoHashBuffer.length !== 20) {
+        throw new Error('Decoded base32 info hash must be 20 bytes');
+      }
+      return { infoHash: infoHashBuffer.toString('hex'), infoHashBuffer };
+    } catch (error) {
+      throw new Error(`Invalid base32 info hash: ${error.message}`);
+    }
+  }
+
+  throw new Error('Invalid info hash length: must be 40 hex characters or 32 base32 characters');
+}
+
+function extractTrackers(params) {
+  const trackers = [];
+  params.forEach((value, key) => {
+    if (key === 'tr') {
+      try {
+        trackers.push(decodeURIComponent(value));
+      } catch (error) {
+        console.warn(`Failed to decode tracker URL: ${value}`);
+      }
+    }
+  });
+  return trackers;
+}
+
+function extractPeers(params) {
+  const peers = [];
+  params.forEach((value, key) => {
+    if (key === 'x.pe') {
+      try {
+        const decoded = decodeURIComponent(value);
+        const match = decoded.match(/^(.+):(\d+)$/);
+        if (match) {
+          peers.push({
+            ip: match[1],
+            port: parseInt(match[2], 10)
+          });
+        }
+      } catch (error) {
+        console.warn(`Failed to parse peer: ${value}`);
+      }
+    }
+  });
+  return peers;
+}
+
+function extractWebSeeds(params) {
+  const webSeeds = [];
+  params.forEach((value, key) => {
+    if (key === 'ws') {
+      try {
+        webSeeds.push(decodeURIComponent(value));
+      } catch (error) {
+        console.warn(`Failed to decode web seed URL: ${value}`);
+      }
+    }
+  });
+  return webSeeds;
+}
+
 /**
  * Parses a magnet URI and extracts torrent information
  * 
@@ -157,83 +236,19 @@ function parseMagnet(magnetURI) {
   }
 
   // Parse info hash from xt
-  let infoHashBuffer;
-  let infoHash;
-
-  if (xt.startsWith('urn:btih:')) {
-    const hashPart = xt.slice(9); // Remove "urn:btih:"
-    
-    if (hashPart.length === 40) {
-      // Hex format (40 characters)
-      if (!/^[a-fA-F0-9]{40}$/.test(hashPart)) {
-        throw new Error('Invalid info hash: must be 40 hex characters');
-      }
-      infoHash = hashPart.toLowerCase();
-      infoHashBuffer = Buffer.from(infoHash, 'hex');
-    } else if (hashPart.length === 32) {
-      // Base32 format (32 characters)
-      try {
-        infoHashBuffer = decodeBase32(hashPart);
-        if (infoHashBuffer.length !== 20) {
-          throw new Error('Decoded base32 info hash must be 20 bytes');
-        }
-        infoHash = infoHashBuffer.toString('hex');
-      } catch (error) {
-        throw new Error(`Invalid base32 info hash: ${error.message}`);
-      }
-    } else {
-      throw new Error('Invalid info hash length: must be 40 hex characters or 32 base32 characters');
-    }
-  } else {
-    throw new Error('Invalid xt format: must start with "urn:btih:"');
-  }
+  const { infoHash, infoHashBuffer } = parseInfoHashFromXt(xt);
 
   // Extract dn (display name) - optional
   const displayName = params.get('dn') ? decodeURIComponent(params.get('dn')) : null;
 
   // Extract tr (trackers) - can be multiple
-  const trackers = [];
-  params.forEach((value, key) => {
-    if (key === 'tr') {
-      try {
-        trackers.push(decodeURIComponent(value));
-      } catch (error) {
-        // Skip malformed tracker URLs
-        console.warn(`Failed to decode tracker URL: ${value}`);
-      }
-    }
-  });
+  const trackers = extractTrackers(params);
 
   // Extract x.pe (peers) - can be multiple
-  const peers = [];
-  params.forEach((value, key) => {
-    if (key === 'x.pe') {
-      try {
-        const decoded = decodeURIComponent(value);
-        const match = decoded.match(/^(.+):(\d+)$/);
-        if (match) {
-          peers.push({
-            ip: match[1],
-            port: parseInt(match[2], 10)
-          });
-        }
-      } catch (error) {
-        console.warn(`Failed to parse peer: ${value}`);
-      }
-    }
-  });
+  const peers = extractPeers(params);
 
   // Extract ws (web seeds) - can be multiple
-  const webSeeds = [];
-  params.forEach((value, key) => {
-    if (key === 'ws') {
-      try {
-        webSeeds.push(decodeURIComponent(value));
-      } catch (error) {
-        console.warn(`Failed to decode web seed URL: ${value}`);
-      }
-    }
-  });
+  const webSeeds = extractWebSeeds(params);
 
   return {
     infoHash,

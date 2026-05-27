@@ -203,117 +203,140 @@ class S3ColdStartStreamer {
     return new Promise((resolve, reject) => {
       if (this._aborted) return reject(new Error('Aborted'));
 
-      let redirectCount = 0;
-      const maxRedirects = 5;
+      const state = {
+        offset,
+        pieceIndex,
+        redirectCount: 0,
+        maxRedirects: 5
+      };
 
       const doRequest = (requestUrl) => {
         if (this._aborted) return reject(new Error('Aborted'));
-
-        const client = requestUrl.startsWith('https') ? https : http;
-        const headers = {};
-
-        // Only add Range header if we're resuming (offset > 0)
-        if (offset > 0) {
-          headers['Range'] = `bytes=${offset}-`;
-        }
-
-        const req = client.get(requestUrl, { headers }, (res) => {
-          // Handle Redirects
-          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-            res.resume(); // drain response to free socket
-            redirectCount++;
-            if (redirectCount > maxRedirects) {
-              return reject(new Error('Too many redirects'));
-            }
-            const redirectUrl = new URL(res.headers.location, requestUrl).href;
-            return doRequest(redirectUrl);
-          }
-
-          // 416 = Range Not Satisfiable = we already have all the data
-          if (res.statusCode === 416) {
-            return resolve({ finalOffset: offset, finalPieceIndex: pieceIndex });
-          }
-
-          // Accept 200 (full body) and 206 (partial content)
-          if (res.statusCode !== 200 && res.statusCode !== 206) {
-            res.resume(); // Drain the response to free the socket
-            return reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage}`));
-          }
-
-        let currentOffset = offset;
-        let currentPiece = pieceIndex;
-
-        const processor = new PieceProcessor({
-          pieceLength: this.pieceLength,
-          initialPieceIndex: pieceIndex,
-          onPieceReady: async ({ pieceData, index }) => {
-            // On-the-fly SHA-256 hashing
-            const sha256 = crypto.createHash('sha256').update(pieceData).digest('hex');
-
-            // Write to CAS (atomic: temp file → rename)
-            await this.casStore.store(pieceData, sha256);
-
-            // Write to BitTorrent file structure for seeding
-            if (this.torrent.fileWriter) {
-              await this.torrent.fileWriter.writePiece(index, pieceData);
-            }
-
-            // Mark as complete so peers can immediately request this piece
-            if (this.torrent.pieceManager) {
-              this.torrent.pieceManager.markComplete(index);
-            }
-
-            currentOffset += pieceData.length;
-            currentPiece = index + 1;
-            this._piecesWritten++;
-            this._bytesStreamed += pieceData.length;
-          },
-        });
-
-        // Wire up abort mechanism
-        const onAbort = () => {
-          res.destroy();
-          processor.destroy(new Error('Stream aborted due to lease loss'));
-        };
-
-        if (this._aborted) {
-          onAbort();
-          return;
-        }
-
-        // Store reference so _abort() can kill an in-flight request
-        this._activeRequest = req;
-        this._onAbort = onAbort;
-
-        processor.on('finish', () => {
-          this._activeRequest = null;
-          this._onAbort = null;
-          resolve({ finalOffset: currentOffset, finalPieceIndex: currentPiece });
-        });
-
-        processor.on('error', (err) => {
-          this._activeRequest = null;
-          this._onAbort = null;
-          reject(err);
-        });
-
-        res.on('error', (err) => {
-          processor.destroy(err);
-        });
-
-        res.pipe(processor);
-      });
-
-        req.on('error', reject);
-
-        // Timeout: if the server hangs for 30s, kill the socket and retry
-        req.setTimeout(30000, () => {
-          req.destroy(new Error('HTTP request timed out after 30s'));
-        });
+        this._startStreamRequest({ requestUrl, state, resolve, reject, doRequest });
       };
 
       doRequest(this.sourceUri);
     });
+  }
+
+  _startStreamRequest({ requestUrl, state, resolve, reject, doRequest }) {
+    const client = requestUrl.startsWith('https') ? https : http;
+    const headers = this._buildRequestHeaders(state.offset);
+
+    const req = client.get(requestUrl, { headers }, (res) => {
+      if (this._handleRedirect(res, requestUrl, state, reject, doRequest)) {
+        return;
+      }
+
+      if (this._handleTerminalStatuses(res, state, resolve, reject)) {
+        return;
+      }
+
+      this._streamResponse({ res, req, state, resolve, reject });
+    });
+
+    req.on('error', reject);
+
+    req.setTimeout(30000, () => {
+      req.destroy(new Error('HTTP request timed out after 30s'));
+    });
+  }
+
+  _buildRequestHeaders(offset) {
+    const headers = {};
+    if (offset > 0) {
+      headers['Range'] = `bytes=${offset}-`;
+    }
+    return headers;
+  }
+
+  _handleRedirect(res, requestUrl, state, reject, doRequest) {
+    if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+      res.resume();
+      state.redirectCount++;
+      if (state.redirectCount > state.maxRedirects) {
+        reject(new Error('Too many redirects'));
+        return true;
+      }
+      const redirectUrl = new URL(res.headers.location, requestUrl).href;
+      doRequest(redirectUrl);
+      return true;
+    }
+    return false;
+  }
+
+  _handleTerminalStatuses(res, state, resolve, reject) {
+    if (res.statusCode === 416) {
+      resolve({ finalOffset: state.offset, finalPieceIndex: state.pieceIndex });
+      return true;
+    }
+
+    if (res.statusCode !== 200 && res.statusCode !== 206) {
+      res.resume();
+      reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage}`));
+      return true;
+    }
+
+    return false;
+  }
+
+  _streamResponse({ res, req, state, resolve, reject }) {
+    let currentOffset = state.offset;
+    let currentPiece = state.pieceIndex;
+
+    const processor = new PieceProcessor({
+      pieceLength: this.pieceLength,
+      initialPieceIndex: state.pieceIndex,
+      onPieceReady: async ({ pieceData, index }) => {
+        const sha256 = crypto.createHash('sha256').update(pieceData).digest('hex');
+
+        await this.casStore.store(pieceData, sha256);
+
+        if (this.torrent.fileWriter) {
+          await this.torrent.fileWriter.writePiece(index, pieceData);
+        }
+
+        if (this.torrent.pieceManager) {
+          this.torrent.pieceManager.markComplete(index);
+        }
+
+        currentOffset += pieceData.length;
+        currentPiece = index + 1;
+        this._piecesWritten++;
+        this._bytesStreamed += pieceData.length;
+      },
+    });
+
+    const onAbort = () => {
+      res.destroy();
+      processor.destroy(new Error('Stream aborted due to lease loss'));
+    };
+
+    if (this._aborted) {
+      onAbort();
+      return;
+    }
+
+    this._activeRequest = req;
+    this._onAbort = onAbort;
+
+    processor.on('finish', () => {
+      this._activeRequest = null;
+      this._onAbort = null;
+      resolve({ finalOffset: currentOffset, finalPieceIndex: currentPiece });
+    });
+
+    processor.on('error', (err) => {
+      this._activeRequest = null;
+      this._onAbort = null;
+      reject(err);
+    });
+
+    res.on('error', (err) => {
+      processor.destroy(err);
+    });
+
+    res.pipe(processor);
   }
 
   /**

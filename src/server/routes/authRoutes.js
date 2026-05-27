@@ -40,6 +40,70 @@ const generateToken = (user) => {
   );
 };
 
+const buildAuthResponse = (user, token) => ({
+  token,
+  user: {
+    id: user.id,
+    username: user.username,
+    email: user.email,
+    avatar: user.avatar,
+    authProvider: user.auth_provider
+  }
+});
+
+const findOrCreateGoogleUser = async ({ googleId, email, picture }) => {
+  let user = await User.findOne({ where: { google_id: googleId } });
+
+  if (user) {
+    return user;
+  }
+
+  user = await User.findOne({ where: { email } });
+
+  if (user) {
+    user.google_id = googleId;
+    user.avatar = picture;
+    user.auth_provider = user.auth_provider === 'local' ? 'local' : 'google';
+    await user.save();
+    logger.info(`Linked Google account to existing user: ${email}`);
+    return user;
+  }
+
+  const username = email.split('@')[0] + '_' + Math.random().toString(36).slice(-4);
+  user = await User.create({
+    username,
+    email,
+    google_id: googleId,
+    avatar: picture,
+    auth_provider: 'google'
+  });
+  logger.info(`Created new Google user: ${email}`);
+  return user;
+};
+
+const handleGoogleAuthError = (res, error) => {
+  logger.error('Google auth error:', error);
+
+  if (error.message && error.message.includes('wrong number of segments')) {
+    return res.status(400).json({
+      message: 'Malformed Google credential format.',
+      details: error.message
+    });
+  }
+
+  if (error.message && error.message.includes('Token used too late')) {
+    return res.status(401).json({
+      message: 'Google token expired. Please sign in again.',
+      details: error.message
+    });
+  }
+
+  return res.status(401).json({
+    message: 'Google authentication failed.',
+    error: process.env.NODE_ENV === 'development' ? error.message : undefined
+  });
+};
+
 // POST /api/auth/google - Handle Google OAuth token from frontend
 router.post('/google', async (req, res) => {
   const { credential } = req.body;
@@ -60,70 +124,15 @@ router.post('/google', async (req, res) => {
 
     logger.info(`Google auth attempt for: ${email}`);
 
-    // Check if user exists by googleId
-    let user = await User.findOne({ where: { google_id: googleId } });
-
-    if (!user) {
-      // Check if user exists by email (link accounts)
-      user = await User.findOne({ where: { email } });
-
-      if (user) {
-        // Link Google to existing account
-        user.google_id = googleId;
-        user.avatar = picture;
-        user.auth_provider = user.auth_provider === 'local' ? 'local' : 'google';
-        await user.save();
-        logger.info(`Linked Google account to existing user: ${email}`);
-      } else {
-        // Create new user
-        const username = email.split('@')[0] + '_' + Math.random().toString(36).slice(-4);
-        user = await User.create({
-          username,
-          email,
-          google_id: googleId,
-          avatar: picture,
-          auth_provider: 'google'
-        });
-        logger.info(`Created new Google user: ${email}`);
-      }
-    }
+    const user = await findOrCreateGoogleUser({ googleId, email, picture });
 
     // Generate JWT
     const token = generateToken(user);
 
-    res.json({
-      token,
-      user: {
-        id: user.id,
-        username: user.username,
-        email: user.email,
-        avatar: user.avatar,
-        authProvider: user.auth_provider
-      }
-    });
+    res.json(buildAuthResponse(user, token));
 
   } catch (error) {
-    logger.error('Google auth error:', error);
-    
-    // Check for specific Google Auth errors
-    if (error.message && error.message.includes('wrong number of segments')) {
-      return res.status(400).json({ 
-        message: 'Malformed Google credential format.',
-        details: error.message 
-      });
-    }
-
-    if (error.message && error.message.includes('Token used too late')) {
-      return res.status(401).json({ 
-        message: 'Google token expired. Please sign in again.',
-        details: error.message 
-      });
-    }
-
-    res.status(401).json({ 
-      message: 'Google authentication failed.',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
+    return handleGoogleAuthError(res, error);
   }
 });
 
@@ -181,30 +190,7 @@ router.get('/google/callback', async (req, res) => {
 
     logger.info(`Google OAuth callback for: ${email}`);
 
-    // Find or create user (same logic as POST /google)
-    let user = await User.findOne({ where: { google_id: googleId } });
-
-    if (!user) {
-      user = await User.findOne({ where: { email } });
-
-      if (user) {
-        user.google_id = googleId;
-        user.avatar = picture;
-        user.auth_provider = user.auth_provider === 'local' ? 'local' : 'google';
-        await user.save();
-        logger.info(`Linked Google account to existing user: ${email}`);
-      } else {
-        const username = email.split('@')[0] + '_' + Math.random().toString(36).slice(-4);
-        user = await User.create({
-          username,
-          email,
-          google_id: googleId,
-          avatar: picture,
-          auth_provider: 'google'
-        });
-        logger.info(`Created new Google user: ${email}`);
-      }
-    }
+    const user = await findOrCreateGoogleUser({ googleId, email, picture });
 
     // Generate JWT
     const token = generateToken(user);

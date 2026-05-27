@@ -154,7 +154,14 @@ class Torrent extends EventEmitter {
       console.error(`[Torrent] Unhandled error: ${err.message || err}`);
     });
 
-    this._initPromise = this._initialize();
+    this._initPromise = null;
+  }
+
+  _ensureInitialized() {
+    if (!this._initPromise) {
+      this._initPromise = this._initialize();
+    }
+    return this._initPromise;
   }
 
   _generatePeerId() {
@@ -367,7 +374,7 @@ class Torrent extends EventEmitter {
   }
 
   async start() {
-    await this._initPromise;
+    await this._ensureInitialized();
 
     if (this._state === 'downloading' || this._state === 'seeding' || this._state === 'fetching_metadata') {
       console.log('[Torrent] Already running');

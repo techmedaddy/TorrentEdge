@@ -344,55 +344,71 @@ class DownloadManager extends EventEmitter {
     const peers = this.peerManager.getConnectedPeers();
 
     for (const peer of peers) {
-      if (peer.peerChoking || !peer.isHandshakeComplete) {
-        continue;
+      this._requestBlocksForPeer(peer);
+    }
+  }
+
+  _shouldSkipPeer(peer) {
+    return peer.peerChoking || !peer.isHandshakeComplete;
+  }
+
+  _getPeerRequests(peer) {
+    const peerKey = `${peer.ip}:${peer.port}`;
+    return Array.from(this.pendingRequests.values())
+      .filter(req => `${req.peer.ip}:${req.peer.port}` === peerKey);
+  }
+
+  _requestBlocksForPeer(peer) {
+    if (this._shouldSkipPeer(peer)) {
+      return;
+    }
+
+    const peerRequests = this._getPeerRequests(peer);
+
+    while (peerRequests.length < this.maxActiveRequests) {
+      const didRequest = this._requestNextBlockForPeer(peer, peerRequests);
+      if (!didRequest) {
+        break;
       }
+    }
+  }
 
-      const peerKey = `${peer.ip}:${peer.port}`;
-      const peerRequests = Array.from(this.pendingRequests.values())
-        .filter(req => `${req.peer.ip}:${req.peer.port}` === peerKey);
+  _requestNextBlockForPeer(peer, peerRequests) {
+    const pieceIndex = this._selectPieceForPeer(peer);
+    if (pieceIndex === null) {
+      return false;
+    }
 
-      while (peerRequests.length < this.maxActiveRequests) {
-        const pieceIndex = this._selectPieceForPeer(peer);
-        
-        if (pieceIndex === null) {
-          break;
-        }
+    const piece = this.getPieceByIndex(pieceIndex);
+    if (!this.activePieces.has(pieceIndex)) {
+      this.activePieces.set(pieceIndex, piece);
+    }
 
-        const piece = this.getPieceByIndex(pieceIndex);
-        
-        if (!this.activePieces.has(pieceIndex)) {
-          this.activePieces.set(pieceIndex, piece);
-        }
+    const block = piece.getNextMissingBlock();
+    if (!block) {
+      return false;
+    }
 
-        const block = piece.getNextMissingBlock();
-        
-        if (!block) {
-          break;
-        }
+    const requestKey = `${pieceIndex}:${block.offset}`;
+    if (this.pendingRequests.has(requestKey)) {
+      return false;
+    }
 
-        const requestKey = `${pieceIndex}:${block.offset}`;
-        
-        if (this.pendingRequests.has(requestKey)) {
-          break;
-        }
+    try {
+      peer.sendRequest(pieceIndex, block.offset, block.length);
 
-        try {
-          peer.sendRequest(pieceIndex, block.offset, block.length);
-          
-          this.pendingRequests.set(requestKey, {
-            piece: pieceIndex,
-            block: block.offset,
-            peer,
-            timestamp: Date.now()
-          });
+      this.pendingRequests.set(requestKey, {
+        piece: pieceIndex,
+        block: block.offset,
+        peer,
+        timestamp: Date.now()
+      });
 
-          console.log(`[DownloadManager] Requested piece ${pieceIndex} block ${block.offset} from ${peer.ip}:${peer.port}`);
-          peerRequests.push({ piece: pieceIndex, block: block.offset });
-        } catch (error) {
-          break;
-        }
-      }
+      console.log(`[DownloadManager] Requested piece ${pieceIndex} block ${block.offset} from ${peer.ip}:${peer.port}`);
+      peerRequests.push({ piece: pieceIndex, block: block.offset });
+      return true;
+    } catch (error) {
+      return false;
     }
   }
 

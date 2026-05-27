@@ -265,7 +265,7 @@ function encode(value) {
     buffers.push(Buffer.from('d'));
     
     // Sort keys alphabetically (byte-order)
-    const keys = Object.keys(obj).sort();
+    const keys = Object.keys(obj).sort((a, b) => String(a).localeCompare(String(b)));
     
     for (const key of keys) {
       encodeByteString(key);

@@ -684,59 +684,9 @@ class Torrent extends EventEmitter {
       this._isStopping = true;
       this._state = 'stopping';
       
-      // Stop seeding-specific timers
-      if (this._chokingInterval) {
-        clearInterval(this._chokingInterval);
-        this._chokingInterval = null;
-      }
-      
-      if (this._seedingLimitCheckInterval) {
-        clearInterval(this._seedingLimitCheckInterval);
-        this._seedingLimitCheckInterval = null;
-      }
-
-      // Clear intervals
-      if (this._announceInterval) {
-        clearInterval(this._announceInterval);
-        this._announceInterval = null;
-      }
-
-      if (this._statsInterval) {
-        clearInterval(this._statsInterval);
-        this._statsInterval = null;
-      }
-      
-      if (this._progressIntervalTimer) {
-        clearInterval(this._progressIntervalTimer);
-        this._progressIntervalTimer = null;
-      }
-      
-      // Clear metadata timeout
-      if (this._metadataTimeout) {
-        clearTimeout(this._metadataTimeout);
-        this._metadataTimeout = null;
-      }
-
-      if (this._noPeersTimeout) {
-        clearTimeout(this._noPeersTimeout);
-        this._noPeersTimeout = null;
-      }
-      
+      this._clearStopTimers();
       this._cleanupMetadataSession();
-
-      // Cancel pending tracker retries
-      if (this._retryManager) {
-        this._retryManager.cancelAll();
-        this._retryManager = new RetryManager({ maxRetries: 3, baseDelay: 2000 });
-      }
-      if (this._trackerManager?.retryManager) {
-        this._trackerManager.retryManager.cancelAll();
-        this._trackerManager.retryManager = new RetryManager({
-          maxRetries: 2,
-          baseDelay: 2000,
-          maxDelay: 30000
-        });
-      }
+      this._resetRetryManagers();
 
       // Stop download manager
       if (this._downloadManager) {
@@ -776,6 +726,48 @@ class Torrent extends EventEmitter {
       this._isStopping = false;
       console.error(`[Torrent] Stop error: ${error.message}`);
       this.emit('error', { message: error.message });
+    }
+  }
+
+  _clearIntervalTimer(timerName) {
+    if (!this[timerName]) {
+      return;
+    }
+    clearInterval(this[timerName]);
+    this[timerName] = null;
+  }
+
+  _clearTimeoutTimer(timerName) {
+    if (!this[timerName]) {
+      return;
+    }
+    clearTimeout(this[timerName]);
+    this[timerName] = null;
+  }
+
+  _clearStopTimers() {
+    this._clearIntervalTimer('_chokingInterval');
+    this._clearIntervalTimer('_seedingLimitCheckInterval');
+    this._clearIntervalTimer('_announceInterval');
+    this._clearIntervalTimer('_statsInterval');
+    this._clearIntervalTimer('_progressIntervalTimer');
+    this._clearTimeoutTimer('_metadataTimeout');
+    this._clearTimeoutTimer('_noPeersTimeout');
+  }
+
+  _resetRetryManagers() {
+    if (this._retryManager) {
+      this._retryManager.cancelAll();
+      this._retryManager = new RetryManager({ maxRetries: 3, baseDelay: 2000 });
+    }
+
+    if (this._trackerManager?.retryManager) {
+      this._trackerManager.retryManager.cancelAll();
+      this._trackerManager.retryManager = new RetryManager({
+        maxRetries: 2,
+        baseDelay: 2000,
+        maxDelay: 30000
+      });
     }
   }
 

@@ -714,7 +714,7 @@ class TorrentEngine extends EventEmitter {
       throw new Error('seedFromFile: Multi-file torrents are not yet supported for seeding from a single file');
     }
 
-    const linkedPath = await this._ensureSeedFile({
+    await this._ensureSeedFile({
       downloadPath,
       torrentName,
       sourcePath,
@@ -790,11 +790,11 @@ class TorrentEngine extends EventEmitter {
 
     const needsLink = await this._needsSeedLink(linkedPath, expectedSize);
     if (!needsLink) {
-      return linkedPath;
+      return { linkedPath, wasLinked: false };
     }
 
     await this._linkSeedFile(sourcePath, linkedPath);
-    return linkedPath;
+    return { linkedPath, wasLinked: true };
   }
 
   async _needsSeedLink(linkedPath, expectedSize) {

@@ -117,30 +117,9 @@ class WorkerConsumer extends EventEmitter {
       console.log(`[Worker:${this._nodeId}] Processing: ${type} (requestId: ${meta?.requestId || 'none'})`);
 
       try {
-        switch (type) {
-          case DIRECTIVE_TYPES.JOB_ASSIGNED:
-            await this._handleJobAssigned(payload, meta);
-            break;
-
-          case DIRECTIVE_TYPES.JOB_PAUSED:
-            await this._handleJobPaused(payload, meta);
-            break;
-
-          case DIRECTIVE_TYPES.JOB_RESUMED:
-            await this._handleJobResumed(payload, meta);
-            break;
-
-          case DIRECTIVE_TYPES.JOB_CANCELLED:
-            await this._handleJobCancelled(payload, meta);
-            break;
-
-          default:
-            console.warn(`[Worker:${this._nodeId}] Unhandled directive type: ${type}`);
-        }
-
+        await this._dispatchDirective(type, payload, meta);
         this._processedCount++;
         metrics.recordWorkerDirective({ type, result: 'success' });
-
       } catch (err) {
         console.error(`[Worker:${this._nodeId}] Directive ${type} failed: ${err.message}`);
         this._failedCount++;
@@ -157,6 +136,27 @@ class WorkerConsumer extends EventEmitter {
         });
       }
     });
+  }
+
+  async _dispatchDirective(type, payload, meta) {
+    const handler = this._getDirectiveHandler(type);
+    if (!handler) {
+      console.warn(`[Worker:${this._nodeId}] Unhandled directive type: ${type}`);
+      return;
+    }
+
+    await handler(payload, meta);
+  }
+
+  _getDirectiveHandler(type) {
+    const handlers = {
+      [DIRECTIVE_TYPES.JOB_ASSIGNED]: this._handleJobAssigned.bind(this),
+      [DIRECTIVE_TYPES.JOB_PAUSED]: this._handleJobPaused.bind(this),
+      [DIRECTIVE_TYPES.JOB_RESUMED]: this._handleJobResumed.bind(this),
+      [DIRECTIVE_TYPES.JOB_CANCELLED]: this._handleJobCancelled.bind(this),
+    };
+
+    return handlers[type];
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -466,70 +466,88 @@ class WorkerConsumer extends EventEmitter {
       const activeTorrentsCount = stats.activeTorrents || 0;
 
       // --- Flow Control / Backpressure Implementation ---
-      if (this._consumer) {
-        const maxCapacity = parseInt(process.env.WORKER_MAX_CAPACITY, 10) || 20;
-        
-        if (activeTorrentsCount >= maxCapacity && !this._isPaused) {
-          console.warn(`[Worker:${this._nodeId}] BACKPRESSURE: Node at capacity (${activeTorrentsCount}/${maxCapacity}). Pausing Kafka consumption.`);
-          this._consumer.pause([{ topic: TOPICS.JOB_DISPATCH }]);
-          this._isPaused = true;
-        } else if (activeTorrentsCount < maxCapacity * 0.8 && this._isPaused) {
-          console.log(`[Worker:${this._nodeId}] BACKPRESSURE: Capacity available (${activeTorrentsCount}/${maxCapacity}). Resuming Kafka consumption.`);
-          this._consumer.resume([{ topic: TOPICS.JOB_DISPATCH }]);
-          this._isPaused = false;
-        }
-      }
+      this._applyBackpressure(activeTorrentsCount);
 
       // Phase 2.2: Bulk renew leases for all active torrents in a single pipeline
       // Phase 4.1: Refresh peer registry TTLs
-      const activeInfoHashes = [];
-      if (this._engine) {
-        for (const [infoHash, torrent] of this._engine.torrents.entries()) {
-          if (torrent.state !== 'paused' && torrent.state !== 'stopped' && torrent.state !== 'error') {
-            activeInfoHashes.push(infoHash);
-          }
-        }
-
-        // Bulk lease renewal via Redis pipeline (1 round-trip instead of N)
-        if (activeInfoHashes.length > 0) {
-          const results = await LeaseManager.renewLeasesBulk(activeInfoHashes, this._nodeId);
-          for (let i = 0; i < activeInfoHashes.length; i++) {
-            if (results[i] === null) {
-              const lostHash = activeInfoHashes[i];
-              console.warn(`[Worker:${this._nodeId}] Lost lease for ${lostHash}! Pausing torrent to prevent split-brain.`);
-              const torrent = this._engine.torrents.get(lostHash);
-              if (torrent) torrent.pause();
-              await this._peerDiscovery.stopDiscovery(lostHash).catch(() => {});
-            }
-          }
-        }
-
-        // Phase 4.1: Bulk refresh peer registry TTLs
-        if (activeInfoHashes.length > 0) {
-          await PeerRegistry.refreshAll(this._nodeId, activeInfoHashes).catch(() => {});
-        }
-      }
-
-      this.emit('heartbeat', buildDirective(
-        DIRECTIVE_TYPES.WORKER_HEARTBEAT,
-        {
-          nodeId:          this._nodeId,
-          processedCount:  this._processedCount,
-          failedCount:     this._failedCount,
-          activeTorrents:  stats.activeTorrents || 0,
-          downloadSpeed:   stats.totalDownloadSpeed || 0,
-          uploadSpeed:     stats.totalUploadSpeed || 0,
-          uptime:          process.uptime(),
-        },
-        { nodeId: this._nodeId }
-      ));
-
+      const activeInfoHashes = this._collectActiveInfoHashes();
+      await this._renewLeases(activeInfoHashes);
+      await this._refreshPeerRegistry(activeInfoHashes);
+      this._emitHeartbeat(stats);
       metrics.recordWorkerHeartbeat(this._nodeId);
     }, this._heartbeatIntervalMs);
 
     if (this._heartbeatTimer.unref) {
       this._heartbeatTimer.unref();
     }
+  }
+
+  _applyBackpressure(activeTorrentsCount) {
+    if (!this._consumer) return;
+
+    const maxCapacity = parseInt(process.env.WORKER_MAX_CAPACITY, 10) || 20;
+
+    if (activeTorrentsCount >= maxCapacity && !this._isPaused) {
+      console.warn(`[Worker:${this._nodeId}] BACKPRESSURE: Node at capacity (${activeTorrentsCount}/${maxCapacity}). Pausing Kafka consumption.`);
+      this._consumer.pause([{ topic: TOPICS.JOB_DISPATCH }]);
+      this._isPaused = true;
+      return;
+    }
+
+    if (activeTorrentsCount < maxCapacity * 0.8 && this._isPaused) {
+      console.log(`[Worker:${this._nodeId}] BACKPRESSURE: Capacity available (${activeTorrentsCount}/${maxCapacity}). Resuming Kafka consumption.`);
+      this._consumer.resume([{ topic: TOPICS.JOB_DISPATCH }]);
+      this._isPaused = false;
+    }
+  }
+
+  _collectActiveInfoHashes() {
+    const activeInfoHashes = [];
+    if (!this._engine) return activeInfoHashes;
+
+    for (const [infoHash, torrent] of this._engine.torrents.entries()) {
+      if (torrent.state !== 'paused' && torrent.state !== 'stopped' && torrent.state !== 'error') {
+        activeInfoHashes.push(infoHash);
+      }
+    }
+
+    return activeInfoHashes;
+  }
+
+  async _renewLeases(activeInfoHashes) {
+    if (!this._engine || activeInfoHashes.length === 0) return;
+
+    const results = await LeaseManager.renewLeasesBulk(activeInfoHashes, this._nodeId);
+    for (let i = 0; i < activeInfoHashes.length; i++) {
+      if (results[i] === null) {
+        const lostHash = activeInfoHashes[i];
+        console.warn(`[Worker:${this._nodeId}] Lost lease for ${lostHash}! Pausing torrent to prevent split-brain.`);
+        const torrent = this._engine.torrents.get(lostHash);
+        if (torrent) torrent.pause();
+        await this._peerDiscovery.stopDiscovery(lostHash).catch(() => {});
+      }
+    }
+  }
+
+  async _refreshPeerRegistry(activeInfoHashes) {
+    if (!this._engine || activeInfoHashes.length === 0) return;
+    await PeerRegistry.refreshAll(this._nodeId, activeInfoHashes).catch(() => {});
+  }
+
+  _emitHeartbeat(stats) {
+    this.emit('heartbeat', buildDirective(
+      DIRECTIVE_TYPES.WORKER_HEARTBEAT,
+      {
+        nodeId: this._nodeId,
+        processedCount: this._processedCount,
+        failedCount: this._failedCount,
+        activeTorrents: stats.activeTorrents || 0,
+        downloadSpeed: stats.totalDownloadSpeed || 0,
+        uploadSpeed: stats.totalUploadSpeed || 0,
+        uptime: process.uptime(),
+      },
+      { nodeId: this._nodeId }
+    ));
   }
 
   /**

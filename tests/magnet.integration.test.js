@@ -122,76 +122,20 @@ class MockPeerServer {
   handleClient(socket) {
     this.clients.push(socket);
     
-    let buffer = Buffer.alloc(0);
-    let handshakeComplete = false;
-    let extensionHandshakeSent = false;
+    const state = {
+      buffer: Buffer.alloc(0),
+      handshakeComplete: false,
+      extensionHandshakeSent: false
+    };
     
     socket.on('data', (data) => {
-      buffer = Buffer.concat([buffer, data]);
-      
-      if (!handshakeComplete) {
-        // BT handshake: <pstrlen><pstr><reserved><info_hash><peer_id>
-        if (buffer.length >= 68) {
-          const pstrlen = buffer[0];
-          if (pstrlen === 19 && buffer.length >= 49 + pstrlen) {
-            const pstr = buffer.slice(1, 1 + pstrlen).toString();
-            
-            if (pstr === BT_PROTOCOL) {
-              const reserved = buffer.slice(20, 28);
-              const infoHash = buffer.slice(28, 48);
-              const peerId = buffer.slice(48, 68);
-              
-              console.log(`[MockPeer] Received handshake from ${peerId.toString('hex').substring(0, 16)}...`);
-              console.log(`[MockPeer] Info hash: ${infoHash.toString('hex').substring(0, 16)}...`);
-              
-              this.infoHash = infoHash;
-              
-              // Send handshake response with extension bit set
-              const response = Buffer.alloc(68);
-              response[0] = 19;
-              response.write(BT_PROTOCOL, 1);
-              // Set extension bit in reserved bytes (byte 5, bit 4)
-              response[25] = EXTENSION_BIT;
-              infoHash.copy(response, 28);
-              this.peerId.copy(response, 48);
-              
-              socket.write(response);
-              console.log('[MockPeer] Sent handshake response with extension bit');
-              
-              handshakeComplete = true;
-              buffer = buffer.slice(68);
-            }
-          }
-        }
-      } else {
-        // Parse messages
-        while (buffer.length >= 4) {
-          const length = buffer.readUInt32BE(0);
-          
-          if (length === 0) {
-            // Keep-alive
-            buffer = buffer.slice(4);
-            continue;
-          }
-          
-          if (buffer.length < 4 + length) {
-            break; // Wait for more data
-          }
-          
-          const messageId = buffer[4];
-          const payload = buffer.slice(5, 4 + length);
-          
-          console.log(`[MockPeer] Received message: id=${messageId}, length=${length}`);
-          
-          if (messageId === 20) {
-            // Extended message
-            this.handleExtendedMessage(socket, payload, extensionHandshakeSent);
-            extensionHandshakeSent = true;
-          }
-          
-          buffer = buffer.slice(4 + length);
-        }
+      state.buffer = Buffer.concat([state.buffer, data]);
+      if (!state.handshakeComplete) {
+        this._tryHandleHandshake(socket, state);
+        return;
       }
+
+      this._processIncomingMessages(socket, state);
     });
     
     socket.on('error', (err) => {
@@ -205,6 +149,70 @@ class MockPeerServer {
         this.clients.splice(index, 1);
       }
     });
+  }
+
+  _tryHandleHandshake(socket, state) {
+    if (state.buffer.length < 68) {
+      return;
+    }
+
+    const pstrlen = state.buffer[0];
+    if (pstrlen !== 19 || state.buffer.length < 49 + pstrlen) {
+      return;
+    }
+
+    const pstr = state.buffer.slice(1, 1 + pstrlen).toString();
+    if (pstr !== BT_PROTOCOL) {
+      return;
+    }
+
+    const infoHash = state.buffer.slice(28, 48);
+    const peerId = state.buffer.slice(48, 68);
+
+    console.log(`[MockPeer] Received handshake from ${peerId.toString('hex').substring(0, 16)}...`);
+    console.log(`[MockPeer] Info hash: ${infoHash.toString('hex').substring(0, 16)}...`);
+
+    this.infoHash = infoHash;
+
+    const response = Buffer.alloc(68);
+    response[0] = 19;
+    response.write(BT_PROTOCOL, 1);
+    response[25] = EXTENSION_BIT;
+    infoHash.copy(response, 28);
+    this.peerId.copy(response, 48);
+
+    socket.write(response);
+    console.log('[MockPeer] Sent handshake response with extension bit');
+
+    state.handshakeComplete = true;
+    state.buffer = state.buffer.slice(68);
+  }
+
+  _processIncomingMessages(socket, state) {
+    while (state.buffer.length >= 4) {
+      const length = state.buffer.readUInt32BE(0);
+
+      if (length === 0) {
+        state.buffer = state.buffer.slice(4);
+        continue;
+      }
+
+      if (state.buffer.length < 4 + length) {
+        break;
+      }
+
+      const messageId = state.buffer[4];
+      const payload = state.buffer.slice(5, 4 + length);
+
+      console.log(`[MockPeer] Received message: id=${messageId}, length=${length}`);
+
+      if (messageId === 20) {
+        this.handleExtendedMessage(socket, payload, state.extensionHandshakeSent);
+        state.extensionHandshakeSent = true;
+      }
+
+      state.buffer = state.buffer.slice(4 + length);
+    }
   }
   
   handleExtendedMessage(socket, payload, handshakeSent) {

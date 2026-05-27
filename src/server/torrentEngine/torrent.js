@@ -548,40 +548,7 @@ class Torrent extends EventEmitter {
     }
     
     if (shouldVerify) {
-      console.log('[Torrent] Verifying completed pieces...');
-      
-      // Get completed pieces from download manager
-      const completedPieces = Array.from(this._downloadManager.completedPieces || []);
-      
-      if (completedPieces.length > 0) {
-        try {
-          // Verify pieces
-          const verifyResult = await this._downloadManager.verifyPieces?.(completedPieces) || 
-                                await this._verifyPiecesManually(completedPieces);
-          
-          console.log(`[Torrent] Verification complete: ${verifyResult.valid.length} valid, ${verifyResult.invalid.length} invalid, ${verifyResult.missing.length} missing`);
-          
-          // Mark invalid pieces as incomplete
-          for (const invalidPiece of verifyResult.invalid) {
-            this._downloadManager.completedPieces.delete(invalidPiece);
-          }
-          
-          for (const missingPiece of verifyResult.missing) {
-            this._downloadManager.completedPieces.delete(missingPiece);
-          }
-          
-          // Update downloaded bytes
-          const pieceLength = this._metadata.pieceLength;
-          const validBytes = verifyResult.valid.length * pieceLength;
-          this._downloadManager.downloadedBytes = validBytes;
-          
-          this.emit('verify:complete', verifyResult);
-          
-        } catch (error) {
-          console.error(`[Torrent] Verification failed: ${error.message}`);
-          this.emit('error', { message: `Verification failed: ${error.message}` });
-        }
-      }
+      await this._verifyCompletedPieces();
     }
     
     // Resume download
@@ -611,6 +578,48 @@ class Torrent extends EventEmitter {
     
     return await pieceManager.verifyPieces(completedPieces);
   }
+
+  async _verifyCompletedPieces() {
+    console.log('[Torrent] Verifying completed pieces...');
+
+    const completedPieces = Array.from(this._downloadManager.completedPieces || []);
+    if (completedPieces.length === 0) {
+      return;
+    }
+
+    try {
+      const verifyResult = await this._runPieceVerification(completedPieces);
+      console.log(`[Torrent] Verification complete: ${verifyResult.valid.length} valid, ${verifyResult.invalid.length} invalid, ${verifyResult.missing.length} missing`);
+
+      this._applyVerificationResults(verifyResult);
+      this.emit('verify:complete', verifyResult);
+    } catch (error) {
+      console.error(`[Torrent] Verification failed: ${error.message}`);
+      this.emit('error', { message: `Verification failed: ${error.message}` });
+    }
+  }
+
+  async _runPieceVerification(completedPieces) {
+    const verifyFn = this._downloadManager.verifyPieces?.bind(this._downloadManager);
+    if (verifyFn) {
+      return Promise.resolve(verifyFn(completedPieces));
+    }
+    return this._verifyPiecesManually(completedPieces);
+  }
+
+  _applyVerificationResults(verifyResult) {
+    for (const invalidPiece of verifyResult.invalid) {
+      this._downloadManager.completedPieces.delete(invalidPiece);
+    }
+
+    for (const missingPiece of verifyResult.missing) {
+      this._downloadManager.completedPieces.delete(missingPiece);
+    }
+
+    const pieceLength = this._metadata.pieceLength;
+    const validBytes = verifyResult.valid.length * pieceLength;
+    this._downloadManager.downloadedBytes = validBytes;
+  }
   
   /**
    * Sets completed pieces (for resume without verification)
@@ -632,25 +641,24 @@ class Torrent extends EventEmitter {
       this._downloadManager.completedPieces.add(pieceIndex);
     }
     
-    // Update downloaded bytes
     if (this._metadata) {
-      const pieceLength = this._metadata.pieceLength;
-      const numPieces = this._metadata.pieces.length;
-      
-      let totalBytes = 0;
-      for (const pieceIndex of pieces) {
-        if (pieceIndex === numPieces - 1) {
-          // Last piece might be smaller
-          const lastPieceLength = this._metadata.length - (pieceIndex * pieceLength);
-          totalBytes += lastPieceLength;
-        } else {
-          totalBytes += pieceLength;
-        }
-      }
-      
+      const totalBytes = this._calculateDownloadedBytes(pieces);
       this._downloadManager.downloadedBytes = totalBytes;
       console.log(`[Torrent] Set downloaded bytes: ${totalBytes}`);
     }
+  }
+
+  _calculateDownloadedBytes(pieces) {
+    const pieceLength = this._metadata.pieceLength;
+    const numPieces = this._metadata.pieces.length;
+
+    return pieces.reduce((totalBytes, pieceIndex) => {
+      if (pieceIndex === numPieces - 1) {
+        const lastPieceLength = this._metadata.length - (pieceIndex * pieceLength);
+        return totalBytes + lastPieceLength;
+      }
+      return totalBytes + pieceLength;
+    }, 0);
   }
   
   /**
@@ -1073,33 +1081,12 @@ class Torrent extends EventEmitter {
    * @private
    */
   async _announceToTracker(event = null) {
-    if (!this._metadata || !this._trackerManager) {
-      return;
-    }
-
-    if (Array.isArray(this._trackerManager.trackers) && this._trackerManager.trackers.length === 0) {
+    if (!this._canAnnounceToTracker()) {
       return;
     }
     
     try {
-      const downloaded = this._downloadManager ? this._downloadManager.downloadedBytes : 0;
-      // For magnet links without metadata yet, use 0 as remaining (we don't know the size)
-      const remaining = this._metadata.length ? (this._metadata.length - downloaded) : 0;
-      
-      const params = {
-        announceUrl: this._metadata.announce,
-        infoHash: this._metadata.infoHashBuffer,
-        peerId: this._peerId,
-        port: this._port,
-        uploaded: this._totalUploaded,
-        downloaded: downloaded,
-        left: this._state === 'seeding' ? 0 : remaining,
-        compact: 1
-      };
-      
-      if (event) {
-        params.event = event;
-      }
+      const params = this._buildTrackerAnnounceParams(event);
       
       // Use TrackerManager with automatic failover
       const result = await this._retryManager.retry(
@@ -1114,14 +1101,7 @@ class Torrent extends EventEmitter {
       );
       
       // Add peers from tracker response
-      if (result && result.peers && result.peers.length > 0) {
-        console.log(`[Torrent] Tracker returned ${result.peers.length} peers`);
-        if (this._peerManager) {
-          this._peerManager.addPeers(result.peers);
-        }
-      } else {
-        console.log(`[Torrent] Tracker returned no peers`);
-      }
+      this._handleTrackerPeers(result);
       
       console.log(`[Torrent] Successfully announced to tracker (event: ${event || 'none'})`);
       
@@ -1136,6 +1116,48 @@ class Torrent extends EventEmitter {
       console.error('[Torrent] Tracker announce error:', error.message);
       this._handleError(error, ERROR_CATEGORY.TRACKER, 'Tracker announce failed', false);
     }
+  }
+
+  _canAnnounceToTracker() {
+    if (!this._metadata || !this._trackerManager) {
+      return false;
+    }
+
+    return !(Array.isArray(this._trackerManager.trackers) && this._trackerManager.trackers.length === 0);
+  }
+
+  _buildTrackerAnnounceParams(event) {
+    const downloaded = this._downloadManager ? this._downloadManager.downloadedBytes : 0;
+    const remaining = this._metadata.length ? (this._metadata.length - downloaded) : 0;
+
+    const params = {
+      announceUrl: this._metadata.announce,
+      infoHash: this._metadata.infoHashBuffer,
+      peerId: this._peerId,
+      port: this._port,
+      uploaded: this._totalUploaded,
+      downloaded: downloaded,
+      left: this._state === 'seeding' ? 0 : remaining,
+      compact: 1
+    };
+
+    if (event) {
+      params.event = event;
+    }
+
+    return params;
+  }
+
+  _handleTrackerPeers(result) {
+    if (result && result.peers && result.peers.length > 0) {
+      console.log(`[Torrent] Tracker returned ${result.peers.length} peers`);
+      if (this._peerManager) {
+        this._peerManager.addPeers(result.peers);
+      }
+      return;
+    }
+
+    console.log('[Torrent] Tracker returned no peers');
   }
   
   /**

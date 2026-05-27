@@ -189,6 +189,68 @@ function extractWebSeeds(params) {
   return webSeeds;
 }
 
+function normalizeInfoHash(infoHash) {
+  if (Buffer.isBuffer(infoHash)) {
+    if (infoHash.length !== 20) {
+      throw new Error('infoHash Buffer must be 20 bytes');
+    }
+    return infoHash.toString('hex');
+  }
+
+  if (typeof infoHash === 'string') {
+    if (infoHash.length !== 40) {
+      throw new Error('Invalid infoHash length: must be 40 hex characters');
+    }
+    if (!/^[a-fA-F0-9]{40}$/.test(infoHash)) {
+      throw new Error('Invalid infoHash: must contain only hex characters');
+    }
+    return infoHash.toLowerCase();
+  }
+
+  throw new Error('infoHash must be a Buffer or hex string');
+}
+
+function appendTrackers(magnetURI, trackers) {
+  if (!Array.isArray(trackers)) return magnetURI;
+  for (const tracker of trackers) {
+    if (tracker) {
+      magnetURI += `&tr=${encodeURIComponent(tracker)}`;
+    }
+  }
+  return magnetURI;
+}
+
+function appendPeers(magnetURI, peers) {
+  if (!Array.isArray(peers)) return magnetURI;
+  for (const peer of peers) {
+    let peerAddress = null;
+
+    if (typeof peer === 'string') {
+      peerAddress = peer;
+    } else if (peer && typeof peer === 'object') {
+      const host = peer.ip || peer.host;
+      if (host && peer.port) {
+        peerAddress = `${host}:${peer.port}`;
+      }
+    }
+
+    if (peerAddress) {
+      magnetURI += `&x.pe=${encodeURIComponent(peerAddress)}`;
+    }
+  }
+  return magnetURI;
+}
+
+function appendWebSeeds(magnetURI, webSeeds) {
+  if (!Array.isArray(webSeeds)) return magnetURI;
+  for (const webSeed of webSeeds) {
+    if (webSeed) {
+      magnetURI += `&ws=${encodeURIComponent(webSeed)}`;
+    }
+  }
+  return magnetURI;
+}
+
 /**
  * Parses a magnet URI and extracts torrent information
  * 
@@ -297,24 +359,7 @@ function createMagnet(options) {
     throw new Error('infoHash is required');
   }
 
-  // Convert infoHash to hex string if it's a Buffer
-  let infoHashHex;
-  if (Buffer.isBuffer(infoHash)) {
-    if (infoHash.length !== 20) {
-      throw new Error('infoHash Buffer must be 20 bytes');
-    }
-    infoHashHex = infoHash.toString('hex');
-  } else if (typeof infoHash === 'string') {
-    if (infoHash.length !== 40) {
-      throw new Error('Invalid infoHash length: must be 40 hex characters');
-    }
-    if (!/^[a-fA-F0-9]{40}$/.test(infoHash)) {
-      throw new Error('Invalid infoHash: must contain only hex characters');
-    }
-    infoHashHex = infoHash.toLowerCase();
-  } else {
-    throw new Error('infoHash must be a Buffer or hex string');
-  }
+  const infoHashHex = normalizeInfoHash(infoHash);
 
   // Build magnet URI
   let magnetURI = `magnet:?xt=urn:btih:${infoHashHex}`;
@@ -326,44 +371,9 @@ function createMagnet(options) {
     magnetURI += `&dn=${encodeURIComponent(magnetDisplayName)}`;
   }
 
-  // Add trackers if provided
-  if (Array.isArray(trackers)) {
-    for (const tracker of trackers) {
-      if (tracker) {
-        magnetURI += `&tr=${encodeURIComponent(tracker)}`;
-      }
-    }
-  }
-
-  // Add direct peers if provided. Accept either "host:port" strings or
-  // { ip|host, port } objects and serialize them as x.pe entries.
-  if (Array.isArray(peers)) {
-    for (const peer of peers) {
-      let peerAddress = null;
-
-      if (typeof peer === 'string') {
-        peerAddress = peer;
-      } else if (peer && typeof peer === 'object') {
-        const host = peer.ip || peer.host;
-        if (host && peer.port) {
-          peerAddress = `${host}:${peer.port}`;
-        }
-      }
-
-      if (peerAddress) {
-        magnetURI += `&x.pe=${encodeURIComponent(peerAddress)}`;
-      }
-    }
-  }
-
-  // Add web seeds if provided.
-  if (Array.isArray(webSeeds)) {
-    for (const webSeed of webSeeds) {
-      if (webSeed) {
-        magnetURI += `&ws=${encodeURIComponent(webSeed)}`;
-      }
-    }
-  }
+  magnetURI = appendTrackers(magnetURI, trackers);
+  magnetURI = appendPeers(magnetURI, peers);
+  magnetURI = appendWebSeeds(magnetURI, webSeeds);
 
   return magnetURI;
 }

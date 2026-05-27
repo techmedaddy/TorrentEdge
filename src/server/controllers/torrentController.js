@@ -187,6 +187,27 @@ const getEngineStats = (engineTorrent) => {
   }
 };
 
+const findTorrentWithIncludes = async (id) => {
+  const qry = {
+    include: [
+      { model: User, as: 'uploader', attributes: ['id', 'username', 'email'] },
+      { model: User, as: 'leechers', attributes: ['id'] }
+    ]
+  };
+
+  if (isValidObjectId(id)) {
+    return Transfer.findByPk(id, qry);
+  }
+
+  return Transfer.findOne({ where: { info_hash: id.toLowerCase() }, ...qry });
+};
+
+const getTorrentAccess = (torrent, userId) => {
+  const isOwner = torrent.uploader && torrent.uploader.id === userId;
+  const isLeecher = torrent.leechers && torrent.leechers.some(l => l.id === userId);
+  return { isOwner, isLeecher };
+};
+
 const SAFE_TYPES = new Set([
   '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
   '.txt', '.md', '.csv', '.json', '.xml',
@@ -507,28 +528,14 @@ exports.getAllTorrents = async (req, res) => {
 // Get torrent by ID or infoHash
 exports.getTorrentById = async (req, res) => {
   try {
-    let torrent;
-
-    const qry = {
-      include: [
-        { model: User, as: 'uploader', attributes: ['id', 'username', 'email'] },
-        { model: User, as: 'leechers', attributes: ['id'] }
-      ]
-    };
-
-    if (isValidObjectId(req.params.id)) {
-      torrent = await Transfer.findByPk(req.params.id, qry);
-    } else {
-      torrent = await Transfer.findOne({ where: { info_hash: req.params.id.toLowerCase() }, ...qry });
-    }
+    const torrent = await findTorrentWithIncludes(req.params.id);
 
     if (!torrent) {
       return res.status(404).json({ message: 'Torrent not found' });
     }
 
-    const userId = req.user.userId || req.user.id;
-    const isOwner = torrent.uploader && torrent.uploader.id === userId;
-    const isLeecher = torrent.leechers && torrent.leechers.some(l => l.id === userId);
+    const userId = getUserId(req);
+    const { isOwner, isLeecher } = getTorrentAccess(torrent, userId);
 
     if (!isOwner && !isLeecher) {
       return res.status(403).json({ message: 'Not authorized to view this torrent' });

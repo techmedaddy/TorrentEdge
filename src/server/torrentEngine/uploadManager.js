@@ -203,45 +203,10 @@ class UploadManager extends EventEmitter {
         return;
       }
       
-      // Throttle upload if needed
       if (this.throttler) {
-        let sentBytes = 0;
-        const blockLength = block.length;
-        
-        while (sentBytes < blockLength) {
-          const remaining = blockLength - sentBytes;
-          const allowed = await this.throttler.requestUpload(remaining);
-          
-          if (allowed > 0) {
-            const chunk = block.slice(sentBytes, sentBytes + allowed);
-            
-            // Send piece message to peer
-            if (peer.sendPiece) {
-              peer.sendPiece(pieceIndex, offset + sentBytes, chunk);
-            } else if (peer.write) {
-              // Fallback: construct piece message manually
-              this._sendPieceMessage(peer, pieceIndex, offset + sentBytes, chunk);
-            }
-            
-            sentBytes += allowed;
-            
-            // Track statistics
-            this._trackUpload(peerId, allowed);
-          } else {
-            // Wait a bit if no tokens available
-            await new Promise(resolve => setTimeout(resolve, 10));
-          }
-        }
+        await this._sendBlockWithThrottle(peer, peerId, pieceIndex, offset, block);
       } else {
-        // No throttling, send directly
-        if (peer.sendPiece) {
-          peer.sendPiece(pieceIndex, offset, block);
-        } else {
-          this._sendPieceMessage(peer, pieceIndex, offset, block);
-        }
-        
-        // Track statistics
-        this._trackUpload(peerId, block.length);
+        this._sendBlockDirect(peer, peerId, pieceIndex, offset, block);
       }
       
       // Super-seeding: mark piece as sent
@@ -264,6 +229,39 @@ class UploadManager extends EventEmitter {
       this.emit('upload:error', { upload, error });
       throw error;
     }
+  }
+
+  async _sendBlockWithThrottle(peer, peerId, pieceIndex, offset, block) {
+    let sentBytes = 0;
+    const blockLength = block.length;
+
+    while (sentBytes < blockLength) {
+      const remaining = blockLength - sentBytes;
+      const allowed = await this.throttler.requestUpload(remaining);
+
+      if (allowed > 0) {
+        const chunk = block.slice(sentBytes, sentBytes + allowed);
+        this._sendPiece(peer, pieceIndex, offset + sentBytes, chunk);
+        sentBytes += allowed;
+        this._trackUpload(peerId, allowed);
+      } else {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+    }
+  }
+
+  _sendBlockDirect(peer, peerId, pieceIndex, offset, block) {
+    this._sendPiece(peer, pieceIndex, offset, block);
+    this._trackUpload(peerId, block.length);
+  }
+
+  _sendPiece(peer, pieceIndex, offset, chunk) {
+    if (peer.sendPiece) {
+      peer.sendPiece(pieceIndex, offset, chunk);
+      return;
+    }
+
+    this._sendPieceMessage(peer, pieceIndex, offset, chunk);
   }
   
   /**

@@ -1,10 +1,13 @@
 const crypto = require('crypto');
 const fs = require('fs').promises;
+const fsSync = require('fs');
 const path = require('path');
 const os = require('os');
 const { Piece } = require('../src/server/torrentEngine/piece');
 const { FileWriter } = require('../src/server/torrentEngine/fileWriter');
 const { DownloadManager } = require('../src/server/torrentEngine/downloadManager');
+
+const createTempDir = () => fsSync.mkdtempSync(path.join(os.tmpdir(), 'torrentedge-test-'));
 
 describe('Piece', () => {
   describe('Constructor and Block Creation', () => {
@@ -502,7 +505,7 @@ describe('DownloadManager', () => {
       const manager = new DownloadManager({
         torrent,
         peerManager: mockPeerManager,
-        downloadPath: '/tmp/test',
+        downloadPath: createTempDir(),
         maxActiveRequests: 5
       });
 
@@ -536,7 +539,7 @@ describe('DownloadManager', () => {
       const manager = new DownloadManager({
         torrent,
         peerManager: mockPeerManager,
-        downloadPath: '/tmp/test',
+        downloadPath: createTempDir(),
         maxActiveRequests: 5
       });
 
@@ -574,7 +577,7 @@ describe('DownloadManager', () => {
       const manager = new DownloadManager({
         torrent,
         peerManager: mockPeerManager,
-        downloadPath: '/tmp/test',
+        downloadPath: createTempDir(),
         maxActiveRequests: 5
       });
 
@@ -613,7 +616,7 @@ describe('DownloadManager', () => {
       const manager = new DownloadManager({
         torrent,
         peerManager: mockPeerManager,
-        downloadPath: '/tmp/test',
+        downloadPath: createTempDir(),
         maxActiveRequests: 5
       });
 
@@ -643,7 +646,7 @@ describe('DownloadManager', () => {
       const manager = new DownloadManager({
         torrent,
         peerManager: mockPeerManager,
-        downloadPath: '/tmp/test',
+        downloadPath: createTempDir(),
         maxActiveRequests: 5
       });
 

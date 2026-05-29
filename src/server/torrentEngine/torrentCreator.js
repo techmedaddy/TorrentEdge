@@ -445,10 +445,126 @@ function extractTrackersFromDict(torrentDict) {
 
 // ─── Exports ──────────────────────────────────────────────────────────────────
 
+const fs = require('fs');
+
+/**
+ * Creates a .torrent file from a file on disk using streams.
+ * Prevents memory bloat for large (2GB+) files by hashing in chunks.
+ *
+ * @param {string} filePath         - Absolute path to the file
+ * @param {Object} options
+ * @param {string} options.name     - Torrent/file name
+ * @param {number} [options.pieceSize] - Piece length in bytes
+ * @param {string[]} [options.trackers] - Tracker announce URLs
+ * @param {boolean} [options.private=false] - Mark as private
+ * @param {string} [options.createdBy] - Creator string
+ * @param {Function} [options.onProgress] - Called with (piecesHashed)
+ *
+ * @returns {Promise<Object>} Same signature as createTorrentWithMagnet
+ */
+async function createTorrentWithMagnetStream(filePath, options = {}) {
+  const stat = await fs.promises.stat(filePath);
+  const fileSize = stat.size;
+
+  if (fileSize === 0) {
+    throw new Error('file is empty — nothing to create a torrent from');
+  }
+
+  const name       = sanitizeName(options.name || 'untitled');
+  const pieceSize  = resolvePieceSize(options.pieceSize, fileSize);
+  const trackers   = options.trackers && options.trackers.length > 0 ? options.trackers : DEFAULT_TRACKERS;
+  const isPrivate  = options.private === true ? 1 : undefined;
+  const createdBy  = options.createdBy || 'TorrentEdge';
+  const createdAt  = Math.floor(Date.now() / 1000);
+  const pieceCount = Math.ceil(fileSize / pieceSize);
+
+  const { piecesBuffer, chunkHashes } = await new Promise((resolve, reject) => {
+    const hashBuffers = [];
+    const casHashes = [];
+    let currentPieceBuffer = Buffer.alloc(pieceSize);
+    let currentOffset = 0;
+    let piecesProcessed = 0;
+
+    const stream = fs.createReadStream(filePath, { highWaterMark: 64 * 1024 });
+
+    stream.on('data', (chunk) => {
+      let chunkOffset = 0;
+      while (chunkOffset < chunk.length) {
+        const spaceLeft = pieceSize - currentOffset;
+        const toCopy = Math.min(spaceLeft, chunk.length - chunkOffset);
+        chunk.copy(currentPieceBuffer, currentOffset, chunkOffset, chunkOffset + toCopy);
+        currentOffset += toCopy;
+        chunkOffset += toCopy;
+
+        if (currentOffset === pieceSize) {
+          const hash = crypto.createHash('sha1').update(currentPieceBuffer).digest();
+          const sha256 = crypto.createHash('sha256').update(currentPieceBuffer).digest('hex');
+          hashBuffers.push(hash);
+          casHashes.push(sha256);
+          piecesProcessed++;
+          if (options.onProgress) options.onProgress(piecesProcessed, pieceCount);
+          currentOffset = 0; // reset
+        }
+      }
+    });
+
+    stream.on('end', () => {
+      // Process final partial piece if any
+      if (currentOffset > 0) {
+        const finalBuffer = currentPieceBuffer.slice(0, currentOffset);
+        const hash = crypto.createHash('sha1').update(finalBuffer).digest();
+        const sha256 = crypto.createHash('sha256').update(finalBuffer).digest('hex');
+        hashBuffers.push(hash);
+        casHashes.push(sha256);
+        piecesProcessed++;
+        if (options.onProgress) options.onProgress(piecesProcessed, pieceCount);
+      }
+      resolve({ piecesBuffer: Buffer.concat(hashBuffers), chunkHashes: casHashes });
+    });
+
+    stream.on('error', reject);
+  });
+
+  const info = buildInfoDict({
+    name,
+    length: fileSize,
+    pieceLength: pieceSize,
+    pieces: piecesBuffer,
+    isPrivate,
+  });
+
+  const encodedInfo = encode(info);
+  const infoHash = crypto.createHash('sha1').update(encodedInfo).digest('hex');
+
+  const torrentDict = buildTorrentDict({
+    info,
+    announce: trackers[0],
+    announceList: trackers,
+    createdBy,
+    createdAt,
+  });
+
+  const torrentBuffer = encode(torrentDict);
+  const magnetURI = buildMagnetURI({ infoHash, name, trackers });
+
+  return {
+    torrentBuffer,
+    infoHash,
+    magnetURI,
+    name,
+    pieceLength: pieceSize,
+    pieceCount,
+    fileSize,
+    trackers,
+    chunkHashes,
+  };
+}
+
 module.exports = {
   createTorrent,
   torrentToMagnet,
   createTorrentWithMagnet,
+  createTorrentWithMagnetStream,
   // Expose internals for unit testing (Phase 1.3)
   _internal: {
     hashPieces,

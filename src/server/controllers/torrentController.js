@@ -415,7 +415,7 @@ const emitHashComplete = (req, originalName, pieceCount) => {
   } catch (_) {}
 };
 
-const persistCreatedFiles = async (created, originalName, fileBuffer) => {
+const persistCreatedFiles = async (created, originalName, uploadedFilePath) => {
   const baseDir = process.env.DOWNLOAD_PATH || './downloads';
   const seedsDir = path.join(baseDir, '.torrentedge', 'seeds');
   const torrentsDir = path.join(baseDir, '.torrentedge', 'torrents');
@@ -429,7 +429,7 @@ const persistCreatedFiles = async (created, originalName, fileBuffer) => {
   const savedSourcePath = path.join(seedsDir, `${hashPrefix}-${safeOrigName}`);
   const savedTorrentPath = path.join(torrentsDir, `${hashPrefix}-${safeOrigName}.torrent`);
 
-  await fs.writeFile(savedSourcePath, fileBuffer);
+  await fs.rename(uploadedFilePath, savedSourcePath);
   await fs.writeFile(savedTorrentPath, created.torrentBuffer);
 
   console.log(`[TorrentController] Saved source file  : ${savedSourcePath}`);
@@ -1234,18 +1234,17 @@ exports.createTorrentFromFile = async (req, res) => {
     }
     const { rawName, rawPrivate, trackers, pieceSize } = parsedOptions;
 
-    // ── 5. Create .torrent from file ────────────────────────────────────────
-    const { createTorrentWithMagnet } = require('../torrentEngine/torrentCreator');
-    const fileBuffer = await fs.readFile(uploadedFilePath);
+    // ── 5. Create .torrent from file using streams ────────────────────────────
+    const { createTorrentWithMagnetStream } = require('../torrentEngine/torrentCreator');
 
     // Throttle progress broadcasts — emit at most once every 100ms and
     // only when progress actually changes by ≥1% to avoid flooding the socket.
-    const pieceCount = Math.ceil(fileBuffer.length / (pieceSize || 262144));
+    const pieceCount = Math.ceil(fileSize / (pieceSize || 262144));
     const onProgress = buildProgressEmitter(req, originalName, pieceCount);
 
     let created;
     try {
-      created = createTorrentWithMagnet(fileBuffer, {
+      created = await createTorrentWithMagnetStream(uploadedFilePath, {
         name:       rawName,
         trackers,
         pieceSize,
@@ -1274,8 +1273,7 @@ exports.createTorrentFromFile = async (req, res) => {
       });
     }
 
-    // ── 7. Write files to disk ──────────────────────────────────────────────
-    const persistedPaths = await persistCreatedFiles(created, originalName, fileBuffer);
+    const persistedPaths = await persistCreatedFiles(created, originalName, uploadedFilePath);
     savedSourcePath = persistedPaths.savedSourcePath;
     savedTorrentPath = persistedPaths.savedTorrentPath;
 

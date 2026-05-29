@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "TorrentEdge - Distributed BitTorrent client backend with Kafka event streaming",
   "main": "src/server/server.js",
+  "bin": {
+    "tedge": "./bin/tedge.js"
+  },
   "private": true,
   "scripts": {
     "start": "node src/server/server.js",

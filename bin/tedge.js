@@ -1,285 +1,135 @@
 #!/usr/bin/env node
-
 /**
- * TorrentEdge CLI (tedge)
- * Zero-dependency infrastructure binary for CI/CD pipelines.
- * 
- * Usage:
- *   tedge dispatch <uri> [--wait] [--request-id <id>]
+ * TorrentEdge Consumer CLI (tedge)
+ * Zero-dependency Node.js binary for pulling artifacts in CI/CD environments.
  */
 
 const http = require('http');
 const https = require('https');
-const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
-// Configuration from Environment
-const API_URL = process.env.TEDGE_API_URL || 'http://localhost:3029';
-const AUTH_TOKEN = process.env.TEDGE_AUTH_TOKEN;
+// CLI Argument Parsing
+const args = process.argv.slice(2);
+const command = args[0];
+const hash = args[1];
 
-function printHelp() {
-  console.log(`
-TorrentEdge CLI - CI/CD Integration Tool
-
-Usage:
-  tedge dispatch <s3-uri | magnet-uri> [--wait]
-  tedge --help
-
-Options:
-  --wait          Block the pipeline until the artifact is fully seeded to the swarm
-  --request-id    Explicitly set the X-Request-ID for idempotency (defaults to CI run ID)
-
-Environment Variables:
-  TEDGE_API_URL      URL of the Control Plane (default: http://localhost:3029)
-  TEDGE_AUTH_TOKEN   JWT or access token for authentication (Required)
-`);
-}
-
-function generateDeterministicId() {
-  // Use CI variables if available for true idempotency across pipeline retries
-  const ciVar = process.env.GITHUB_RUN_ID || 
-                process.env.GITLAB_CI || 
-                process.env.CIRCLE_BUILD_NUM || 
-                process.env.TRAVIS_BUILD_ID || 
-                crypto.randomUUID();
-  return `pipeline-${ciVar}`;
-}
-
-function parseArgs(args) {
-  const options = {
-    command: null,
-    target: null,
-    wait: false,
-    requestId: generateDeterministicId()
-  };
-
-  for (let i = 2; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === '--help' || arg === '-h') {
-      printHelp();
-      process.exit(0);
-    } else if (arg === '--wait') {
-      options.wait = true;
-    } else if (arg === '--request-id') {
-      options.requestId = args[++i];
-    } else if (!options.command) {
-      options.command = arg;
-    } else if (!options.target) {
-      options.target = arg;
-    }
-  }
-
-  return options;
-}
-
-function makeRequest(urlStr, method, headers, body) {
-  return new Promise((resolve, reject) => {
-    const url = new URL(urlStr);
-    const client = url.protocol === 'https:' ? https : http;
-    
-    const reqHeaders = { ...headers };
-    let bodyData = null;
-    
-    if (body) {
-      bodyData = JSON.stringify(body);
-      reqHeaders['Content-Type'] = 'application/json';
-      reqHeaders['Content-Length'] = Buffer.byteLength(bodyData);
-    }
-
-    const options = {
-      method,
-      headers: reqHeaders,
-    };
-
-    const req = client.request(url, options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        let parsed = null;
-        try {
-          parsed = JSON.parse(data);
-        } catch (e) {
-          parsed = data;
-        }
-        resolve({ status: res.statusCode, headers: res.headers, body: parsed });
-      });
-    });
-
-    req.on('error', (err) => reject(err));
-    if (bodyData) req.write(bodyData);
-    req.end();
-  });
-}
-
-async function pollStatus(torrentId) {
-  console.log(`[tedge] Waiting for swarm seeding... (Torrent ID: ${torrentId})`);
-  
-  const headers = { 'Authorization': `Bearer ${AUTH_TOKEN}` };
-  const endpoint = `${API_URL}/api/torrent/${torrentId}`;
-
-  return new Promise((resolve) => {
-    const interval = setInterval(async () => {
-      try {
-        const res = await makeRequest(endpoint, 'GET', headers, null);
-        if (res.status === 200 && res.body) {
-          const status = res.body.status;
-          const progress = res.body.progress;
-          
-          process.stdout.write(`\r[tedge] Status: ${status} | Progress: ${(progress * 100).toFixed(1)}% `);
-          
-          if (status === 'seeding' || progress >= 1) {
-            clearInterval(interval);
-            console.log('\n[tedge] Artifact is fully seeded to the swarm. ✅');
-            resolve();
-          } else if (status === 'error' || status === 'failed') {
-            clearInterval(interval);
-            console.error('\n[tedge] Swarm reported an error state. ❌');
-            process.exit(1);
-          }
-        }
-      } catch (err) {
-        // Ignore network hiccups during polling
-      }
-    }, 2000);
-  });
-}
-
-function ensureValidCommand(options) {
-  if (options.command !== 'dispatch') {
-    if (options.command) console.error(`Unknown command: ${options.command}`);
-    printHelp();
-    process.exit(1);
-  }
-}
-
-function ensureTargetProvided(options) {
-  if (!options.target) {
-    console.error('Error: Target URI is required.');
-    printHelp();
-    process.exit(1);
-  }
-}
-
-function ensureAuthToken() {
-  if (!AUTH_TOKEN) {
-    console.error('Error: TEDGE_AUTH_TOKEN environment variable is not set.');
-    process.exit(1);
-  }
-}
-
-function buildSyntheticMagnet(targetUri) {
-  const hash = crypto.createHash('sha1').update(targetUri).digest('hex');
-  const filename = targetUri.split('/').pop() || 'artifact';
-  return `magnet:?xt=urn:btih:${hash}&dn=${encodeURIComponent(filename)}`;
-}
-
-function resolveTarget(targetUri) {
-  if (targetUri.startsWith('s3://')) {
-    const s3Path = targetUri.slice(5);
-    const bucket = s3Path.split('/')[0];
-    const key = s3Path.split('/').slice(1).join('/');
-    const sourceUri = `https://${bucket}.s3.amazonaws.com/${key}`;
-    const magnetURI = buildSyntheticMagnet(targetUri);
-    console.log(`[tedge] Parsed S3 target: ${targetUri}`);
-    console.log(`[tedge] Resolved to Streamable URI: ${sourceUri}`);
-    console.log(`[tedge] Generated synthetic magnet: ${magnetURI}`);
-    return { sourceUri, magnetURI };
-  }
-
-  if (targetUri.startsWith('http://') || targetUri.startsWith('https://')) {
-    const sourceUri = targetUri;
-    const magnetURI = buildSyntheticMagnet(targetUri);
-    console.log(`[tedge] Parsed HTTP target: ${targetUri}`);
-    console.log(`[tedge] Generated synthetic magnet: ${magnetURI}`);
-    return { sourceUri, magnetURI };
-  }
-
-  if (targetUri.startsWith('magnet:')) {
-    console.log(`[tedge] Parsed magnet link: ${targetUri.substring(0, 50)}...`);
-    return { sourceUri: null, magnetURI: targetUri };
-  }
-
-  console.error('Error: Target must be an S3 URI, HTTP(S) URL, or magnet link.');
+if (!command || command !== 'pull' || !hash) {
+  console.error('\x1b[31mError:\x1b[0m Invalid command.');
+  console.log('\nUsage:');
+  console.log('  tedge pull <info_hash>\n');
   process.exit(1);
 }
 
-function getTorrentIdFromResponse(resBody) {
-  if (resBody && resBody._id) return resBody._id;
-  if (resBody && resBody.torrent && resBody.torrent._id) return resBody.torrent._id;
-  return null;
-}
+// Configuration
+// In a real environment, this could be configured via env vars or a config file
+const TE_SERVER_URL = process.env.TE_SERVER_URL || 'http://localhost:3029';
+const TOKEN = process.env.TE_TOKEN || ''; // If auth is required
 
-function getHashFromMagnet(magnetURI) {
-  if (!magnetURI) return null;
-  const hashMatch = magnetURI.match(/urn:btih:([a-zA-Z0-9]{40})/i);
-  return hashMatch ? hashMatch[1] : null;
-}
+const pullArtifact = async (infoHash) => {
+  const url = `${TE_SERVER_URL}/api/torrent/${infoHash}/download`;
+  console.log(`\x1b[36m[TorrentEdge]\x1b[0m Pulling artifact \x1b[33m${infoHash}\x1b[0m...`);
 
-async function handleSuccessResponse(res, options, magnetURI) {
-  if (res.status === 201) {
-    console.log('[tedge] Success: Artifact dispatched (Status: 201 Created)');
-  } else {
-    console.log(`[tedge] Success: Idempotent guard engaged (Status: ${res.status}). Intent already fulfilled.`);
-  }
-
-  if (!options.wait) {
-    process.exit(0);
-  }
-
-  const responseId = getTorrentIdFromResponse(res.body);
-  if (responseId) {
-    await pollStatus(responseId);
-    process.exit(0);
-  }
-
-  if (res.status === 409) {
-    const hashId = getHashFromMagnet(magnetURI);
-    if (hashId) {
-      console.log('[tedge] In-flight request detected. Polling via hash lookup...');
-      await new Promise(r => setTimeout(r, 2000));
-      await pollStatus(hashId);
-    }
-  }
-
-  process.exit(0);
-}
-
-async function main() {
-  const options = parseArgs(process.argv);
-
-  ensureValidCommand(options);
-  ensureTargetProvided(options);
-  ensureAuthToken();
-
-  const targetUri = options.target;
-  const { magnetURI, sourceUri } = resolveTarget(targetUri);
-
-  const payload = {
-    magnetURI,
-    sourceUri,
-    autoStart: true
+  const client = url.startsWith('https') ? https : http;
+  
+  const options = {
+    headers: {}
   };
 
-  const headers = {
-    'Authorization': `Bearer ${AUTH_TOKEN}`,
-    'X-Request-ID': options.requestId
-  };
+  if (TOKEN) {
+    options.headers['Authorization'] = `Bearer ${TOKEN}`;
+  }
 
-  console.log(`[tedge] Dispatching request with Correlation ID: ${options.requestId}`);
-
-  try {
-    const res = await makeRequest(`${API_URL}/api/torrent/create`, 'POST', headers, payload);
-
-    if (res.status === 201 || res.status === 200 || res.status === 409) {
-      await handleSuccessResponse(res, options, magnetURI);
+  const req = client.get(url, options, (res) => {
+    if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+      // Handle redirect if any
+      console.log('\x1b[33mRedirecting...\x1b[0m');
+      // For a robust implementation, we would recursively follow redirects here.
+      // But for this simple CI/CD tool, we assume direct download.
     }
 
-    console.error(`[tedge] Error: API returned status ${res.status}`);
-    console.error(res.body);
-    process.exit(1);
-  } catch (err) {
-    console.error(`[tedge] Connection Error: ${err.message}`);
-    process.exit(1);
-  }
-}
+    if (res.statusCode !== 200) {
+      let errBody = '';
+      res.on('data', chunk => errBody += chunk);
+      res.on('end', () => {
+        console.error(`\x1b[31mError:\x1b[0m Server responded with status ${res.statusCode}`);
+        try {
+          const json = JSON.parse(errBody);
+          if (json.message) console.error(json.message);
+        } catch(e) {
+          console.error(errBody);
+        }
+        process.exit(1);
+      });
+      return;
+    }
 
-main();
+    // Extract filename from Content-Disposition header if available
+    let filename = `artifact-${infoHash.slice(0, 8)}.dat`;
+    const contentDisposition = res.headers['content-disposition'];
+    if (contentDisposition) {
+      const match = contentDisposition.match(/filename="?([^"]+)"?/);
+      if (match && match[1]) {
+        filename = match[1];
+      }
+    }
+
+    const totalBytes = parseInt(res.headers['content-length'], 10) || 0;
+    const destPath = path.resolve(process.cwd(), filename);
+    const fileStream = fs.createWriteStream(destPath);
+
+    let downloadedBytes = 0;
+    let lastLogged = 0;
+
+    res.on('data', (chunk) => {
+      downloadedBytes += chunk.length;
+      fileStream.write(chunk);
+      
+      const now = Date.now();
+      if (now - lastLogged > 100 || downloadedBytes === totalBytes) {
+        printProgressBar(downloadedBytes, totalBytes, filename);
+        lastLogged = now;
+      }
+    });
+
+    res.on('end', () => {
+      fileStream.end();
+      // Final progress bar update
+      printProgressBar(totalBytes, totalBytes, filename);
+      console.log(`\n\x1b[32mSuccess:\x1b[0m Artifact saved to ${destPath}\n`);
+    });
+
+    res.on('error', (err) => {
+      console.error(`\n\x1b[31mStream Error:\x1b[0m ${err.message}`);
+      fs.unlinkSync(destPath); // Clean up partial file
+      process.exit(1);
+    });
+  });
+
+  req.on('error', (err) => {
+    console.error(`\x1b[31mNetwork Error:\x1b[0m Failed to connect to TorrentEdge server at ${TE_SERVER_URL}`);
+    console.error(err.message);
+    process.exit(1);
+  });
+};
+
+const printProgressBar = (current, total, filename) => {
+  const width = 40;
+  if (!total) {
+    // Unknown total size
+    process.stdout.write(`\rDownloading ${filename} ... ${(current / (1024*1024)).toFixed(2)} MB`);
+    return;
+  }
+
+  const percent = Math.min(100, Math.round((current / total) * 100));
+  const completedWidth = Math.round((width * percent) / 100);
+  const emptyWidth = width - completedWidth;
+
+  const bar = '█'.repeat(completedWidth) + '░'.repeat(emptyWidth);
+  const sizeStr = `${(current / (1024*1024)).toFixed(2)} MB / ${(total / (1024*1024)).toFixed(2)} MB`;
+
+  process.stdout.write(`\r\x1b[36m[${bar}]\x1b[0m ${percent}% | ${sizeStr} | ${filename}`);
+};
+
+// Execute
+pullArtifact(hash);

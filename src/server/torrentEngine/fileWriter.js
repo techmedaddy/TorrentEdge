@@ -199,7 +199,8 @@ class FileWriter extends EventEmitter {
    * @returns {Promise<import('fs').FileHandle>}
    */
   async _getOrOpenFd(filePath, mode) {
-    const entry = this._fdCache.get(filePath);
+    const cacheKey = `${filePath}:${mode}`;
+    const entry = this._fdCache.get(cacheKey);
     if (entry) {
       entry.lastUsed = Date.now();
       return entry.fd;
@@ -211,7 +212,7 @@ class FileWriter extends EventEmitter {
     }
 
     const fd = await fs.open(filePath, mode);
-    this._fdCache.set(filePath, { fd, lastUsed: Date.now() });
+    this._fdCache.set(cacheKey, { fd, lastUsed: Date.now() });
     return fd;
   }
 

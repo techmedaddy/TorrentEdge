@@ -593,6 +593,9 @@ class TorrentEngine extends EventEmitter {
         dht: this._dht // Pass DHT node for peer discovery
       });
 
+      // Start metadata parsing
+      torrent._ensureInitialized();
+
       // Wait for torrent to be ready (metadata parsed)
       await new Promise((resolve, reject) => {
         torrent.once('ready', resolve);
@@ -2035,12 +2038,30 @@ class TorrentEngine extends EventEmitter {
     const begin = payload.readUInt32BE(4);
     const length = payload.readUInt32BE(8);
 
-    if (msgId === 6) {
-      torrent.handlePieceRequest(peer, pieceIndex, begin, length);
+    if (msgId === 8) {
+      // CANCEL — just ignore for now
       return;
     }
 
-    torrent.handleCancelRequest(peer, pieceIndex, begin, length);
+    // REQUEST (msgId === 6) — read from FileWriter and send PIECE
+    const fw = torrent._fileWriter || torrent.fileWriter;
+    if (!fw) {
+      console.warn(`[TorrentEngine] No FileWriter for ${torrent.infoHash} — cannot serve piece ${pieceIndex}`);
+      return;
+    }
+
+    fw.readPiece(pieceIndex)
+      .then((pieceData) => {
+        if (!pieceData || pieceData.length === 0) {
+          console.warn(`[TorrentEngine] Empty read for piece ${pieceIndex}`);
+          return;
+        }
+        const block = pieceData.slice(begin, begin + length);
+        peer.sendPiece(pieceIndex, begin, block);
+      })
+      .catch((err) => {
+        console.error(`[TorrentEngine] Failed to read piece ${pieceIndex}@${begin}: ${err.message}`);
+      });
   }
 
   /**

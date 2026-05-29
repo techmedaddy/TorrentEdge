@@ -313,13 +313,10 @@ class PeerManager extends EventEmitter {
    * Updates piece availability when peer sends bitfield
    */
   updatePieceAvailability(connection, bitfield) {
-    if (!connection.peerBitfield) {
-      // First time seeing this peer's pieces
-      for (let i = 0; i < this.numPieces; i++) {
-        if (this.hasPiece(bitfield, i)) {
-          this.pieceAvailability[i]++;
-          this.emit('piece:available', { pieceIndex: i, count: this.pieceAvailability[i] });
-        }
+    for (let i = 0; i < this.numPieces; i++) {
+      if (this.hasPiece(bitfield, i)) {
+        this.pieceAvailability[i]++;
+        this.emit('piece:available', { pieceIndex: i, count: this.pieceAvailability[i] });
       }
     }
   }

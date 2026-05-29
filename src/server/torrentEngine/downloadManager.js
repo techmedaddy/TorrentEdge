@@ -589,9 +589,9 @@ class DownloadManager extends EventEmitter {
       // Multi-file torrent: distribute piece data across files
       await this._writeMultiFilePiece(piece);
     } else {
-      // Single-file torrent: append to single file
+      // Single-file torrent: write to single file at correct offset
       const filePath = path.join(this.downloadPath, this.torrent.name);
-      const fd = await fs.open(filePath, 'a');
+      const fd = await fs.open(filePath, 'r+');
       await fd.write(piece.data, 0, piece.length, piece.index * this.torrent.pieceLength);
       await fd.close();
     }

@@ -292,12 +292,16 @@ class S3ColdStartStreamer {
 
         await this.casStore.store(pieceData, sha256);
 
-        if (this.torrent.fileWriter) {
-          await this.torrent.fileWriter.writePiece(index, pieceData);
+        if (this.torrent._fileWriter) {
+          await this.torrent._fileWriter.writePiece(index, pieceData);
         }
 
-        if (this.torrent.pieceManager) {
-          this.torrent.pieceManager.markComplete(index);
+        if (this.torrent._downloadManager) {
+          const piece = this.torrent._downloadManager.getPieceByIndex(index);
+          this.torrent._downloadManager.completedPieces.add(index);
+          if (piece) {
+            this.torrent._downloadManager.downloadedBytes += piece.length;
+          }
         }
 
         currentOffset += pieceData.length;

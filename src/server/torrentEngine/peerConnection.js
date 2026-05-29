@@ -230,18 +230,22 @@ class PeerConnection extends EventEmitter {
     switch (id) {
       case MESSAGE_TYPES.CHOKE:
         this.peerChoking = true;
+        this.onMessage({ type: 'choke' });
         break;
 
       case MESSAGE_TYPES.UNCHOKE:
         this.peerChoking = false;
+        this.onMessage({ type: 'unchoke' });
         break;
 
       case MESSAGE_TYPES.INTERESTED:
         this.peerInterested = true;
+        this.onMessage({ type: 'interested' });
         break;
 
       case MESSAGE_TYPES.NOT_INTERESTED:
         this.peerInterested = false;
+        this.onMessage({ type: 'not_interested' });
         break;
 
       case MESSAGE_TYPES.HAVE:
@@ -347,16 +351,17 @@ class PeerConnection extends EventEmitter {
 
     this.isHandshakeComplete = true;
 
-    // Handle any remaining data after handshake
-    if (this.handshakeBuffer.length > 68) {
-      const remaining = this.handshakeBuffer.slice(68);
-      this.handshakeBuffer = Buffer.alloc(0);
-      this.handleData(remaining);
-    } else {
-      this.handshakeBuffer = Buffer.alloc(0);
-    }
+    // Capture remaining data before clearing buffer
+    const remaining = this.handshakeBuffer.length > 68
+      ? this.handshakeBuffer.slice(68)
+      : null;
+    this.handshakeBuffer = Buffer.alloc(0);
 
-    // Notify handshake complete
+    // Notify handshake complete FIRST so PeerManager registers this
+    // connection in activeConnections before any messages are dispatched.
+    // Without this ordering, bitfield/unchoke messages that piggyback on
+    // the handshake TCP segment would be emitted before the peer exists
+    // in the connection map, causing requestBlocks() to find zero peers.
     this.onHandshake({
       peerId: this.remotePeerId,
       ip: this.ip,
@@ -370,6 +375,11 @@ class PeerConnection extends EventEmitter {
       port: this.port,
       supportsExtensions: this.peerSupportsExtensions
     });
+
+    // NOW process any remaining data (bitfield, unchoke, etc.)
+    if (remaining) {
+      this.handleData(remaining);
+    }
   }
 
   /**

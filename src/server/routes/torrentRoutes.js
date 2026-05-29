@@ -49,11 +49,7 @@ const uploadAnyFile = multer({
   // No fileFilter — accept all MIME types intentionally (controller warns, never blocks)
 });
 
-// ── Public Routes (No Auth Required) ─────────────────────────────────────────
-// The infoHash itself acts as the capability token for secure artifact retrieval
-router.get('/:id/download', torrentController.downloadTorrentFile);
-
-// Apply authentication to all other torrent routes
+// Apply authentication to all torrent routes
 router.use(authMiddleware);
 
 // ── Static routes MUST come before parameterized routes ──────────────────────
@@ -97,6 +93,9 @@ router.post('/:id/resume', torrentController.resumeTorrent);
 // File selection and downloading
 router.get('/:id/files', torrentController.getFiles);
 router.post('/:id/files/select', torrentController.selectFiles);
+
+// NOTE: /:id/download is mounted at the app level (server.js) BEFORE this
+// router to bypass authMiddleware for public artifact pulls via `tedge pull`.
 
 // Get torrent real-time stats
 router.get('/:id/stats', torrentController.getTorrentStats);

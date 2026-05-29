@@ -429,8 +429,20 @@ const persistCreatedFiles = async (created, originalName, tempFilePath) => {
   const savedSourcePath = path.join(seedsDir, `${hashPrefix}-${safeOrigName}`);
   const savedTorrentPath = path.join(torrentsDir, `${hashPrefix}-${safeOrigName}.torrent`);
 
-  // TRUE ZERO-BUFFER: Move the file via OS inode rename instead of buffer writing
-  await fs.rename(tempFilePath, savedSourcePath);
+  // Move the file to its permanent seed location.
+  // fs.rename is instant (inode swap) when src and dest are on the same device,
+  // but throws EXDEV when they cross mount boundaries (e.g. /tmp → /home).
+  // Fallback: copy + unlink, which works across any filesystem boundary.
+  try {
+    await fs.rename(tempFilePath, savedSourcePath);
+  } catch (err) {
+    if (err.code === 'EXDEV') {
+      await fs.copyFile(tempFilePath, savedSourcePath);
+      await fs.unlink(tempFilePath);
+    } else {
+      throw err;
+    }
+  }
   
   // The .torrent metadata is small enough to stay in memory and write normally
   await fs.writeFile(savedTorrentPath, created.torrentBuffer);
@@ -441,7 +453,7 @@ const persistCreatedFiles = async (created, originalName, tempFilePath) => {
   return { savedSourcePath, savedTorrentPath };
 };
 
-const saveCreatedTorrent = async (created, savedSourcePath, req) => {
+const saveCreatedTorrent = async (created, savedSourcePath, req, savedTorrentPath) => {
   try {
     const torrent = await Transfer.create({
       name: created.name,
@@ -451,7 +463,9 @@ const saveCreatedTorrent = async (created, savedSourcePath, req) => {
       status: 'seeding',
       progress: 100,
       uploaded_by: getUserId(req),
-      source_path: savedSourcePath
+      source_path: savedSourcePath,
+      torrent_file_path: savedTorrentPath || null,
+      created_from_upload: true,
     });
 
     if (created.chunkHashes && created.chunkHashes.length > 0) {
@@ -459,9 +473,10 @@ const saveCreatedTorrent = async (created, savedSourcePath, req) => {
       await Checkpointer.markChunksVerifiedBulk(created.infoHash, created.chunkHashes);
     }
 
+    console.log(`[TorrentController] DB record created: ${created.infoHash} (id=${torrent.id})`);
     return torrent;
   } catch (sqlErr) {
-    console.error('[TorrentController] SQL Dual-Write failed:', sqlErr.message);
+    console.error('[TorrentController] SQL Dual-Write failed:', sqlErr.message, sqlErr.stack);
     return null;
   }
 };
@@ -1275,7 +1290,7 @@ exports.createTorrentFromFile = async (req, res) => {
     savedTorrentPath = persistedPaths.savedTorrentPath;
 
     // ── 8. Save to DB & Initialize CAS Chunks ───────────────────────────────
-    const torrent = await saveCreatedTorrent(created, savedSourcePath, req);
+    const torrent = await saveCreatedTorrent(created, savedSourcePath, req, savedTorrentPath);
 
     console.log(`[TorrentController] Created torrent from file: ${created.name} (${created.infoHash})`);
 

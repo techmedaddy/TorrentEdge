@@ -158,6 +158,11 @@ app.get('/api/metrics', metricsHandler);
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/auth', require('./routes/authRoutes')); // Also mount at /auth for Google OAuth callback compatibility
 app.use('/api/user', require('./routes/userRoutes'));
+// Public artifact download — mounted BEFORE the torrent router so authMiddleware never fires.
+// The 40-char infoHash acts as a capability token; if you know it, you can pull.
+const torrentController = require('./controllers/torrentController');
+app.get('/api/torrent/:id/download', torrentController.downloadTorrentFile);
+
 app.use('/api/torrent', require('./routes/torrentRoutes'));
 app.use('/api/statistics', require('./routes/statisticsRoutes'));
 app.use('/api/settings', require('./routes/settingsRoutes'));

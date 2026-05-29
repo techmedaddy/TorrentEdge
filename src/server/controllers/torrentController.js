@@ -415,7 +415,7 @@ const emitHashComplete = (req, originalName, pieceCount) => {
   } catch (_) {}
 };
 
-const persistCreatedFiles = async (created, originalName, uploadedFilePath) => {
+const persistCreatedFiles = async (created, originalName, tempFilePath) => {
   const baseDir = process.env.DOWNLOAD_PATH || './downloads';
   const seedsDir = path.join(baseDir, '.torrentedge', 'seeds');
   const torrentsDir = path.join(baseDir, '.torrentedge', 'torrents');
@@ -429,10 +429,13 @@ const persistCreatedFiles = async (created, originalName, uploadedFilePath) => {
   const savedSourcePath = path.join(seedsDir, `${hashPrefix}-${safeOrigName}`);
   const savedTorrentPath = path.join(torrentsDir, `${hashPrefix}-${safeOrigName}.torrent`);
 
-  await fs.rename(uploadedFilePath, savedSourcePath);
+  // TRUE ZERO-BUFFER: Move the file via OS inode rename instead of buffer writing
+  await fs.rename(tempFilePath, savedSourcePath);
+  
+  // The .torrent metadata is small enough to stay in memory and write normally
   await fs.writeFile(savedTorrentPath, created.torrentBuffer);
 
-  console.log(`[TorrentController] Saved source file  : ${savedSourcePath}`);
+  console.log(`[TorrentController] Moved source file to: ${savedSourcePath}`);
   console.log(`[TorrentController] Saved .torrent file: ${savedTorrentPath}`);
 
   return { savedSourcePath, savedTorrentPath };
@@ -1234,25 +1237,19 @@ exports.createTorrentFromFile = async (req, res) => {
     }
     const { rawName, rawPrivate, trackers, pieceSize } = parsedOptions;
 
-    // ── 5. Create .torrent from file using streams ────────────────────────────
-    const { createTorrentWithMagnetStream } = require('../torrentEngine/torrentCreator');
+    // DO NOT read the file into memory!
+    // We pass the file PATH to the streaming creator.
+    const { TorrentCreator } = require('../torrentEngine/torrentCreator');
 
-    // Throttle progress broadcasts — emit at most once every 100ms and
-    // only when progress actually changes by ≥1% to avoid flooding the socket.
     const pieceCount = Math.ceil(fileSize / (pieceSize || 262144));
     const onProgress = buildProgressEmitter(req, originalName, pieceCount);
 
     let created;
     try {
-      created = await createTorrentWithMagnetStream(uploadedFilePath, {
-        name:       rawName,
-        trackers,
-        pieceSize,
-        private:    rawPrivate,
-        onProgress: pieceCount > 1 ? onProgress : undefined, // skip for tiny files
-      });
+      // Use the streaming generation class
+      created = await TorrentCreator.generateFromFile(uploadedFilePath, rawName, pieceSize, trackers);
     } catch (err) {
-      return res.status(400).json({ error: `Failed to create torrent: ${err.message}` });
+      return res.status(400).json({ error: `Failed to stream-create torrent: ${err.message}` });
     }
 
     // Emit 100% done event

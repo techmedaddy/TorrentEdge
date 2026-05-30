@@ -209,19 +209,15 @@ services:
       - minio-data:/data
     networks:
       - app-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
 
   createbuckets:
     image: minio/mc:RELEASE.2023-11-20T16-30-59Z
     depends_on:
-      minio:
-        condition: service_healthy
+      - minio
     entrypoint: >
       /bin/sh -c "
+      echo 'Waiting for MinIO...';
+      sleep 5;
       /usr/bin/mc config host add myminio http://minio:9000 admin password;
       /usr/bin/mc mb myminio/torrentedge-artifacts --ignore-existing;
       /usr/bin/mc anonymous set public myminio/torrentedge-artifacts;

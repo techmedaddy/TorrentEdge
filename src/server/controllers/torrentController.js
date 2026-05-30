@@ -454,19 +454,25 @@ const persistCreatedFiles = async (created, originalName, tempFilePath) => {
 };
 
 const saveCreatedTorrent = async (created, savedSourcePath, req, savedTorrentPath) => {
+  // Safely extract user ID — may be null if auth context is missing
+  let userId = null;
+  try { userId = getUserId(req); } catch (e) { /* no auth context */ }
+
+  const record = {
+    name: created.name,
+    info_hash: created.infoHash.toLowerCase(),
+    magnet_uri: created.magnetURI,
+    size_bytes: created.fileSize,
+    status: 'seeding',
+    progress: 100,
+    uploaded_by: userId,
+    source_path: savedSourcePath,
+    torrent_file_path: savedTorrentPath || null,
+    created_from_upload: true,
+  };
+
   try {
-    const torrent = await Transfer.create({
-      name: created.name,
-      info_hash: created.infoHash.toLowerCase(),
-      magnet_uri: created.magnetURI,
-      size_bytes: created.fileSize,
-      status: 'seeding',
-      progress: 100,
-      uploaded_by: getUserId(req),
-      source_path: savedSourcePath,
-      torrent_file_path: savedTorrentPath || null,
-      created_from_upload: true,
-    });
+    const torrent = await Transfer.create(record);
 
     if (created.chunkHashes && created.chunkHashes.length > 0) {
       await Checkpointer.initializeChunks(created.infoHash, created.chunkHashes, torrent.id);
@@ -476,6 +482,20 @@ const saveCreatedTorrent = async (created, savedSourcePath, req, savedTorrentPat
     console.log(`[TorrentController] DB record created: ${created.infoHash} (id=${torrent.id})`);
     return torrent;
   } catch (sqlErr) {
+    // FK constraint failure on uploaded_by — user doesn't exist in this DB instance.
+    // Retry without the FK to ensure the torrent record is never lost.
+    if (sqlErr.message && sqlErr.message.includes('foreign key constraint') && userId) {
+      console.warn(`[TorrentController] FK constraint on uploaded_by (${userId}), retrying without user link`);
+      try {
+        record.uploaded_by = null;
+        const torrent = await Transfer.create(record);
+        console.log(`[TorrentController] DB record created (no owner): ${created.infoHash} (id=${torrent.id})`);
+        return torrent;
+      } catch (retryErr) {
+        console.error('[TorrentController] SQL Dual-Write retry failed:', retryErr.message);
+        return null;
+      }
+    }
     console.error('[TorrentController] SQL Dual-Write failed:', sqlErr.message, sqlErr.stack);
     return null;
   }

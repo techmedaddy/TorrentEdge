@@ -29,6 +29,7 @@ const Checkpointer = require('../torrentEngine/checkpointer'); // Phase 1.2 CAS
 const ResumeService = require('../torrentEngine/resumeService'); // Phase 1.3 Idempotent Resume
 const { defaultDispatcher, DIRECTIVE_TYPES } = require('../torrentEngine'); // Phase 2.1 Dispatcher
 const { parseTorrent } = require('../torrentEngine/torrentParser');
+const s3Service = require('../services/s3Service'); // Phase 4 S3 Bridge
 
 // Helper to validate UUID
 const isValidObjectId = (id) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
@@ -469,6 +470,7 @@ const saveCreatedTorrent = async (created, savedSourcePath, req, savedTorrentPat
     source_path: savedSourcePath,
     torrent_file_path: savedTorrentPath || null,
     created_from_upload: true,
+    s3_key: created.infoHash, // Phase 4 S3 Bridge
   };
 
   try {
@@ -1314,6 +1316,12 @@ exports.createTorrentFromFile = async (req, res) => {
 
     console.log(`[TorrentController] Created torrent from file: ${created.name} (${created.infoHash})`);
 
+    // ── 8.5 S3 Dual-Write (Phase 4 Cold Start Bridge) ───────────────────────
+    // Fire-and-forget the MinIO upload. We don't block the API response on this.
+    s3Service.uploadArtifact(savedSourcePath, created.infoHash).catch(e => {
+      console.error(`[TorrentController] S3 Dual-Write failed for ${created.infoHash}:`, e.message);
+    });
+
     // ── 9. Auto-seed: wire into engine (Phase 3.1) ──────────────────────────
     // Fire-and-forget — seeding starting up shouldn't delay the HTTP response.
     // Engine errors are logged but don't fail the request (torrent is saved, user
@@ -1401,10 +1409,51 @@ exports.downloadTorrentFile = async (req, res) => {
 
     const selectedFile = files[fileIndex];
     const baseDir = process.env.DOWNLOAD_PATH || './downloads';
-    const finalPath = await resolveDownloadPath(baseDir, selectedFile, dbTorrent);
+    let finalPath = await resolveDownloadPath(baseDir, selectedFile, dbTorrent);
 
     if (!finalPath) {
-      return res.status(404).json({ message: 'File not found on disk. Ensure worker has completed the transfer.' });
+      // ── Phase 4: Cold Start Resurrection Trigger ──────────────────────────
+      if (dbTorrent.s3_key && s3Service.enabled) {
+        console.log(`[TorrentController] Artifact missing locally. Triggering S3 Cold Start for ${dbTorrent.s3_key}`);
+        try {
+          const presignedUrl = await s3Service.generatePresignedUrl(dbTorrent.s3_key);
+          
+          let targetTorrent = engineTorrent;
+          if (!targetTorrent && dbTorrent.torrent_file_path) {
+            targetTorrent = await defaultEngine.addTorrent({
+              torrentFile: dbTorrent.torrent_file_path,
+              autoStart: false,
+            });
+          }
+
+          if (targetTorrent) {
+            const S3ColdStartStreamer = require('../torrentEngine/s3Streamer');
+            const streamer = new S3ColdStartStreamer({
+              torrent: targetTorrent,
+              sourceUri: presignedUrl,
+              nodeId: `genesis-${Date.now()}`,
+              downloadPath: baseDir
+            });
+
+            console.log(`[TorrentController] Starting S3 Cold Start stream for ${dbTorrent.info_hash}`);
+            await streamer.start();
+            
+            // Re-resolve path after successful resurrection
+            finalPath = await resolveDownloadPath(baseDir, selectedFile, dbTorrent);
+            
+            // Ensure the engine torrent transitions to seeding
+            if (targetTorrent._state !== 'seeding' && typeof targetTorrent._transitionToSeeding === 'function') {
+              await targetTorrent._transitionToSeeding();
+            }
+          }
+        } catch (coldStartErr) {
+          console.error(`[TorrentController] S3 Cold Start failed for ${dbTorrent.info_hash}:`, coldStartErr);
+        }
+      }
+
+      if (!finalPath) {
+        return res.status(404).json({ message: 'File not found on disk. Ensure worker has completed the transfer.' });
+      }
     }
 
     res.download(finalPath, selectedFile.name, (err) => {

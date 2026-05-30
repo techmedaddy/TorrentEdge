@@ -55,6 +55,7 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
       - REDIS_URL=redis://redis:6379
+      - S3_ENDPOINT=http://minio:9000
       - OTEL_ENABLED=true
       - OTEL_SERVICE_NAME=torrentedge-backend
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318

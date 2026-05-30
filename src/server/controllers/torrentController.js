@@ -680,12 +680,33 @@ exports.createTorrent = async (req, res) => {
     }
 
     if (input.magnetInfo) {
-      const existingTorrent = await findExistingTorrentByInfoHash(input.magnetInfo.infoHash);
+      const infoHash = input.magnetInfo.infoHash.toLowerCase();
+
+      // --- NEW: PHASE 4 - S3 COLD START RESURRECTION ---
+      if (s3Service.enabled) {
+        const engineTorrent = defaultEngine.getTorrent(infoHash);
+        if (!engineTorrent) {
+          const record = await findExistingTorrentByInfoHash(infoHash);
+          if (record && record.s3_key) {
+            console.log(`[S3 Bridge] Dead torrent detected for ${infoHash}. Initiating Cold Start Resurrection...`);
+            try {
+              const presignedUrl = await s3Service.generatePresignedUrl(record.s3_key);
+              await defaultEngine.dispatchS3Bridge(presignedUrl, infoHash, record.name);
+              console.log(`[S3 Bridge] Resurrection complete! Genesis Seeder restored for ${infoHash}.`);
+            } catch (resurrectionError) {
+              console.error(`[S3 Bridge] FATAL: Failed to resurrect artifact from S3:`, resurrectionError.message);
+            }
+          }
+        }
+      }
+      // --- END COLD START RESURRECTION ---
+
+      const existingTorrent = await findExistingTorrentByInfoHash(infoHash);
       if (existingTorrent && await handleExistingMagnetTorrent(existingTorrent, req, res)) {
         return;
       }
 
-      console.log(`[TorrentController] Adding magnet: ${input.magnetInfo.displayName || input.magnetInfo.infoHash}`);
+      console.log(`[TorrentController] Adding magnet: ${input.magnetInfo.displayName || infoHash}`);
     }
 
     // Add to engine via Dispatcher (Phase 2.1: decoupled from direct engine call)

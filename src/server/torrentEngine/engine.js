@@ -568,6 +568,47 @@ class TorrentEngine extends EventEmitter {
     }
   }
 
+  // ── Phase 4: S3 Cold Start Bridge ───────────────────────────────────────
+  
+  /**
+   * Triggers the Cold Start Bridge to stream an artifact from S3 into the CAS 
+   * and immediately morphs the node into the Genesis Seeder.
+   */
+  async dispatchS3Bridge(presignedUrl, expectedInfoHash, originalName) {
+    return new Promise(async (resolve, reject) => {
+      try {
+        console.log(`[Engine] Booting S3 Cold Start Streamer for ${expectedInfoHash}...`);
+        
+        // Add the torrent to the engine first so the streamer has a target
+        const targetTorrent = await this.addTorrent({
+          magnetURI: `magnet:?xt=urn:btih:${expectedInfoHash}&dn=${encodeURIComponent(originalName)}`,
+          autoStart: false,
+        });
+
+        // Initialize our stream processor
+        const S3ColdStartStreamer = require('./s3Streamer');
+        const streamer = new S3ColdStartStreamer({
+          torrent: targetTorrent,
+          sourceUri: presignedUrl,
+          nodeId: `genesis-bridge-${Date.now()}`,
+          downloadPath: this.downloadPath
+        });
+
+        // Start pulling the chunks from MinIO to the local disk
+        await streamer.start();
+
+        // Instantly transition the worker into a TCP seeder using the reconstructed metadata
+        if (targetTorrent._state !== 'seeding' && typeof targetTorrent._transitionToSeeding === 'function') {
+          await targetTorrent._transitionToSeeding();
+        }
+        
+        resolve(true);
+      } catch (error) {
+        console.error(`[Engine] S3 Streamer failed:`, error);
+        reject(error);
+      }
+    });
+  }
   async addTorrent(options = {}) {
     try {
       // Validate input

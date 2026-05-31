@@ -1343,6 +1343,24 @@ exports.createTorrentFromFile = async (req, res) => {
       console.error(`[TorrentController] S3 Dual-Write failed for ${created.infoHash}:`, e.message);
     });
 
+    // ── 8.7 Audit Logging (Phase 5) ───────────────────────────────
+    try {
+      const { ArtifactActivity } = require('../models/sql');
+      const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown';
+      let userId = null;
+      try { userId = getUserId(req); } catch (e) { /* ignore */ }
+      
+      await ArtifactActivity.create({
+        user_id: userId,
+        info_hash: created.infoHash.toLowerCase(),
+        action: 'UPLOAD',
+        file_name: created.name,
+        ip_address: ip
+      });
+    } catch (auditErr) {
+      console.warn('[TorrentController] Audit logging failed for UPLOAD:', auditErr.message);
+    }
+
     // ── 9. Auto-seed: wire into engine (Phase 3.1) ──────────────────────────
     // Fire-and-forget — seeding starting up shouldn't delay the HTTP response.
     // Engine errors are logged but don't fail the request (torrent is saved, user
@@ -1416,6 +1434,22 @@ exports.downloadTorrentFile = async (req, res) => {
     if (dbTorrent.status !== 'completed' && dbTorrent.status !== 'seeding') {
       return res.status(400).json({ message: 'Torrent has not finished downloading yet' });
     }
+
+    try {
+      const { ArtifactActivity } = require('../models/sql');
+      const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown';
+      let userId = null;
+      if (req.user && (req.user.userId || req.user.id)) {
+        userId = req.user.userId || req.user.id;
+      }
+      ArtifactActivity.create({
+        user_id: userId,
+        info_hash: dbTorrent.info_hash,
+        action: 'DOWNLOAD_START',
+        file_name: dbTorrent.name,
+        ip_address: ip
+      }).catch(err => console.warn('[TorrentController] Audit logging failed for DOWNLOAD:', err.message));
+    } catch (auditErr) {}
 
     const engineTorrent = defaultEngine.getTorrent(dbTorrent.info_hash);
     const files = await getFilesForTorrent(dbTorrent, engineTorrent);

@@ -2,6 +2,7 @@ const User = require('./User');
 const Node = require('./Node');
 const Transfer = require('./Transfer');
 const Chunk = require('./Chunk');
+const ArtifactActivity = require('./ArtifactActivity');
 
 // Associations
 
@@ -15,6 +16,10 @@ const TransferLeecher = sequelize.define('TransferLeecher', {}, { tableName: 'tr
 
 User.belongsToMany(Transfer, { through: TransferLeecher, as: 'leeched_transfers', foreignKey: 'user_id' });
 Transfer.belongsToMany(User, { through: TransferLeecher, as: 'leechers', foreignKey: 'transfer_id' });
+
+// User has many ArtifactActivity
+User.hasMany(ArtifactActivity, { foreignKey: 'user_id', as: 'activities' });
+ArtifactActivity.belongsTo(User, { foreignKey: 'user_id', as: 'user' });
 
 // Transfers belong to a Node (Owner)
 Node.hasMany(Transfer, { foreignKey: 'owner_node_id', as: 'owned_transfers' });
@@ -33,5 +38,6 @@ module.exports = {
   Node,
   Transfer,
   Chunk,
-  TransferLeecher
+  TransferLeecher,
+  ArtifactActivity
 };

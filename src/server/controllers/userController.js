@@ -13,6 +13,36 @@ exports.getUserProfile = async (req, res) => {
     }
 };
 
+// Function to get user audit history
+exports.getUserHistory = async (req, res) => {
+    try {
+        const { ArtifactActivity, Transfer } = require('../models/sql');
+        const { Op } = require('sequelize');
+        const userId = req.user.userId || req.user.id;
+        
+        // Find all info_hashes owned by the user
+        const userTorrents = await Transfer.findAll({ 
+            where: { uploaded_by: userId }, 
+            attributes: ['info_hash'] 
+        });
+        const userHashes = userTorrents.map(t => t.info_hash);
+
+        const history = await ArtifactActivity.findAll({
+            where: {
+                [Op.or]: [
+                    { user_id: userId },
+                    { info_hash: { [Op.in]: userHashes } }
+                ]
+            },
+            order: [['created_at', 'DESC']],
+            limit: 100
+        });
+        res.json(history);
+    } catch (error) {
+        res.status(500).json({ message: 'Server error: ' + error.message });
+    }
+};
+
 // Function to update user profile (restricted fields)
 exports.updateUserProfile = async (req, res) => {
     try {

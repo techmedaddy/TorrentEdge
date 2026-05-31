@@ -58,6 +58,36 @@ router.get('/', async (req, res) => {
   }
 });
 
+// GET /api/statistics/global - Global egress savings
+router.get('/global', async (req, res) => {
+  try {
+    // Aggregate metrics across all active torrents managed by the engine
+    const torrents = defaultEngine.getAllTorrents();
+    
+    let totalP2PBytesDownloaded = 0;
+    let totalCloudBytesDownloaded = 0; // Bytes pulled via the S3 Bridge
+    
+    torrents.forEach(t => {
+      try {
+        const stats = t.getStats();
+        totalP2PBytesDownloaded += stats.downloadedFromPeers || stats.downloaded || 0;
+        totalCloudBytesDownloaded += stats.downloadedFromS3 || 0;
+      } catch (e) {
+        // Stats not available for this torrent
+      }
+    });
+
+    return res.status(200).json({
+      totalP2PBytes: totalP2PBytesDownloaded,
+      totalCloudBytes: totalCloudBytesDownloaded,
+      activeSwarms: torrents.length
+    });
+  } catch (error) {
+    console.error('[API] Failed to fetch egress global stats:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // GET /api/statistics/engine - Detailed engine stats (auth required)
 router.get('/engine', authMiddleware, async (req, res) => {
   try {

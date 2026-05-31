@@ -41,3 +41,17 @@ data/
 # Compiled files
 *.tsbuildinfo
 exclusive-documentation.md
+
+# Scratch, test, and image files
+test-*.js
+test_*.js
+check_*.js
+fix-*.js
+scratch_*.js
+plan.txt
+repo.txt
+cd
+docker
+desktop.ini
+image*.png
+test-downloads/

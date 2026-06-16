@@ -15,11 +15,21 @@
 
 TorrentEdge is a cloud-native artifact router for infrastructure teams that move very large binary assets: model checkpoints, dataset shards, build artifacts, VM images, and other deployment-critical payloads. It is designed for the moment when centralized object storage becomes a fleet-wide bottleneck and every node in the cluster starts competing for the same North-South bandwidth.
 
+<div align="center">
+  <img src="images/image.png" alt="TorrentEdge Dashboard Overview" width="80%" />
+  <br><em>Real-time visibility into your distributed artifacts and swarm health.</em>
+</div>
+
 ## 🚨 The "Thundering Herd" Problem
 
 - 🔥 **Top-of-Rack collapse:** A 50+ node GPU fleet pulling the same 70GB artifact at once can saturate VPC endpoints, NAT gateways, and ToR uplinks before the workload even starts.
 - 💸 **Egress amplification:** One rollout becomes dozens of redundant object-store reads, multiplying cloud transfer costs for bytes that are identical across the fleet.
 - 🕒 **Tail-latency rollouts:** Nodes finish at different times based on network contention, so inference, fine-tuning, or batch jobs wait for the slowest artifact pull.
+
+<div align="center">
+  <img src="images/image-1.png" alt="Thundering Herd Resolution" width="80%" />
+  <br><em>Visualizing piece-level verification and network distribution to prevent bottlenecks.</em>
+</div>
 
 ## 🧠 Architecture & Core Engine
 
@@ -28,6 +38,11 @@ TorrentEdge is a cloud-native artifact router for infrastructure teams that move
 - 🧬 **Content-Addressable Storage:** Verified chunks are stored by digest and materialized through local symlinks, allowing workers to deduplicate identical data across transfers and avoid redundant disk I/O.
 - 🔐 **Distributed Leases:** Redis `SETNX` locks and fencing tokens coordinate shared storage access, prevent split-brain writes, and let replacement workers safely resume abandoned transfers.
 - 📨 **Event Bus:** Apache Kafka decouples API-facing orchestration from worker execution through asynchronous job dispatch, lifecycle events, and telemetry streams.
+
+<div align="center">
+  <img src="images/image-2.png" alt="Core Engine Architecture" width="80%" />
+  <br><em>Detailed metrics showing chunk materialization and peer exchanges.</em>
+</div>
 
 ## 🗺️ Deployment Topology
 
@@ -68,6 +83,11 @@ graph TD
   classDef storage fill:#334155,stroke:#94a3b8,color:#ffffff,stroke-width:2px;
 ```
 
+<div align="center">
+  <img src="images/image-3.png" alt="Deployment View" width="80%" />
+  <br><em>Monitoring stateless REST Pods and Node.js Data Plane workers in action.</em>
+</div>
+
 ## ⚡ Quick Start (Evaluation Mode)
 
 ```bash
@@ -80,6 +100,11 @@ docker compose up -d
 - 🚀 **Local cluster:** Boots the API, PostgreSQL, Kafka, Redis, worker runtime, and telemetry pipeline for evaluation.
 - 🩺 **Health check:** `GET http://localhost:3029/api/health` confirms the API process is live.
 - 📊 **Metrics endpoint:** `GET http://localhost:3029/metrics` exposes Prometheus-compatible service and transfer metrics.
+
+<div align="center">
+  <img src="images/image-4.png" alt="Quick Start Dashboard" width="80%" />
+  <br><em>The main evaluation dashboard once the local cluster is successfully booted.</em>
+</div>
 
 ## 🧪 Code Review (SonarCloud)
 
@@ -98,6 +123,11 @@ SONAR_TOKEN=<YOUR_TOKEN> npx sonar-scanner
 
 The scan configuration lives in [sonar-project.properties](sonar-project.properties).
 
+<div align="center">
+  <img src="images/image-5.png" alt="Code Quality" width="80%" />
+  <br><em>Ensuring pristine code quality and test coverage before deployment.</em>
+</div>
+
 ## 🔌 API & Pipeline Integration
 
 ```bash
@@ -115,11 +145,21 @@ curl -X POST http://localhost:3029/api/torrent/create \
 - 🧭 **Pipeline-native dispatch:** The API returns transfer metadata while workers asynchronously acquire leases, discover peers, verify chunks, and publish lifecycle state.
 - 🔁 **Retry-safe operations:** Reusing the same request ID lets infrastructure automation distinguish a retry from a new deployment intent.
 
+<div align="center">
+  <img src="images/image-6.png" alt="API Integration" width="80%" />
+  <br><em>Tracking idempotent API requests and CI/CD transfer metadata.</em>
+</div>
+
 ## 📡 Telemetry & Observability
 
 - 📈 **Prometheus metrics:** TorrentEdge exports API latency, Kafka throughput, queue depth, worker heartbeats, lease activity, CAS hit rate, and deduplicated bytes.
 - 🔭 **OpenTelemetry distributed tracing:** Request IDs and W3C trace context flow from REST ingress through Kafka dispatch into worker execution and CAS writes.
 - 🛰️ **WebSocket streams for SREs:** Real-time transfer progress, peer counts, throughput, and piece completion events can be streamed into operational tooling.
+
+<div align="center">
+  <img src="images/image-7.png" alt="Telemetry" width="80%" />
+  <br><em>Streaming Prometheus metrics and WebSocket events for SRE observability.</em>
+</div>
 
 ## 🧭 Roadmap
 

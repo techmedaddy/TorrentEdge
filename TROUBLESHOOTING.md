@@ -77,3 +77,28 @@ We implemented a robust "Absolute Fallback" architecture to ensure the frontend 
 4. **Dynamic Path Resolution:** Updated `downloadTorrentFile` to recursively check multiple directories (`absolutePath`, `seedPath`, and `sourcePath`) to locate and pipe the physical file correctly.
 
 **Key Takeaway:** Never assume an in-memory application state will persist. Always build API endpoints with absolute fallback mechanisms to serve essential data directly from the persistent database or file system when the active engine goes offline.
+
+---
+
+## 4. Google OAuth: `client_secret is missing` & Redis `getaddrinfo EAI_AGAIN redis` in Docker
+
+**Date Logged:** June 17, 2026
+**Component:** Authentication / Redis / Docker Networking
+
+### Symptom
+1. Users attempting to log in via Google were immediately redirected back to the login screen without any error message on the frontend (silent failure).
+2. The backend logs showed `Google OAuth callback error: invalid_request` with the details `error_description: 'client_secret is missing.'`.
+3. Simultaneously, the backend logs were spammed with `[Redis] Connection error: getaddrinfo EAI_AGAIN redis`, indicating that while PostgreSQL and Kafka connected successfully, Redis was totally unreachable.
+
+### Root Cause
+These were two separate configuration issues combining to break the authentication and infrastructure layers:
+
+1. **The Missing Secret:** In the Docker Compose setup, the backend container loaded environment variables from `src/server/.env`. While the root `.env` file contained the `GOOGLE_CLIENT_SECRET`, the `src/server/.env` file was completely missing it. The Google OAuth library initialized silently with `undefined`, but crashed upon attempting the token exchange. The error handler caught it and redirected the user back to the frontend.
+2. **The IPv6 Docker DNS Quirk:** Node.js versions 18+ default to preferring IPv6 for DNS resolution. Inside standard Docker bridge networks, IPv6 resolution for container hostnames (like `redis`) can time out or fail (`EAI_AGAIN`), whereas IPv4 works instantly.
+
+### Solution
+1. **Sync `.env` Files:** Added the `GOOGLE_CLIENT_SECRET` into `src/server/.env` so the backend container could pick it up.
+2. **Force IPv4 for Redis:** Edited `src/server/db/redis.js` and explicitly added `family: 4` to the `ioredis` constructor options. This forces Node.js to resolve the `redis` container name using IPv4, instantly curing the `EAI_AGAIN` error.
+3. **Restart the Backend:** Restarted the `backend` Docker container to apply the updated environment variables and connection logic.
+
+**Key Takeaway:** Always verify that all required environment variables are present in the specific `.env` file loaded by your container context. Additionally, when encountering DNS resolution timeouts (`EAI_AGAIN`) between Node 18+ and Docker containers, always attempt to force IPv4 resolution (`family: 4`).

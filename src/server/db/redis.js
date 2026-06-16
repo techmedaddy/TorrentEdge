@@ -4,6 +4,7 @@ const Redis = require('ioredis');
 
 // Connect to Redis instance
 const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
+  family: 4, // Force IPv4 to fix Docker resolution issues
   maxRetriesPerRequest: 3,
   enableReadyCheck: true,
   retryStrategy(times) {
